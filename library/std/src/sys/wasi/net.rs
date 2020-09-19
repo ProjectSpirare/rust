@@ -3,19 +3,69 @@
 use crate::convert::TryFrom;
 use crate::fmt;
 use crate::io::{self, IoSlice, IoSliceMut};
+// use crate::mem;
 use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
 use crate::sys::fd::WasiFd;
 use crate::sys::{unsupported, Void};
 use crate::sys_common::FromInner;
 use crate::time::Duration;
 
+// fn iovec<'a>(a: &'a mut [IoSliceMut<'_>]) -> &'a [wasi::Iovec] {
+//     assert_eq!(mem::size_of::<IoSliceMut<'_>>(), mem::size_of::<wasi::Iovec>());
+//     assert_eq!(mem::align_of::<IoSliceMut<'_>>(), mem::align_of::<wasi::Iovec>());
+//     // SAFETY: `IoSliceMut` and `IoVec` have exactly the same memory layout
+//     unsafe { mem::transmute(a) }
+// }
+
+// fn ciovec<'a>(a: &'a [IoSlice<'_>]) -> &'a [wasi::Ciovec] {
+//     assert_eq!(mem::size_of::<IoSlice<'_>>(), mem::size_of::<wasi::Ciovec>());
+//     assert_eq!(mem::align_of::<IoSlice<'_>>(), mem::align_of::<wasi::Ciovec>());
+//     // SAFETY: `IoSlice` and `CIoVec` have exactly the same memory layout
+//     unsafe { mem::transmute(a) }
+// }
+
 pub struct TcpStream {
     fd: WasiFd,
 }
 
+// TODO
+// move to fd.rs
+pub const STDPOOL_FD: wasi::Fd = 0x3;
+
 impl TcpStream {
-    pub fn connect(_: io::Result<&SocketAddr>) -> io::Result<TcpStream> {
-        unsupported()
+    pub fn connect(addr: io::Result<&SocketAddr>) -> io::Result<TcpStream> {
+        if let SocketAddr::V4(ipv4) = addr? {
+            // let mut addr = ipv4.ip().clone().into() as u8;
+            let port: u16 = ipv4.port();
+
+            // TODO
+            // actually parse the IP address above
+            let mut addr = wasi::Addr {
+                tag: wasi::ADDR_TYPE_IP4,
+                u: wasi::AddrU {
+                    ip4: wasi::AddrIp4Port {
+                        addr: wasi::AddrIp4 { n0: 127, n1: 0, h0: 0, h1: 1 },
+                        port,
+                    },
+                },
+            };
+
+            // TODO
+            // the
+            unsafe {
+                let sd = wasi::sock_open(
+                    STDPOOL_FD,
+                    wasi::ADDRESS_FAMILY_INET4,
+                    wasi::SOCK_TYPE_SOCKET_STREAM,
+                )
+                .unwrap();
+
+                wasi::sock_connect(sd, &mut addr as *mut wasi::Addr).unwrap();
+                Ok(Self { fd: WasiFd::from_raw(sd) })
+            }
+        } else {
+            unsupported()
+        }
     }
 
     pub fn connect_timeout(_: &SocketAddr, _: Duration) -> io::Result<TcpStream> {
@@ -42,11 +92,13 @@ impl TcpStream {
         unsupported()
     }
 
-    pub fn read(&self, _: &mut [u8]) -> io::Result<usize> {
-        unsupported()
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_vectored(&mut [IoSliceMut::new(buf)])
     }
 
     pub fn read_vectored(&self, _: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        // Ok(self.fd.sock_recv(iov.as_ptr(), 0).unwrap())
+        //Ok(unsafe { wasi::sock_recv(self.fd.as_raw(), iovec(iov), 0).unwrap() })
         unsupported()
     }
 
@@ -54,11 +106,12 @@ impl TcpStream {
         true
     }
 
-    pub fn write(&self, _: &[u8]) -> io::Result<usize> {
-        unsupported()
+    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        self.write_vectored(&[IoSlice::new(buf)])
     }
 
     pub fn write_vectored(&self, _: &[IoSlice<'_>]) -> io::Result<usize> {
+        // Ok(unsafe { wasi::sock_send(self.fd.as_raw(), ciovec(iov), 0).unwrap() })
         unsupported()
     }
 

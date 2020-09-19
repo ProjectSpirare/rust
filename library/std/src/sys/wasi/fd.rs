@@ -198,16 +198,12 @@ impl WasiFd {
         unsafe { wasi::path_remove_directory(self.fd, path).map_err(err2io) }
     }
 
-    pub fn sock_recv(
-        &self,
-        ri_data: &mut [IoSliceMut<'_>],
-        ri_flags: wasi::Riflags,
-    ) -> io::Result<(usize, wasi::Roflags)> {
-        unsafe { wasi::sock_recv(self.fd, iovec(ri_data), ri_flags).map_err(err2io) }
+    pub fn sock_recv(&self, buf: &mut [u8], ri_flags: wasi::Riflags) -> io::Result<usize> {
+        unsafe { wasi::sock_recv(self.fd, buf.as_mut_ptr(), buf.len(), ri_flags).map_err(err2io) }
     }
 
-    pub fn sock_send(&self, si_data: &[IoSlice<'_>], si_flags: wasi::Siflags) -> io::Result<usize> {
-        unsafe { wasi::sock_send(self.fd, ciovec(si_data), si_flags).map_err(err2io) }
+    pub fn sock_send(&self, buf: &mut [u8], si_flags: wasi::Siflags) -> io::Result<usize> {
+        unsafe { wasi::sock_send(self.fd, buf.as_mut_ptr(), buf.len(), si_flags).map_err(err2io) }
     }
 
     pub fn sock_shutdown(&self, how: Shutdown) -> io::Result<()> {
