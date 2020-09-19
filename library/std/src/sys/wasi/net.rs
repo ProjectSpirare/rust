@@ -34,37 +34,37 @@ pub const STDPOOL_FD: wasi::Fd = 0x3;
 
 impl TcpStream {
     pub fn connect(addr: io::Result<&SocketAddr>) -> io::Result<TcpStream> {
-        if let SocketAddr::V4(ipv4) = addr? {
-            // let mut addr = ipv4.ip().clone().into() as u8;
-            let port: u16 = ipv4.port();
+        println!("rust_stdlib::TcpStream::connect;");
 
-            // TODO
-            // actually parse the IP address above
-            let mut addr = wasi::Addr {
-                tag: wasi::ADDR_TYPE_IP4,
-                u: wasi::AddrU {
-                    ip4: wasi::AddrIp4Port {
-                        addr: wasi::AddrIp4 { n0: 127, n1: 0, h0: 0, h1: 1 },
-                        port,
+        match addr.expect("rust_stdlib::TcpStream::connect reading result of addr") {
+            SocketAddr::V4(ipv4) => {
+                let port: u16 = ipv4.port();
+                let mut addr = wasi::Addr {
+                    tag: wasi::ADDR_TYPE_IP4,
+                    u: wasi::AddrU {
+                        ip4: wasi::AddrIp4Port {
+                            addr: wasi::AddrIp4 { n0: 127, n1: 0, h0: 0, h1: 1 },
+                            port,
+                        },
                     },
-                },
-            };
+                };
+                unsafe {
+                    let sd = wasi::sock_open(
+                        STDPOOL_FD,
+                        wasi::ADDRESS_FAMILY_INET4,
+                        wasi::SOCK_TYPE_SOCKET_STREAM,
+                    )
+                    .expect("error in Rust stdlib from wasi::sock_open");
 
-            // TODO
-            // the
-            unsafe {
-                let sd = wasi::sock_open(
-                    STDPOOL_FD,
-                    wasi::ADDRESS_FAMILY_INET4,
-                    wasi::SOCK_TYPE_SOCKET_STREAM,
-                )
-                .unwrap();
-
-                wasi::sock_connect(sd, &mut addr as *mut wasi::Addr).unwrap();
-                Ok(Self { fd: WasiFd::from_raw(sd) })
+                    wasi::sock_connect(sd, &mut addr as *mut wasi::Addr)
+                        .expect("error in Rust stdlib from wasi::sock_connect");
+                    Ok(Self { fd: WasiFd::from_raw(sd) })
+                }
             }
-        } else {
-            unsupported()
+            SocketAddr::V6(_ipv6) => {
+                println!("rust_stdlib::TcpStream::connect cannot handle IPv6");
+                unsupported()
+            }
         }
     }
 
