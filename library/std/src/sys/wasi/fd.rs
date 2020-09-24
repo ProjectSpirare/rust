@@ -1,4 +1,3 @@
-#![deny(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code)]
 
 use super::err2io;
@@ -198,12 +197,16 @@ impl WasiFd {
         unsafe { wasi::path_remove_directory(self.fd, path).map_err(err2io) }
     }
 
-    pub fn sock_recv(&self, buf: &mut [u8], ri_flags: wasi::Riflags) -> io::Result<usize> {
-        unsafe { wasi::sock_recv(self.fd, buf.as_mut_ptr(), buf.len(), ri_flags).map_err(err2io) }
+    pub fn sock_recv(
+        &self,
+        ri_data: &mut [IoSliceMut<'_>],
+        ri_flags: wasi::Riflags,
+    ) -> io::Result<(usize, wasi::Roflags)> {
+        unsafe { wasi::sock_recv(self.fd, iovec(ri_data), ri_flags).map_err(err2io) }
     }
 
-    pub fn sock_send(&self, buf: &mut [u8], si_flags: wasi::Siflags) -> io::Result<usize> {
-        unsafe { wasi::sock_send(self.fd, buf.as_mut_ptr(), buf.len(), si_flags).map_err(err2io) }
+    pub fn sock_send(&self, si_data: &[IoSlice<'_>], si_flags: wasi::Siflags) -> io::Result<usize> {
+        unsafe { wasi::sock_send(self.fd, ciovec(si_data), si_flags).map_err(err2io) }
     }
 
     pub fn sock_shutdown(&self, how: Shutdown) -> io::Result<()> {
@@ -218,8 +221,6 @@ impl WasiFd {
 
 impl Drop for WasiFd {
     fn drop(&mut self) {
-        // FIXME: can we handle the return code here even though we can't on
-        // unix?
         let _ = unsafe { wasi::fd_close(self.fd) };
     }
 }

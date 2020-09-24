@@ -1,5 +1,3 @@
-#![deny(unsafe_op_in_unsafe_fn)]
-
 use crate::ffi::{CStr, CString, OsStr, OsString};
 use crate::fmt;
 use crate::io::{self, IoSlice, IoSliceMut, SeekFrom};
@@ -273,9 +271,9 @@ impl OpenOptions {
         }
     }
 
-    pub fn append(&mut self, append: bool) {
-        self.append = append;
-        self.fdflag(wasi::FDFLAGS_APPEND, append);
+    pub fn append(&mut self, set: bool) {
+        self.append = set;
+        self.fdflag(wasi::FDFLAGS_APPEND, set);
     }
 
     pub fn dsync(&mut self, set: bool) {
@@ -335,7 +333,6 @@ impl OpenOptions {
         // FIXME: some of these should probably be read-only or write-only...
         base |= wasi::RIGHTS_FD_ADVISE;
         base |= wasi::RIGHTS_FD_FDSTAT_SET_FLAGS;
-        base |= wasi::RIGHTS_FD_FILESTAT_GET;
         base |= wasi::RIGHTS_FD_FILESTAT_SET_TIMES;
         base |= wasi::RIGHTS_FD_SEEK;
         base |= wasi::RIGHTS_FD_SYNC;
@@ -602,14 +599,14 @@ fn open_at(fd: &WasiFd, path: &Path, opts: &OpenOptions) -> io::Result<File> {
 ///
 /// WASI has no fundamental capability to do this. All syscalls and operations
 /// are relative to already-open file descriptors. The C library, however,
-/// manages a map of pre-opened file descriptors to their path, and then the C
+/// manages a map of preopened file descriptors to their path, and then the C
 /// library provides an API to look at this. In other words, when you want to
 /// open a path `p`, you have to find a previously opened file descriptor in a
 /// global table and then see if `p` is relative to that file descriptor.
 ///
 /// This function, if successful, will return two items:
 ///
-/// * The first is a `ManuallyDrop<WasiFd>`. This represents a pre-opened file
+/// * The first is a `ManuallyDrop<WasiFd>`. This represents a preopened file
 ///   descriptor which we don't have ownership of, but we can use. You shouldn't
 ///   actually drop the `fd`.
 ///
@@ -624,7 +621,7 @@ fn open_at(fd: &WasiFd, path: &Path, opts: &OpenOptions) -> io::Result<File> {
 /// appropriate rights for performing `rights` actions.
 ///
 /// Note that this can fail if `p` doesn't look like it can be opened relative
-/// to any pre-opened file descriptor.
+/// to any preopened file descriptor.
 fn open_parent(p: &Path) -> io::Result<(ManuallyDrop<WasiFd>, PathBuf)> {
     let p = CString::new(p.as_os_str().as_bytes())?;
     unsafe {
@@ -632,7 +629,7 @@ fn open_parent(p: &Path) -> io::Result<(ManuallyDrop<WasiFd>, PathBuf)> {
         let fd = __wasilibc_find_relpath(p.as_ptr(), &mut ret);
         if fd == -1 {
             let msg = format!(
-                "failed to find a pre-opened file descriptor \
+                "failed to find a preopened file descriptor \
                  through which {:?} could be opened",
                 p
             );

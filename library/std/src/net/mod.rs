@@ -76,6 +76,7 @@ fn each_addr<A: ToSocketAddrs, F, T>(addr: A, mut f: F) -> io::Result<T>
 where
     F: FnMut(io::Result<&SocketAddr>) -> io::Result<T>,
 {
+    println!("rust_stdlib_net::each_addr");
     let addrs = match addr.to_socket_addrs() {
         Ok(addrs) => addrs,
         Err(e) => return f(Err(e)),
