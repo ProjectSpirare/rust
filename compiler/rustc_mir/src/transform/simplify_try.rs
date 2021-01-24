@@ -9,14 +9,14 @@
 //!
 //! into just `x`.
 
-use crate::transform::{simplify, MirPass, MirSource};
+use crate::transform::{simplify, MirPass};
 use itertools::Itertools as _;
 use rustc_index::{bit_set::BitSet, vec::IndexVec};
 use rustc_middle::mir::visit::{NonUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, List, Ty, TyCtxt};
 use rustc_target::abi::VariantIdx;
-use std::iter::{Enumerate, Peekable};
+use std::iter::{once, Enumerate, Peekable};
 use std::slice::Iter;
 
 /// Simplifies arms of form `Variant(x) => Variant(x)` to just a move.
@@ -113,7 +113,7 @@ fn get_arm_identity_info<'a, 'tcx>(
         test: impl Fn(&'a Statement<'tcx>) -> bool,
         mut action: impl FnMut(usize, &'a Statement<'tcx>),
     ) {
-        while stmt_iter.peek().map(|(_, stmt)| test(stmt)).unwrap_or(false) {
+        while stmt_iter.peek().map_or(false, |(_, stmt)| test(stmt)) {
             let (idx, stmt) = stmt_iter.next().unwrap();
 
             action(idx, stmt);
@@ -246,14 +246,19 @@ fn get_arm_identity_info<'a, 'tcx>(
         tmp_assigned_vars.insert(*r);
     }
 
-    let dbg_info_to_adjust: Vec<_> =
-        debug_info
-            .iter()
-            .enumerate()
-            .filter_map(|(i, var_info)| {
-                if tmp_assigned_vars.contains(var_info.place.local) { Some(i) } else { None }
-            })
-            .collect();
+    let dbg_info_to_adjust: Vec<_> = debug_info
+        .iter()
+        .enumerate()
+        .filter_map(|(i, var_info)| {
+            if let VarDebugInfoContents::Place(p) = var_info.value {
+                if tmp_assigned_vars.contains(p.local) {
+                    return Some(i);
+                }
+            }
+
+            None
+        })
+        .collect();
 
     Some(ArmIdentityInfo {
         local_temp_0: local_tmp_s0,
@@ -301,7 +306,7 @@ fn optimization_applies<'tcx>(
         return false;
     }
 
-    // Verify the assigment chain consists of the form b = a; c = b; d = c; etc...
+    // Verify the assignment chain consists of the form b = a; c = b; d = c; etc...
     if opt_info.field_tmp_assignments.is_empty() {
         trace!("NO: no assignments found");
         return false;
@@ -340,9 +345,11 @@ fn optimization_applies<'tcx>(
     // Check that debug info only points to full Locals and not projections.
     for dbg_idx in &opt_info.dbg_info_to_adjust {
         let dbg_info = &var_debug_info[*dbg_idx];
-        if !dbg_info.place.projection.is_empty() {
-            trace!("NO: debug info for {:?} had a projection {:?}", dbg_info.name, dbg_info.place);
-            return false;
+        if let VarDebugInfoContents::Place(p) = dbg_info.value {
+            if !p.projection.is_empty() {
+                trace!("NO: debug info for {:?} had a projection {:?}", dbg_info.name, p);
+                return false;
+            }
         }
     }
 
@@ -367,8 +374,15 @@ fn optimization_applies<'tcx>(
 }
 
 impl<'tcx> MirPass<'tcx> for SimplifyArmIdentity {
-    fn run_pass(&self, _tcx: TyCtxt<'tcx>, source: MirSource<'tcx>, body: &mut Body<'tcx>) {
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        // FIXME(77359): This optimization can result in unsoundness.
+        if !tcx.sess.opts.debugging_opts.unsound_mir_opts {
+            return;
+        }
+
+        let source = body.source;
         trace!("running SimplifyArmIdentity on {:?}", source);
+
         let local_uses = LocalUseCounter::get_local_uses(body);
         let (basic_blocks, local_decls, debug_info) =
             body.basic_blocks_local_decls_mut_and_var_debug_info();
@@ -416,9 +430,15 @@ impl<'tcx> MirPass<'tcx> for SimplifyArmIdentity {
                 // Fix the debug info to point to the right local
                 for dbg_index in opt_info.dbg_info_to_adjust {
                     let dbg_info = &mut debug_info[dbg_index];
-                    assert!(dbg_info.place.projection.is_empty());
-                    dbg_info.place.local = opt_info.local_0;
-                    dbg_info.place.projection = opt_info.dbg_projection;
+                    assert!(
+                        matches!(dbg_info.value, VarDebugInfoContents::Place(_)),
+                        "value was not a Place"
+                    );
+                    if let VarDebugInfoContents::Place(p) = &mut dbg_info.value {
+                        assert!(p.projection.is_empty());
+                        p.local = opt_info.local_0;
+                        p.projection = opt_info.dbg_projection;
+                    }
                 }
 
                 trace!("block is now {:?}", bb.statements);
@@ -523,8 +543,8 @@ fn match_variant_field_place<'tcx>(place: Place<'tcx>) -> Option<(Local, VarFiel
 pub struct SimplifyBranchSame;
 
 impl<'tcx> MirPass<'tcx> for SimplifyBranchSame {
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, source: MirSource<'tcx>, body: &mut Body<'tcx>) {
-        trace!("Running SimplifyBranchSame on {:?}", source);
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        trace!("Running SimplifyBranchSame on {:?}", body.source);
         let finder = SimplifyBranchSameOptimizationFinder { body, tcx };
         let opts = finder.find();
 
@@ -551,6 +571,12 @@ struct SimplifyBranchSameOptimization {
     bb_to_opt_terminator: BasicBlock,
 }
 
+struct SwitchTargetAndValue {
+    target: BasicBlock,
+    // None in case of the `otherwise` case
+    value: Option<u128>,
+}
+
 struct SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
     body: &'a Body<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -562,8 +588,14 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
             .basic_blocks()
             .iter_enumerated()
             .filter_map(|(bb_idx, bb)| {
-                let (discr_switched_on, targets) = match &bb.terminator().kind {
-                    TerminatorKind::SwitchInt { targets, discr, .. } => (discr, targets),
+                let (discr_switched_on, targets_and_values) = match &bb.terminator().kind {
+                    TerminatorKind::SwitchInt { targets, discr, .. } => {
+                        let targets_and_values: Vec<_> = targets.iter()
+                            .map(|(val, target)| SwitchTargetAndValue { target, value: Some(val) })
+                            .chain(once(SwitchTargetAndValue { target: targets.otherwise(), value: None }))
+                            .collect();
+                        (discr, targets_and_values)
+                    },
                     _ => return None,
                 };
 
@@ -587,9 +619,9 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
                     },
                 };
 
-                let mut iter_bbs_reachable = targets
+                let mut iter_bbs_reachable = targets_and_values
                     .iter()
-                    .map(|idx| (*idx, &self.body.basic_blocks()[*idx]))
+                    .map(|target_and_value| (target_and_value, &self.body.basic_blocks()[target_and_value.target]))
                     .filter(|(_, bb)| {
                         // Reaching `unreachable` is UB so assume it doesn't happen.
                         bb.terminator().kind != TerminatorKind::Unreachable
@@ -603,16 +635,17 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
                     })
                     .peekable();
 
-                let bb_first = iter_bbs_reachable.peek().map(|(idx, _)| *idx).unwrap_or(targets[0]);
+                let bb_first = iter_bbs_reachable.peek().map_or(&targets_and_values[0], |(idx, _)| *idx);
                 let mut all_successors_equivalent = StatementEquality::TrivialEqual;
 
                 // All successor basic blocks must be equal or contain statements that are pairwise considered equal.
-                for ((bb_l_idx,bb_l), (bb_r_idx,bb_r)) in iter_bbs_reachable.tuple_windows() {
+                for ((target_and_value_l,bb_l), (target_and_value_r,bb_r)) in iter_bbs_reachable.tuple_windows() {
                     let trivial_checks = bb_l.is_cleanup == bb_r.is_cleanup
-                    && bb_l.terminator().kind == bb_r.terminator().kind;
+                                            && bb_l.terminator().kind == bb_r.terminator().kind
+                                            && bb_l.statements.len() == bb_r.statements.len();
                     let statement_check = || {
                         bb_l.statements.iter().zip(&bb_r.statements).try_fold(StatementEquality::TrivialEqual, |acc,(l,r)| {
-                            let stmt_equality = self.statement_equality(*adt_matched_on, &l, bb_l_idx, &r, bb_r_idx, self.tcx.sess.opts.debugging_opts.mir_opt_level);
+                            let stmt_equality = self.statement_equality(*adt_matched_on, &l, target_and_value_l, &r, target_and_value_r);
                             if matches!(stmt_equality, StatementEquality::NotEqual) {
                                 // short circuit
                                 None
@@ -634,7 +667,7 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
                         // statements are trivially equal, so just take first
                         trace!("Statements are trivially equal");
                         Some(SimplifyBranchSameOptimization {
-                            bb_to_goto: bb_first,
+                            bb_to_goto: bb_first.target,
                             bb_to_opt_terminator: bb_idx,
                         })
                     }
@@ -669,10 +702,9 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
         &self,
         adt_matched_on: Place<'tcx>,
         x: &Statement<'tcx>,
-        x_bb_idx: BasicBlock,
+        x_target_and_value: &SwitchTargetAndValue,
         y: &Statement<'tcx>,
-        y_bb_idx: BasicBlock,
-        mir_opt_level: usize,
+        y_target_and_value: &SwitchTargetAndValue,
     ) -> StatementEquality {
         let helper = |rhs: &Rvalue<'tcx>,
                       place: &Place<'tcx>,
@@ -691,13 +723,7 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
 
             match rhs {
                 Rvalue::Use(operand) if operand.place() == Some(adt_matched_on) => {
-                    // FIXME(76803): This logic is currently broken because it does not take into
-                    // account the current discriminant value.
-                    if mir_opt_level > 2 {
-                        StatementEquality::ConsideredEqual(side_to_choose)
-                    } else {
-                        StatementEquality::NotEqual
-                    }
+                    StatementEquality::ConsideredEqual(side_to_choose)
                 }
                 _ => {
                     trace!(
@@ -717,16 +743,20 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
             (
                 StatementKind::Assign(box (_, rhs)),
                 StatementKind::SetDiscriminant { place, variant_index },
-            ) => {
+            )
+            // we need to make sure that the switch value that targets the bb with SetDiscriminant (y), is the same as the variant index
+            if Some(variant_index.index() as u128) == y_target_and_value.value => {
                 // choose basic block of x, as that has the assign
-                helper(rhs, place, variant_index, x_bb_idx)
+                helper(rhs, place, variant_index, x_target_and_value.target)
             }
             (
                 StatementKind::SetDiscriminant { place, variant_index },
                 StatementKind::Assign(box (_, rhs)),
-            ) => {
+            )
+            // we need to make sure that the switch value that targets the bb with SetDiscriminant (x), is the same as the variant index
+            if Some(variant_index.index() as u128) == x_target_and_value.value  => {
                 // choose basic block of y, as that has the assign
-                helper(rhs, place, variant_index, y_bb_idx)
+                helper(rhs, place, variant_index, y_target_and_value.target)
             }
             _ => {
                 trace!("NO: statements `{:?}` and `{:?}` not considered equal", x, y);

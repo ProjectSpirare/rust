@@ -179,9 +179,10 @@ macro_rules! options {
     {
         let mut op = $defaultfn();
         for option in matches.opt_strs($prefix) {
-            let mut iter = option.splitn(2, '=');
-            let key = iter.next().unwrap();
-            let value = iter.next();
+            let (key, value) = match option.split_once('=') {
+                None => (option, None),
+                Some((k, v)) => (k.to_string(), Some(v)),
+            };
             let option_to_lookup = key.replace("-", "_");
             let mut found = false;
             for &(candidate, setter, type_desc, _) in $stat {
@@ -268,6 +269,7 @@ macro_rules! options {
         pub const parse_switch_with_opt_path: &str =
             "an optional path to the profiling data output directory";
         pub const parse_merge_functions: &str = "one of: `disabled`, `trampolines`, or `aliases`";
+        pub const parse_split_dwarf_kind: &str = "one of: `none`, `single` or `split`";
         pub const parse_symbol_mangling_version: &str = "either `legacy` or `v0` (RFC 2603)";
         pub const parse_src_file_hash: &str = "either `md5` or `sha1`";
         pub const parse_relocation_model: &str =
@@ -277,6 +279,7 @@ macro_rules! options {
         pub const parse_tls_model: &str =
             "one of supported TLS models (`rustc --print tls-models`)";
         pub const parse_target_feature: &str = parse_string;
+        pub const parse_wasi_exec_model: &str = "either `command` or `reactor`";
     }
 
     #[allow(dead_code)]
@@ -675,13 +678,26 @@ macro_rules! options {
             true
         }
 
-        fn parse_symbol_mangling_version(
-            slot: &mut SymbolManglingVersion,
+        fn parse_split_dwarf_kind(
+            slot: &mut SplitDwarfKind,
             v: Option<&str>,
         ) -> bool {
             *slot = match v {
-                Some("legacy") => SymbolManglingVersion::Legacy,
-                Some("v0") => SymbolManglingVersion::V0,
+                Some("none") => SplitDwarfKind::None,
+                Some("split") => SplitDwarfKind::Split,
+                Some("single") => SplitDwarfKind::Single,
+                _ => return false,
+            };
+            true
+        }
+
+        fn parse_symbol_mangling_version(
+            slot: &mut Option<SymbolManglingVersion>,
+            v: Option<&str>,
+        ) -> bool {
+            *slot = match v {
+                Some("legacy") => Some(SymbolManglingVersion::Legacy),
+                Some("v0") => Some(SymbolManglingVersion::V0),
                 _ => return false,
             };
             true
@@ -707,6 +723,15 @@ macro_rules! options {
                 None => false,
             }
         }
+
+        fn parse_wasi_exec_model(slot: &mut Option<WasiExecModel>, v: Option<&str>) -> bool {
+            match v {
+                Some("command")  => *slot = Some(WasiExecModel::Command),
+                Some("reactor") => *slot = Some(WasiExecModel::Reactor),
+                _ => return false,
+            }
+            true
+        }
     }
 ) }
 
@@ -717,7 +742,7 @@ options! {CodegenOptions, CodegenSetter, basic_codegen_options,
     // This list is in alphabetical order.
     //
     // If you add a new option, please update:
-    // - src/librustc_interface/tests.rs
+    // - compiler/rustc_interface/src/tests.rs
     // - src/doc/rustc/src/codegen-options/index.md
 
     ar: String = (String::new(), parse_string, [UNTRACKED],
@@ -814,7 +839,7 @@ options! {CodegenOptions, CodegenSetter, basic_codegen_options,
     // This list is in alphabetical order.
     //
     // If you add a new option, please update:
-    // - src/librustc_interface/tests.rs
+    // - compiler/rustc_interface/src/tests.rs
     // - src/doc/rustc/src/codegen-options/index.md
 }
 
@@ -825,7 +850,7 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
     // This list is in alphabetical order.
     //
     // If you add a new option, please update:
-    // - src/librustc_interface/tests.rs
+    // - compiler/rustc_interface/src/tests.rs
 
     allow_features: Option<Vec<String>> = (None, parse_opt_comma_list, [TRACKED],
         "only allow the listed language features to be enabled in code (space separated)"),
@@ -887,20 +912,20 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
     dump_mir_exclude_pass_number: bool = (false, parse_bool, [UNTRACKED],
         "exclude the pass number when dumping MIR (used in tests) (default: no)"),
     dump_mir_graphviz: bool = (false, parse_bool, [UNTRACKED],
-        "in addition to `.mir` files, create graphviz `.dot` files (default: no)"),
+        "in addition to `.mir` files, create graphviz `.dot` files (and with \
+        `-Z instrument-coverage`, also create a `.dot` file for the MIR-derived \
+        coverage graph) (default: no)"),
     dump_mir_spanview: Option<MirSpanview> = (None, parse_mir_spanview, [UNTRACKED],
         "in addition to `.mir` files, create `.html` files to view spans for \
         all `statement`s (including terminators), only `terminator` spans, or \
         computed `block` spans (one span encompassing a block's terminator and \
-        all statements)."),
+        all statements). If `-Z instrument-coverage` is also enabled, create \
+        an additional `.html` file showing the computed coverage spans."),
+    emit_future_incompat_report: bool = (false, parse_bool, [UNTRACKED],
+        "emits a future-incompatibility report for lints (RFC 2834)"),
     emit_stack_sizes: bool = (false, parse_bool, [UNTRACKED],
         "emit a section containing stack size metadata (default: no)"),
-    experimental_coverage: bool = (false, parse_bool, [TRACKED],
-        "enable and extend the `-Z instrument-coverage` function-level coverage \
-        feature, adding additional experimental (likely inaccurate) counters and \
-        code regions (used by `rustc` compiler developers to test new coverage \
-        counter placements) (default: no)"),
-    fewer_names: bool = (false, parse_bool, [TRACKED],
+    fewer_names: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "reduce memory use by retaining fewer names within compilation artifacts (LLVM-IR) \
         (default: no)"),
     force_overflow_checks: Option<bool> = (None, parse_opt_bool, [TRACKED],
@@ -909,6 +934,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "force all crates to be `rustc_private` unstable (default: no)"),
     fuel: Option<(String, u64)> = (None, parse_optimization_fuel, [TRACKED],
         "set the optimization fuel quota for a crate"),
+    function_sections: Option<bool> = (None, parse_opt_bool, [TRACKED],
+        "whether each function should go in its own section"),
     graphviz_dark_mode: bool = (false, parse_bool, [UNTRACKED],
         "use dark-themed colors in graphviz output (default: no)"),
     graphviz_font: String = ("Courier, monospace".to_string(), parse_string, [UNTRACKED],
@@ -927,6 +954,10 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         (default: no)"),
     incremental_verify_ich: bool = (false, parse_bool, [UNTRACKED],
         "verify incr. comp. hashes of green query instances (default: no)"),
+    inline_mir_threshold: usize = (50, parse_uint, [TRACKED],
+        "a default MIR inlining threshold (default: 50)"),
+    inline_mir_hint_threshold: usize = (100, parse_uint, [TRACKED],
+        "inlining threshold for functions with inline hint (default: 100)"),
     inline_in_all_cgus: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "control whether `#[inline]` functions are in all CGUs"),
     input_stats: bool = (false, parse_bool, [UNTRACKED],
@@ -939,8 +970,7 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "instrument the generated code to support LLVM source-based code coverage \
         reports (note, the compiler build config must include `profiler = true`, \
         and is mutually exclusive with `-C profile-generate`/`-C profile-use`); \
-        implies `-C link-dead-code` (unless targeting MSVC, or explicitly disabled) \
-        and `-Z symbol-mangling-version=v0`; disables/overrides some Rust \
+        implies `-Z symbol-mangling-version=v0`; disables/overrides some Rust \
         optimizations (default: no)"),
     instrument_mcount: bool = (false, parse_bool, [TRACKED],
         "insert function instrument code for mcount-based tracing (default: no)"),
@@ -972,6 +1002,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "use new LLVM pass manager (default: no)"),
     nll_facts: bool = (false, parse_bool, [UNTRACKED],
         "dump facts from NLL analysis into side files (default: no)"),
+    nll_facts_dir: String = ("nll-facts".to_string(), parse_string, [UNTRACKED],
+        "the directory the NLL facts are dumped into (default: `nll-facts`)"),
     no_analysis: bool = (false, parse_no_flag, [UNTRACKED],
         "parse and expand the source, but run no analysis"),
     no_codegen: bool = (false, parse_no_flag, [TRACKED],
@@ -988,6 +1020,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "run LLVM in non-parallel mode (while keeping codegen-units and ThinLTO)"),
     no_profiler_runtime: bool = (false, parse_no_flag, [TRACKED],
         "prevent automatic injection of the profiler_builtins crate"),
+    normalize_docs: bool = (false, parse_bool, [TRACKED],
+        "normalize associated items in rustdoc when generating documentation"),
     osx_rpath_install_name: bool = (false, parse_bool, [TRACKED],
         "pass `-install_name @rpath/...` to the macOS linker (default: no)"),
     panic_abort_tests: bool = (false, parse_bool, [TRACKED],
@@ -1000,7 +1034,7 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "whether to use the PLT when calling into shared libraries;
         only has effect for PIC code on systems with ELF binaries
         (default: PLT is disabled if full relro is enabled)"),
-    polonius: bool = (false, parse_bool, [UNTRACKED],
+    polonius: bool = (false, parse_bool, [TRACKED],
         "enable polonius-based borrow-checker (default: no)"),
     polymorphize: bool = (false, parse_bool, [TRACKED],
           "perform polymorphization analysis"),
@@ -1008,6 +1042,10 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "a single extra argument to prepend the linker invocation (can be used several times)"),
     pre_link_args: Vec<String> = (Vec::new(), parse_list, [UNTRACKED],
         "extra arguments to prepend to the linker invocation (space separated)"),
+    precise_enum_drop_elaboration: bool = (true, parse_bool, [TRACKED],
+        "use a more precise version of drop elaboration for matches on enums (default: yes). \
+        This results in better codegen, but has caused miscompilations on some tier 2 platforms. \
+        See #77382 and #74551."),
     print_fuel: Option<String> = (None, parse_opt_string, [TRACKED],
         "make rustc print the total optimization fuel used by a crate"),
     print_link_args: bool = (false, parse_bool, [UNTRACKED],
@@ -1029,6 +1067,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "enable queries of the dependency graph for regression testing (default: no)"),
     query_stats: bool = (false, parse_bool, [UNTRACKED],
         "print some statistics about the query system (default: no)"),
+    relax_elf_relocations: Option<bool> = (None, parse_opt_bool, [TRACKED],
+        "whether ELF relocations can be relaxed"),
     relro_level: Option<RelroLevel> = (None, parse_relro_level, [TRACKED],
         "choose which RELRO level to use"),
     report_delayed_bugs: bool = (false, parse_bool, [TRACKED],
@@ -1069,16 +1109,23 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
     span_free_formats: bool = (false, parse_bool, [UNTRACKED],
         "exclude spans when debug-printing compiler state (default: no)"),
     src_hash_algorithm: Option<SourceFileHashAlgorithm> = (None, parse_src_file_hash, [TRACKED],
-        "hash algorithm of source files in debug info (`md5`, or `sha1`)"),
+        "hash algorithm of source files in debug info (`md5`, `sha1`, or `sha256`)"),
     strip: Strip = (Strip::None, parse_strip, [UNTRACKED],
         "tell the linker which information to strip (`none` (default), `debuginfo` or `symbols`)"),
-    symbol_mangling_version: SymbolManglingVersion = (SymbolManglingVersion::Legacy,
+    split_dwarf: SplitDwarfKind = (SplitDwarfKind::None, parse_split_dwarf_kind, [UNTRACKED],
+        "enable generation of split dwarf"),
+    split_dwarf_inlining: bool = (true, parse_bool, [UNTRACKED],
+        "provide minimal debug info in the object/executable to facilitate online \
+         symbolication/stack traces in the absence of .dwo/.dwp files when using Split DWARF"),
+    symbol_mangling_version: Option<SymbolManglingVersion> = (None,
         parse_symbol_mangling_version, [TRACKED],
-        "which mangling version to use for symbol names"),
+        "which mangling version to use for symbol names ('legacy' (default) or 'v0')"),
     teach: bool = (false, parse_bool, [TRACKED],
         "show extended diagnostic help (default: no)"),
     terminal_width: Option<usize> = (None, parse_opt_uint, [UNTRACKED],
         "set the current terminal width"),
+    tune_cpu: Option<String> = (None, parse_opt_string, [TRACKED],
+        "select processor to schedule for (`rustc --print target-cpus` for details)"),
     thinlto: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "enable ThinLTO when possible"),
     // We default to 1 here since we want to behave like
@@ -1097,6 +1144,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "choose the TLS model to use (`rustc --print tls-models` for details)"),
     trace_macros: bool = (false, parse_bool, [UNTRACKED],
         "for every macro invocation, print its name and arguments (default: no)"),
+    trap_unreachable: Option<bool> = (None, parse_opt_bool, [TRACKED],
+        "generate trap instructions for unreachable intrinsics (default: use target setting, usually yes)"),
     treat_err_as_bug: Option<usize> = (None, parse_treat_err_as_bug, [TRACKED],
         "treat error number `val` that occurs as bug"),
     trim_diagnostic_paths: bool = (true, parse_bool, [UNTRACKED],
@@ -1115,6 +1164,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         `hir,typed` (HIR with types for each node),
         `hir-tree` (dump the raw HIR),
         `mir` (the MIR), or `mir-cfg` (graphviz formatted MIR)"),
+    unsound_mir_opts: bool = (false, parse_bool, [TRACKED],
+        "enable unsound and buggy MIR optimizations (default: no)"),
     unstable_options: bool = (false, parse_bool, [UNTRACKED],
         "adds unstable command line options to rustc interface (default: no)"),
     use_ctors_section: Option<bool> = (None, parse_opt_bool, [TRACKED],
@@ -1125,9 +1176,17 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "in general, enable more debug printouts (default: no)"),
     verify_llvm_ir: bool = (false, parse_bool, [TRACKED],
         "verify LLVM IR (default: no)"),
+    wasi_exec_model: Option<WasiExecModel> = (None, parse_wasi_exec_model, [TRACKED],
+        "whether to build a wasi command or reactor"),
 
     // This list is in alphabetical order.
     //
     // If you add a new option, please update:
-    // - src/librustc_interface/tests.rs
+    // - compiler/rustc_interface/src/tests.rs
+}
+
+#[derive(Clone, Hash)]
+pub enum WasiExecModel {
+    Command,
+    Reactor,
 }

@@ -66,12 +66,12 @@ pub mod thread;
 pub mod thread_info;
 pub mod thread_local_dtor;
 pub mod thread_local_key;
+pub mod thread_parker;
 pub mod util;
 pub mod wtf8;
 
 cfg_if::cfg_if! {
-    if #[cfg(any(target_os = "cloudabi",
-                 target_os = "l4re",
+    if #[cfg(any(target_os = "l4re",
                  target_os = "hermit",
                  feature = "restricted-std",
                  all(target_arch = "wasm32", not(target_os = "emscripten")),

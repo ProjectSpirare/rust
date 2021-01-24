@@ -5,14 +5,12 @@
 //! generated instead.
 
 #![doc(
-    html_root_url = "https://doc.rust-lang.org/nightly/",
+    html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
     html_playground_url = "https://play.rust-lang.org/",
     test(attr(deny(warnings)))
 )]
 #![feature(nll)]
 #![feature(or_patterns)]
-#![feature(rustc_private)]
-#![feature(unicode_internals)]
 #![feature(bool_to_option)]
 
 pub use Alignment::*;
@@ -349,7 +347,7 @@ impl<'a> Parser<'a> {
         let mut pos = pos;
         // This handles the raw string case, the raw argument is the number of #
         // in r###"..."### (we need to add one because of the `r`).
-        let raw = self.style.map(|raw| raw + 1).unwrap_or(0);
+        let raw = self.style.map_or(0, |raw| raw + 1);
         for skip in &self.skips {
             if pos > *skip {
                 pos += 1;
@@ -527,12 +525,9 @@ impl<'a> Parser<'a> {
 
         // fill character
         if let Some(&(_, c)) = self.cur.peek() {
-            match self.cur.clone().nth(1) {
-                Some((_, '>' | '<' | '^')) => {
-                    spec.fill = Some(c);
-                    self.cur.next();
-                }
-                _ => {}
+            if let Some((_, '>' | '<' | '^')) = self.cur.clone().nth(1) {
+                spec.fill = Some(c);
+                self.cur.next();
             }
         }
         // Alignment
@@ -741,7 +736,7 @@ fn find_skips_from_snippet(
 
     fn find_skips(snippet: &str, is_raw: bool) -> Vec<usize> {
         let mut eat_ws = false;
-        let mut s = snippet.chars().enumerate().peekable();
+        let mut s = snippet.char_indices().peekable();
         let mut skips = vec![];
         while let Some((pos, c)) = s.next() {
             match (c, s.peek()) {
@@ -819,7 +814,7 @@ fn find_skips_from_snippet(
         skips
     }
 
-    let r_start = str_style.map(|r| r + 1).unwrap_or(0);
+    let r_start = str_style.map_or(0, |r| r + 1);
     let r_end = str_style.unwrap_or(0);
     let s = &snippet[r_start + 1..snippet.len() - r_end - 1];
     (find_skips(s, str_style.is_some()), true)

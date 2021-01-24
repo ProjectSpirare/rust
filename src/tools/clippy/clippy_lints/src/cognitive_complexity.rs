@@ -7,7 +7,7 @@ use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::hir::map::Map;
 use rustc_session::{declare_tool_lint, impl_lint_pass};
 use rustc_span::source_map::Span;
-use rustc_span::BytePos;
+use rustc_span::{sym, BytePos};
 
 use crate::utils::{is_type_diagnostic_item, snippet_opt, span_lint_and_help, LimitStack};
 
@@ -61,7 +61,7 @@ impl CognitiveComplexity {
         helper.visit_expr(expr);
         let CCHelper { cc, returns } = helper;
         let ret_ty = cx.typeck_results().node_type(expr.hir_id);
-        let ret_adjust = if is_type_diagnostic_item(cx, ret_ty, sym!(result_type)) {
+        let ret_adjust = if is_type_diagnostic_item(cx, ret_ty, sym::result_type) {
             returns
         } else {
             #[allow(clippy::integer_division)]
@@ -123,7 +123,7 @@ impl<'tcx> LateLintPass<'tcx> for CognitiveComplexity {
         hir_id: HirId,
     ) {
         let def_id = cx.tcx.hir().local_def_id(hir_id);
-        if !cx.tcx.has_attr(def_id.to_def_id(), sym!(test)) {
+        if !cx.tcx.has_attr(def_id.to_def_id(), sym::test) {
             self.check(cx, kind, decl, body, span);
         }
     }
@@ -147,6 +147,9 @@ impl<'tcx> Visitor<'tcx> for CCHelper {
     fn visit_expr(&mut self, e: &'tcx Expr<'_>) {
         walk_expr(self, e);
         match e.kind {
+            ExprKind::If(_, _, _) => {
+                self.cc += 1;
+            },
             ExprKind::Match(_, ref arms, _) => {
                 if arms.len() > 1 {
                     self.cc += 1;

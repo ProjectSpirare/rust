@@ -1,9 +1,6 @@
-use super::InPlaceIterable;
 use crate::intrinsics;
-use crate::iter::adapters::zip::try_get_unchecked;
-use crate::iter::adapters::SourceIter;
-use crate::iter::TrustedRandomAccess;
-use crate::iter::{DoubleEndedIterator, ExactSizeIterator, FusedIterator, Iterator};
+use crate::iter::adapters::{zip::try_get_unchecked, InPlaceIterable, SourceIter};
+use crate::iter::{DoubleEndedIterator, ExactSizeIterator, FusedIterator, TrustedRandomAccess};
 use crate::ops::Try;
 
 /// An iterator that yields `None` forever after the underlying iterator
@@ -115,12 +112,13 @@ where
     }
 
     #[inline]
-    unsafe fn get_unchecked(&mut self, idx: usize) -> Self::Item
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> Self::Item
     where
         Self: TrustedRandomAccess,
     {
         match self.iter {
-            // SAFETY: the caller must uphold the contract for `Iterator::get_unchecked`.
+            // SAFETY: the caller must uphold the contract for
+            // `Iterator::__iterator_get_unchecked`.
             Some(ref mut iter) => unsafe { try_get_unchecked(iter, idx) },
             // SAFETY: the caller asserts there is an item at `i`, so we're not exhausted.
             None => unsafe { intrinsics::unreachable() },
@@ -302,7 +300,7 @@ where
             acc = iter.try_fold(acc, fold)?;
             self.iter = None;
         }
-        Try::from_ok(acc)
+        try { acc }
     }
 
     #[inline]
@@ -352,7 +350,7 @@ where
             acc = iter.try_rfold(acc, fold)?;
             self.iter = None;
         }
-        Try::from_ok(acc)
+        try { acc }
     }
 
     #[inline]

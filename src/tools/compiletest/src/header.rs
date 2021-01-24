@@ -208,10 +208,13 @@ impl EarlyProps {
                 config.parse_name_value_directive(line, "needs-llvm-components")
             {
                 let components: HashSet<_> = config.llvm_components.split_whitespace().collect();
-                if !needed_components
+                if let Some(missing_component) = needed_components
                     .split_whitespace()
-                    .all(|needed_component| components.contains(needed_component))
+                    .find(|needed_component| !components.contains(needed_component))
                 {
+                    if env::var_os("COMPILETEST_NEEDS_ALL_LLVM_COMPONENTS").is_some() {
+                        panic!("missing LLVM component: {}", missing_component);
+                    }
                     return true;
                 }
             }
@@ -539,10 +542,7 @@ impl TestProps {
         }
 
         if self.failure_status == -1 {
-            self.failure_status = match config.mode {
-                Mode::RunFail => 101,
-                _ => 1,
-            };
+            self.failure_status = 1;
         }
         if self.should_ice {
             self.failure_status = 101;
@@ -849,6 +849,8 @@ impl Config {
                 Some(CompareMode::Nll) => name == "compare-mode-nll",
                 Some(CompareMode::Polonius) => name == "compare-mode-polonius",
                 Some(CompareMode::Chalk) => name == "compare-mode-chalk",
+                Some(CompareMode::SplitDwarf) => name == "compare-mode-split-dwarf",
+                Some(CompareMode::SplitDwarfSingle) => name == "compare-mode-split-dwarf-single",
                 None => false,
             } ||
             (cfg!(debug_assertions) && name == "debug") ||

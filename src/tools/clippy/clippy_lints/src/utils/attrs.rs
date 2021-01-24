@@ -1,6 +1,7 @@
 use rustc_ast::ast;
 use rustc_errors::Applicability;
 use rustc_session::Session;
+use rustc_span::sym;
 use std::str::FromStr;
 
 /// Deprecation status of attributes known by Clippy.
@@ -21,6 +22,7 @@ pub const BUILTIN_ATTRIBUTES: &[(&str, DeprecationStatus)] = &[
         DeprecationStatus::Replaced("cognitive_complexity"),
     ),
     ("dump", DeprecationStatus::None),
+    ("msrv", DeprecationStatus::None),
 ];
 
 pub struct LimitStack {
@@ -57,17 +59,17 @@ pub fn get_attr<'a>(
     name: &'static str,
 ) -> impl Iterator<Item = &'a ast::Attribute> {
     attrs.iter().filter(move |attr| {
-        let attr = if let ast::AttrKind::Normal(ref attr) = attr.kind {
+        let attr = if let ast::AttrKind::Normal(ref attr, _) = attr.kind {
             attr
         } else {
             return false;
         };
         let attr_segments = &attr.path.segments;
-        if attr_segments.len() == 2 && attr_segments[0].ident.to_string() == "clippy" {
+        if attr_segments.len() == 2 && attr_segments[0].ident.name == sym::clippy {
             BUILTIN_ATTRIBUTES
                 .iter()
-                .find_map(|(builtin_name, deprecation_status)| {
-                    if *builtin_name == attr_segments[1].ident.to_string() {
+                .find_map(|&(builtin_name, ref deprecation_status)| {
+                    if attr_segments[1].ident.name.as_str() == builtin_name {
                         Some(deprecation_status)
                     } else {
                         None
@@ -98,7 +100,7 @@ pub fn get_attr<'a>(
                             },
                             DeprecationStatus::None => {
                                 diag.cancel();
-                                attr_segments[1].ident.to_string() == name
+                                attr_segments[1].ident.name.as_str() == name
                             },
                         }
                     },
@@ -121,6 +123,24 @@ fn parse_attrs<F: FnMut(u64)>(sess: &Session, attrs: &[ast::Attribute], name: &'
             sess.span_err(attr.span, "bad clippy attribute");
         }
     }
+}
+
+pub fn get_unique_inner_attr(sess: &Session, attrs: &[ast::Attribute], name: &'static str) -> Option<ast::Attribute> {
+    let mut unique_attr = None;
+    for attr in get_attr(sess, attrs, name) {
+        match attr.style {
+            ast::AttrStyle::Inner if unique_attr.is_none() => unique_attr = Some(attr.clone()),
+            ast::AttrStyle::Inner => {
+                sess.struct_span_err(attr.span, &format!("`{}` is defined multiple times", name))
+                    .span_note(unique_attr.as_ref().unwrap().span, "first definition found here")
+                    .emit();
+            },
+            ast::AttrStyle::Outer => {
+                sess.span_err(attr.span, &format!("`{}` cannot be an outer attribute", name));
+            },
+        }
+    }
+    unique_attr
 }
 
 /// Return true if the attributes contain any of `proc_macro`,

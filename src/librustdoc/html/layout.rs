@@ -1,37 +1,40 @@
 use std::path::PathBuf;
 
+use rustc_data_structures::fx::FxHashMap;
+
 use crate::externalfiles::ExternalHtml;
 use crate::html::escape::Escape;
 use crate::html::format::{Buffer, Print};
 use crate::html::render::{ensure_trailing_slash, StylePath};
 
 #[derive(Clone)]
-pub struct Layout {
-    pub logo: String,
-    pub favicon: String,
-    pub external_html: ExternalHtml,
-    pub krate: String,
+crate struct Layout {
+    crate logo: String,
+    crate favicon: String,
+    crate external_html: ExternalHtml,
+    crate default_settings: FxHashMap<String, String>,
+    crate krate: String,
     /// The given user css file which allow to customize the generated
     /// documentation theme.
-    pub css_file_extension: Option<PathBuf>,
+    crate css_file_extension: Option<PathBuf>,
     /// If false, the `select` element to have search filtering by crates on rendered docs
     /// won't be generated.
-    pub generate_search_filter: bool,
+    crate generate_search_filter: bool,
 }
 
-pub struct Page<'a> {
-    pub title: &'a str,
-    pub css_class: &'a str,
-    pub root_path: &'a str,
-    pub static_root_path: Option<&'a str>,
-    pub description: &'a str,
-    pub keywords: &'a str,
-    pub resource_suffix: &'a str,
-    pub extra_scripts: &'a [&'a str],
-    pub static_extra_scripts: &'a [&'a str],
+crate struct Page<'a> {
+    crate title: &'a str,
+    crate css_class: &'a str,
+    crate root_path: &'a str,
+    crate static_root_path: Option<&'a str>,
+    crate description: &'a str,
+    crate keywords: &'a str,
+    crate resource_suffix: &'a str,
+    crate extra_scripts: &'a [&'a str],
+    crate static_extra_scripts: &'a [&'a str],
 }
 
-pub fn render<T: Print, S: Print>(
+crate fn render<T: Print, S: Print>(
     layout: &Layout,
     page: &Page<'_>,
     sidebar: S,
@@ -53,6 +56,7 @@ pub fn render<T: Print, S: Print>(
     <link rel=\"stylesheet\" type=\"text/css\" href=\"{static_root_path}rustdoc{suffix}.css\" \
           id=\"mainThemeStyle\">\
     {style_files}\
+    <script id=\"default-settings\"{default_settings}></script>\
     <script src=\"{static_root_path}storage{suffix}.js\"></script>\
     <noscript><link rel=\"stylesheet\" href=\"{static_root_path}noscript{suffix}.css\"></noscript>\
     {css_extension}\
@@ -76,12 +80,12 @@ pub fn render<T: Print, S: Print>(
         {sidebar}\
     </nav>\
     <div class=\"theme-picker\">\
-        <button id=\"theme-picker\" aria-label=\"Pick another theme!\">\
+        <button id=\"theme-picker\" aria-label=\"Pick another theme!\" aria-haspopup=\"menu\">\
             <img src=\"{static_root_path}brush{suffix}.svg\" \
                  width=\"18\" \
                  alt=\"Pick another theme!\">\
         </button>\
-        <div id=\"theme-choices\"></div>\
+        <div id=\"theme-choices\" role=\"menu\"></div>\
     </div>\
     <script src=\"{static_root_path}theme{suffix}.js\"></script>\
     <nav class=\"sub\">\
@@ -95,7 +99,7 @@ pub fn render<T: Print, S: Print>(
                            placeholder=\"Click or press ‘S’ to search, ‘?’ for more options…\" \
                            type=\"search\">\
                 </div>\
-                <span class=\"help-button\">?</span>
+                <button type=\"button\" class=\"help-button\">?</button>
                 <a id=\"settings-menu\" href=\"{root_path}settings.html\">\
                     <img src=\"{static_root_path}wheel{suffix}.svg\" \
                          width=\"18\" \
@@ -108,10 +112,7 @@ pub fn render<T: Print, S: Print>(
     <section id=\"search\" class=\"content hidden\"></section>\
     <section class=\"footer\"></section>\
     {after_content}\
-    <script>\
-        window.rootPath = \"{root_path}\";\
-        window.currentCrate = \"{krate}\";\
-    </script>\
+    <div id=\"rustdoc-vars\" data-root-path=\"{root_path}\" data-current-crate=\"{krate}\"></div>
     <script src=\"{static_root_path}main{suffix}.js\"></script>\
     {static_extra_scripts}\
     {extra_scripts}\
@@ -158,7 +159,9 @@ pub fn render<T: Print, S: Print>(
         keywords = page.keywords,
         favicon = if layout.favicon.is_empty() {
             format!(
-                r#"<link rel="shortcut icon" href="{static_root_path}favicon{suffix}.ico">"#,
+                r##"<link rel="icon" type="image/svg+xml" href="{static_root_path}favicon{suffix}.svg">
+<link rel="alternate icon" type="image/png" href="{static_root_path}favicon-16x16{suffix}.png">
+<link rel="alternate icon" type="image/png" href="{static_root_path}favicon-32x32{suffix}.png">"##,
                 static_root_path = static_root_path,
                 suffix = page.resource_suffix
             )
@@ -170,6 +173,11 @@ pub fn render<T: Print, S: Print>(
         after_content = layout.external_html.after_content,
         sidebar = Buffer::html().to_display(sidebar),
         krate = layout.krate,
+        default_settings = layout
+            .default_settings
+            .iter()
+            .map(|(k, v)| format!(r#" data-{}="{}""#, k.replace('-', "_"), Escape(v)))
+            .collect::<String>(),
         style_files = style_files
             .iter()
             .filter_map(|t| {
@@ -218,7 +226,7 @@ pub fn render<T: Print, S: Print>(
     )
 }
 
-pub fn redirect(url: &str) -> String {
+crate fn redirect(url: &str) -> String {
     // <script> triggers a redirect before refresh, so this is fine.
     format!(
         r##"<!DOCTYPE html>

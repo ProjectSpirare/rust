@@ -62,41 +62,16 @@ pub enum LinkOrCopy {
 pub fn link_or_copy<P: AsRef<Path>, Q: AsRef<Path>>(p: P, q: Q) -> io::Result<LinkOrCopy> {
     let p = p.as_ref();
     let q = q.as_ref();
-    if q.exists() {
-        fs::remove_file(&q)?;
+    match fs::remove_file(&q) {
+        Ok(()) => (),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => (),
+        Err(err) => return Err(err),
     }
 
     match fs::hard_link(p, q) {
         Ok(()) => Ok(LinkOrCopy::Link),
         Err(_) => match fs::copy(p, q) {
             Ok(_) => Ok(LinkOrCopy::Copy),
-            Err(e) => Err(e),
-        },
-    }
-}
-
-#[derive(Debug)]
-pub enum RenameOrCopyRemove {
-    Rename,
-    CopyRemove,
-}
-
-/// Rename `p` into `q`, preferring to use `rename` if possible.
-/// If `rename` fails (rename may fail for reasons such as crossing
-/// filesystem), fallback to copy & remove
-pub fn rename_or_copy_remove<P: AsRef<Path>, Q: AsRef<Path>>(
-    p: P,
-    q: Q,
-) -> io::Result<RenameOrCopyRemove> {
-    let p = p.as_ref();
-    let q = q.as_ref();
-    match fs::rename(p, q) {
-        Ok(()) => Ok(RenameOrCopyRemove::Rename),
-        Err(_) => match fs::copy(p, q) {
-            Ok(_) => {
-                fs::remove_file(p)?;
-                Ok(RenameOrCopyRemove::CopyRemove)
-            }
             Err(e) => Err(e),
         },
     }

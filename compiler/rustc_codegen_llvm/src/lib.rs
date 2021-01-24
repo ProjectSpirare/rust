@@ -4,7 +4,7 @@
 //!
 //! This API is completely unstable and subject to change.
 
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
+#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![feature(bool_to_option)]
 #![feature(const_cstr_unchecked)]
 #![feature(crate_visibility_modifier)]
@@ -12,7 +12,6 @@
 #![feature(in_band_lifetimes)]
 #![feature(nll)]
 #![feature(or_patterns)]
-#![feature(trusted_len)]
 #![recursion_limit = "256"]
 
 use back::write::{create_informational_target_machine, create_target_machine};
@@ -20,23 +19,23 @@ use back::write::{create_informational_target_machine, create_target_machine};
 pub use llvm_util::target_features;
 use rustc_ast::expand::allocator::AllocatorKind;
 use rustc_codegen_ssa::back::lto::{LtoModuleCodegen, SerializedModule, ThinModule};
-use rustc_codegen_ssa::back::write::{CodegenContext, FatLTOInput, ModuleConfig};
+use rustc_codegen_ssa::back::write::{
+    CodegenContext, FatLTOInput, ModuleConfig, TargetMachineFactoryConfig, TargetMachineFactoryFn,
+};
 use rustc_codegen_ssa::traits::*;
 use rustc_codegen_ssa::ModuleCodegen;
 use rustc_codegen_ssa::{CodegenResults, CompiledModule};
+use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{ErrorReported, FatalError, Handler};
-use rustc_middle::dep_graph::{DepGraph, WorkProduct};
+use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::middle::cstore::{EncodedMetadata, MetadataLoaderDyn};
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_serialize::json;
-use rustc_session::config::{self, OptLevel, OutputFilenames, PrintRequest};
+use rustc_session::config::{OptLevel, OutputFilenames, PrintRequest};
 use rustc_session::Session;
 use rustc_span::symbol::Symbol;
 
 use std::any::Any;
 use std::ffi::CStr;
-use std::fs;
-use std::sync::Arc;
 
 mod back {
     pub mod archive;
@@ -96,8 +95,9 @@ impl ExtraBackendMethods for LlvmCodegenBackend {
         tcx: TyCtxt<'tcx>,
         mods: &mut ModuleLlvm,
         kind: AllocatorKind,
+        has_alloc_error_handler: bool,
     ) {
-        unsafe { allocator::codegen(tcx, mods, kind) }
+        unsafe { allocator::codegen(tcx, mods, kind, has_alloc_error_handler) }
     }
     fn compile_codegen_unit(
         &self,
@@ -110,11 +110,14 @@ impl ExtraBackendMethods for LlvmCodegenBackend {
         &self,
         sess: &Session,
         optlvl: OptLevel,
-    ) -> Arc<dyn Fn() -> Result<&'static mut llvm::TargetMachine, String> + Send + Sync> {
+    ) -> TargetMachineFactoryFn<Self> {
         back::write::target_machine_factory(sess, optlvl)
     }
     fn target_cpu<'b>(&self, sess: &'b Session) -> &'b str {
         llvm_util::target_cpu(sess)
+    }
+    fn tune_cpu<'b>(&self, sess: &'b Session) -> Option<&'b str> {
+        llvm_util::tune_cpu(sess)
     }
 }
 
@@ -157,7 +160,7 @@ impl WriteBackendMethods for LlvmCodegenBackend {
         module: &ModuleCodegen<Self::Module>,
         config: &ModuleConfig,
     ) -> Result<(), FatalError> {
-        back::write::optimize(cgcx, diag_handler, module, config)
+        Ok(back::write::optimize(cgcx, diag_handler, module, config))
     }
     unsafe fn optimize_thin(
         cgcx: &CodegenContext<Self>,
@@ -249,11 +252,11 @@ impl CodegenBackend for LlvmCodegenBackend {
     }
 
     fn provide(&self, providers: &mut ty::query::Providers) {
-        attributes::provide(providers);
+        attributes::provide_both(providers);
     }
 
     fn provide_extern(&self, providers: &mut ty::query::Providers) {
-        attributes::provide_extern(providers);
+        attributes::provide_both(providers);
     }
 
     fn codegen_crate<'tcx>(
@@ -274,72 +277,40 @@ impl CodegenBackend for LlvmCodegenBackend {
         &self,
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
-        dep_graph: &DepGraph,
-    ) -> Result<Box<dyn Any>, ErrorReported> {
+    ) -> Result<(CodegenResults, FxHashMap<WorkProductId, WorkProduct>), ErrorReported> {
         let (codegen_results, work_products) = ongoing_codegen
             .downcast::<rustc_codegen_ssa::back::write::OngoingCodegen<LlvmCodegenBackend>>()
             .expect("Expected LlvmCodegenBackend's OngoingCodegen, found Box<Any>")
             .join(sess);
-        if sess.opts.debugging_opts.incremental_info {
-            rustc_codegen_ssa::back::write::dump_incremental_data(&codegen_results);
-        }
-
-        sess.time("serialize_work_products", move || {
-            rustc_incremental::save_work_product_index(sess, &dep_graph, work_products)
-        });
-
-        sess.compile_status()?;
-
-        Ok(Box::new(codegen_results))
-    }
-
-    fn link(
-        &self,
-        sess: &Session,
-        codegen_results: Box<dyn Any>,
-        outputs: &OutputFilenames,
-    ) -> Result<(), ErrorReported> {
-        let codegen_results = codegen_results
-            .downcast::<CodegenResults>()
-            .expect("Expected CodegenResults, found Box<Any>");
-
-        if sess.opts.debugging_opts.no_link {
-            // FIXME: use a binary format to encode the `.rlink` file
-            let rlink_data = json::encode(&codegen_results).map_err(|err| {
-                sess.fatal(&format!("failed to encode rlink: {}", err));
-            })?;
-            let rlink_file = outputs.with_extension(config::RLINK_EXT);
-            fs::write(&rlink_file, rlink_data).map_err(|err| {
-                sess.fatal(&format!("failed to write file {}: {}", rlink_file.display(), err));
-            })?;
-            return Ok(());
-        }
-
-        // Run the linker on any artifacts that resulted from the LLVM run.
-        // This should produce either a finished executable or library.
-        sess.time("link_crate", || {
-            use crate::back::archive::LlvmArchiveBuilder;
-            use rustc_codegen_ssa::back::link::link_binary;
-
-            let target_cpu = crate::llvm_util::target_cpu(sess);
-            link_binary::<LlvmArchiveBuilder<'_>>(
-                sess,
-                &codegen_results,
-                outputs,
-                &codegen_results.crate_name.as_str(),
-                target_cpu,
-            );
-        });
-
-        // Now that we won't touch anything in the incremental compilation directory
-        // any more, we can finalize it (which involves renaming it)
-        rustc_incremental::finalize_session_directory(sess, codegen_results.crate_hash);
 
         sess.time("llvm_dump_timing_file", || {
             if sess.opts.debugging_opts.llvm_time_trace {
                 llvm_util::time_trace_profiler_finish("llvm_timings.json");
             }
         });
+
+        Ok((codegen_results, work_products))
+    }
+
+    fn link(
+        &self,
+        sess: &Session,
+        codegen_results: CodegenResults,
+        outputs: &OutputFilenames,
+    ) -> Result<(), ErrorReported> {
+        use crate::back::archive::LlvmArchiveBuilder;
+        use rustc_codegen_ssa::back::link::link_binary;
+
+        // Run the linker on any artifacts that resulted from the LLVM run.
+        // This should produce either a finished executable or library.
+        let target_cpu = crate::llvm_util::target_cpu(sess);
+        link_binary::<LlvmArchiveBuilder<'_>>(
+            sess,
+            &codegen_results,
+            outputs,
+            &codegen_results.crate_name.as_str(),
+            target_cpu,
+        );
 
         Ok(())
     }
@@ -359,7 +330,7 @@ impl ModuleLlvm {
         unsafe {
             let llcx = llvm::LLVMRustContextCreate(tcx.sess.fewer_names());
             let llmod_raw = context::create_module(tcx, llcx, mod_name) as *const _;
-            ModuleLlvm { llmod_raw, llcx, tm: create_target_machine(tcx) }
+            ModuleLlvm { llmod_raw, llcx, tm: create_target_machine(tcx, mod_name) }
         }
     }
 
@@ -380,7 +351,13 @@ impl ModuleLlvm {
         unsafe {
             let llcx = llvm::LLVMRustContextCreate(cgcx.fewer_names);
             let llmod_raw = back::lto::parse_module(llcx, name, buffer, handler)?;
-            let tm = match (cgcx.tm_factory.0)() {
+
+            let split_dwarf_file = cgcx
+                .output_filenames
+                .split_dwarf_filename(cgcx.split_dwarf_kind, Some(name.to_str().unwrap()));
+            let tm_factory_config = TargetMachineFactoryConfig { split_dwarf_file };
+
+            let tm = match (cgcx.tm_factory)(tm_factory_config) {
                 Ok(m) => m,
                 Err(e) => {
                     handler.struct_err(&e).emit();

@@ -8,11 +8,13 @@ use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefId;
+use rustc_hir::hir_id::HirIdSet;
 use rustc_hir::intravisit::{self, NestedVisitorMap, Visitor};
-use rustc_hir::{Expr, ExprKind, Pat, PatKind};
+use rustc_hir::{Arm, Expr, ExprKind, Guard, HirId, Pat, PatKind};
 use rustc_middle::middle::region::{self, YieldData};
 use rustc_middle::ty::{self, Ty};
 use rustc_span::Span;
+use smallvec::SmallVec;
 
 struct InteriorVisitor<'a, 'tcx> {
     fcx: &'a FnCtxt<'a, 'tcx>,
@@ -21,6 +23,13 @@ struct InteriorVisitor<'a, 'tcx> {
     expr_count: usize,
     kind: hir::GeneratorKind,
     prev_unresolved_span: Option<Span>,
+    /// Match arm guards have temporary borrows from the pattern bindings.
+    /// In case there is a yield point in a guard with a reference to such bindings,
+    /// such borrows can span across this yield point.
+    /// As such, we need to track these borrows and record them despite of the fact
+    /// that they may succeed the said yield point in the post-order.
+    guard_bindings: SmallVec<[SmallVec<[HirId; 4]>; 1]>,
+    guard_bindings_set: HirIdSet,
 }
 
 impl<'a, 'tcx> InteriorVisitor<'a, 'tcx> {
@@ -30,6 +39,7 @@ impl<'a, 'tcx> InteriorVisitor<'a, 'tcx> {
         scope: Option<region::Scope>,
         expr: Option<&'tcx Expr<'tcx>>,
         source_span: Span,
+        guard_borrowing_from_pattern: bool,
     ) {
         use rustc_span::DUMMY_SP;
 
@@ -53,7 +63,12 @@ impl<'a, 'tcx> InteriorVisitor<'a, 'tcx> {
                         yield_data.expr_and_pat_count, self.expr_count, source_span
                     );
 
-                    if yield_data.expr_and_pat_count >= self.expr_count {
+                    // If it is a borrowing happening in the guard,
+                    // it needs to be recorded regardless because they
+                    // do live across this yield point.
+                    if guard_borrowing_from_pattern
+                        || yield_data.expr_and_pat_count >= self.expr_count
+                    {
                         Some(yield_data)
                     } else {
                         None
@@ -65,7 +80,7 @@ impl<'a, 'tcx> InteriorVisitor<'a, 'tcx> {
             });
 
         if let Some(yield_data) = live_across_yield {
-            let ty = self.fcx.resolve_vars_if_possible(&ty);
+            let ty = self.fcx.resolve_vars_if_possible(ty);
             debug!(
                 "type in expr = {:?}, scope = {:?}, type = {:?}, count = {}, yield_span = {:?}",
                 expr, scope, ty, self.expr_count, yield_data.span
@@ -105,7 +120,7 @@ impl<'a, 'tcx> InteriorVisitor<'a, 'tcx> {
                 self.expr_count,
                 expr.map(|e| e.span)
             );
-            let ty = self.fcx.resolve_vars_if_possible(&ty);
+            let ty = self.fcx.resolve_vars_if_possible(ty);
             if let Some((unresolved_type, unresolved_type_span)) =
                 self.fcx.unresolved_type_vars(&ty)
             {
@@ -134,6 +149,8 @@ pub fn resolve_interior<'a, 'tcx>(
         expr_count: 0,
         kind,
         prev_unresolved_span: None,
+        guard_bindings: <_>::default(),
+        guard_bindings_set: <_>::default(),
     };
     intravisit::walk_body(&mut visitor, body);
 
@@ -162,15 +179,17 @@ pub fn resolve_interior<'a, 'tcx>(
         .filter_map(|mut cause| {
             // Erase regions and canonicalize late-bound regions to deduplicate as many types as we
             // can.
-            let erased = fcx.tcx.erase_regions(&cause.ty);
+            let erased = fcx.tcx.erase_regions(cause.ty);
             if captured_tys.insert(erased) {
                 // Replace all regions inside the generator interior with late bound regions.
                 // Note that each region slot in the types gets a new fresh late bound region,
                 // which means that none of the regions inside relate to any other, even if
                 // typeck had previously found constraints that would cause them to be related.
-                let folded = fcx.tcx.fold_regions(&erased, &mut false, |_, current_depth| {
+                let folded = fcx.tcx.fold_regions(erased, &mut false, |_, current_depth| {
+                    let br = ty::BoundRegion { kind: ty::BrAnon(counter) };
+                    let r = fcx.tcx.mk_region(ty::ReLateBound(current_depth, br));
                     counter += 1;
-                    fcx.tcx.mk_region(ty::ReLateBound(current_depth, ty::BrAnon(counter)))
+                    r
                 });
 
                 cause.ty = folded;
@@ -186,7 +205,8 @@ pub fn resolve_interior<'a, 'tcx>(
     let witness = fcx.tcx.mk_generator_witness(ty::Binder::bind(type_list));
 
     // Store the generator types and spans into the typeck results for this generator.
-    visitor.fcx.inh.typeck_results.borrow_mut().generator_interior_types = type_causes;
+    visitor.fcx.inh.typeck_results.borrow_mut().generator_interior_types =
+        ty::Binder::bind(type_causes);
 
     debug!(
         "types in generator after region replacement {:?}, span = {:?}",
@@ -210,6 +230,39 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
         NestedVisitorMap::None
     }
 
+    fn visit_arm(&mut self, arm: &'tcx Arm<'tcx>) {
+        let Arm { guard, pat, body, .. } = arm;
+        self.visit_pat(pat);
+        if let Some(ref g) = guard {
+            self.guard_bindings.push(<_>::default());
+            ArmPatCollector {
+                guard_bindings_set: &mut self.guard_bindings_set,
+                guard_bindings: self
+                    .guard_bindings
+                    .last_mut()
+                    .expect("should have pushed at least one earlier"),
+            }
+            .visit_pat(pat);
+
+            match g {
+                Guard::If(ref e) => {
+                    self.visit_expr(e);
+                }
+                Guard::IfLet(ref pat, ref e) => {
+                    self.visit_pat(pat);
+                    self.visit_expr(e);
+                }
+            }
+
+            let mut scope_var_ids =
+                self.guard_bindings.pop().expect("should have pushed at least one earlier");
+            for var_id in scope_var_ids.drain(..) {
+                self.guard_bindings_set.remove(&var_id);
+            }
+        }
+        self.visit_expr(body);
+    }
+
     fn visit_pat(&mut self, pat: &'tcx Pat<'tcx>) {
         intravisit::walk_pat(self, pat);
 
@@ -218,11 +271,12 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
         if let PatKind::Binding(..) = pat.kind {
             let scope = self.region_scope_tree.var_scope(pat.hir_id.local_id);
             let ty = self.fcx.typeck_results.borrow().pat_ty(pat);
-            self.record(ty, Some(scope), None, pat.span);
+            self.record(ty, Some(scope), None, pat.span, false);
         }
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        let mut guard_borrowing_from_pattern = false;
         match &expr.kind {
             ExprKind::Call(callee, args) => match &callee.kind {
                 ExprKind::Path(qpath) => {
@@ -249,6 +303,16 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
                 }
                 _ => intravisit::walk_expr(self, expr),
             },
+            ExprKind::Path(qpath) => {
+                intravisit::walk_expr(self, expr);
+                let res = self.fcx.typeck_results.borrow().qpath_res(qpath, expr.hir_id);
+                match res {
+                    Res::Local(id) if self.guard_bindings_set.contains(&id) => {
+                        guard_borrowing_from_pattern = true;
+                    }
+                    _ => {}
+                }
+            }
             _ => intravisit::walk_expr(self, expr),
         }
 
@@ -259,7 +323,7 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
         // If there are adjustments, then record the final type --
         // this is the actual value that is being produced.
         if let Some(adjusted_ty) = self.fcx.typeck_results.borrow().expr_ty_adjusted_opt(expr) {
-            self.record(adjusted_ty, scope, Some(expr), expr.span);
+            self.record(adjusted_ty, scope, Some(expr), expr.span, guard_borrowing_from_pattern);
         }
 
         // Also record the unadjusted type (which is the only type if
@@ -267,10 +331,10 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
         // unadjusted value is sometimes a "temporary" that would wind
         // up in a MIR temporary.
         //
-        // As an example, consider an expression like `vec![].push()`.
+        // As an example, consider an expression like `vec![].push(x)`.
         // Here, the `vec![]` would wind up MIR stored into a
         // temporary variable `t` which we can borrow to invoke
-        // `<Vec<_>>::push(&mut t)`.
+        // `<Vec<_>>::push(&mut t, x)`.
         //
         // Note that an expression can have many adjustments, and we
         // are just ignoring those intermediate types. This is because
@@ -287,9 +351,42 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
         // The type table might not have information for this expression
         // if it is in a malformed scope. (#66387)
         if let Some(ty) = self.fcx.typeck_results.borrow().expr_ty_opt(expr) {
-            self.record(ty, scope, Some(expr), expr.span);
+            if guard_borrowing_from_pattern {
+                // Match guards create references to all the bindings in the pattern that are used
+                // in the guard, e.g. `y if is_even(y) => ...` becomes `is_even(*r_y)` where `r_y`
+                // is a reference to `y`, so we must record a reference to the type of the binding.
+                let tcx = self.fcx.tcx;
+                let ref_ty = tcx.mk_ref(
+                    // Use `ReErased` as `resolve_interior` is going to replace all the regions anyway.
+                    tcx.mk_region(ty::RegionKind::ReErased),
+                    ty::TypeAndMut { ty, mutbl: hir::Mutability::Not },
+                );
+                self.record(ref_ty, scope, Some(expr), expr.span, guard_borrowing_from_pattern);
+            }
+            self.record(ty, scope, Some(expr), expr.span, guard_borrowing_from_pattern);
         } else {
             self.fcx.tcx.sess.delay_span_bug(expr.span, "no type for node");
+        }
+    }
+}
+
+struct ArmPatCollector<'a> {
+    guard_bindings_set: &'a mut HirIdSet,
+    guard_bindings: &'a mut SmallVec<[HirId; 4]>,
+}
+
+impl<'a, 'tcx> Visitor<'tcx> for ArmPatCollector<'a> {
+    type Map = intravisit::ErasedMap<'tcx>;
+
+    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
+        NestedVisitorMap::None
+    }
+
+    fn visit_pat(&mut self, pat: &'tcx Pat<'tcx>) {
+        intravisit::walk_pat(self, pat);
+        if let PatKind::Binding(_, id, ..) = pat.kind {
+            self.guard_bindings.push(id);
+            self.guard_bindings_set.insert(id);
         }
     }
 }

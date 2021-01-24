@@ -3,6 +3,7 @@
 //! All high-level functions to write to memory work on places as destinations.
 
 use std::convert::TryFrom;
+use std::fmt::Debug;
 use std::hash::Hash;
 
 use rustc_macros::HashStable;
@@ -13,9 +14,9 @@ use rustc_target::abi::{Abi, Align, FieldsShape, TagEncoding};
 use rustc_target::abi::{HasDataLayout, LayoutOf, Size, VariantIdx, Variants};
 
 use super::{
-    mir_assign_valid_types, truncate, AllocId, AllocMap, Allocation, AllocationExtra, ImmTy,
+    mir_assign_valid_types, AllocId, AllocMap, Allocation, AllocationExtra, ConstAlloc, ImmTy,
     Immediate, InterpCx, InterpResult, LocalValue, Machine, MemoryKind, OpTy, Operand, Pointer,
-    PointerArithmetic, RawConst, Scalar, ScalarMaybeUninit,
+    PointerArithmetic, Scalar, ScalarMaybeUninit,
 };
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, HashStable)]
@@ -86,7 +87,7 @@ pub struct PlaceTy<'tcx, Tag = ()> {
     pub layout: TyAndLayout<'tcx>,
 }
 
-impl<'tcx, Tag> ::std::ops::Deref for PlaceTy<'tcx, Tag> {
+impl<'tcx, Tag> std::ops::Deref for PlaceTy<'tcx, Tag> {
     type Target = Place<Tag>;
     #[inline(always)]
     fn deref(&self) -> &Place<Tag> {
@@ -101,7 +102,7 @@ pub struct MPlaceTy<'tcx, Tag = ()> {
     pub layout: TyAndLayout<'tcx>,
 }
 
-impl<'tcx, Tag> ::std::ops::Deref for MPlaceTy<'tcx, Tag> {
+impl<'tcx, Tag> std::ops::Deref for MPlaceTy<'tcx, Tag> {
     type Target = MemPlace<Tag>;
     #[inline(always)]
     fn deref(&self) -> &MemPlace<Tag> {
@@ -226,7 +227,7 @@ impl<'tcx, Tag> MPlaceTy<'tcx, Tag> {
 }
 
 // These are defined here because they produce a place.
-impl<'tcx, Tag: ::std::fmt::Debug + Copy> OpTy<'tcx, Tag> {
+impl<'tcx, Tag: Debug + Copy> OpTy<'tcx, Tag> {
     #[inline(always)]
     /// Note: do not call `as_ref` on the resulting place. This function should only be used to
     /// read from the resulting mplace, not to get its address back.
@@ -251,7 +252,7 @@ impl<'tcx, Tag: ::std::fmt::Debug + Copy> OpTy<'tcx, Tag> {
     }
 }
 
-impl<Tag: ::std::fmt::Debug> Place<Tag> {
+impl<Tag: Debug> Place<Tag> {
     #[inline]
     pub fn assert_mem_place(self) -> MemPlace<Tag> {
         match self {
@@ -261,7 +262,7 @@ impl<Tag: ::std::fmt::Debug> Place<Tag> {
     }
 }
 
-impl<'tcx, Tag: ::std::fmt::Debug> PlaceTy<'tcx, Tag> {
+impl<'tcx, Tag: Debug> PlaceTy<'tcx, Tag> {
     #[inline]
     pub fn assert_mem_place(self) -> MPlaceTy<'tcx, Tag> {
         MPlaceTy { mplace: self.place.assert_mem_place(), layout: self.layout }
@@ -272,7 +273,7 @@ impl<'tcx, Tag: ::std::fmt::Debug> PlaceTy<'tcx, Tag> {
 impl<'mir, 'tcx: 'mir, Tag, M> InterpCx<'mir, 'tcx, M>
 where
     // FIXME: Working around https://github.com/rust-lang/rust/issues/54385
-    Tag: ::std::fmt::Debug + Copy + Eq + Hash + 'static,
+    Tag: Debug + Copy + Eq + Hash + 'static,
     M: Machine<'mir, 'tcx, PointerTag = Tag>,
     // FIXME: Working around https://github.com/rust-lang/rust/issues/24159
     M::MemoryMap: AllocMap<AllocId, (MemoryKind<M::MemoryKind>, Allocation<Tag, M::AllocExtra>)>,
@@ -551,7 +552,7 @@ where
                 let n = base.len(self)?;
                 if n < min_length {
                     // This can only be reached in ConstProp and non-rustc-MIR.
-                    throw_ub!(BoundsCheckFailed { len: min_length.into(), index: n });
+                    throw_ub!(BoundsCheckFailed { len: min_length, index: n });
                 }
 
                 let index = if from_end {
@@ -565,9 +566,7 @@ where
                 self.mplace_index(base, index)?
             }
 
-            Subslice { from, to, from_end } => {
-                self.mplace_subslice(base, u64::from(from), u64::from(to), from_end)?
-            }
+            Subslice { from, to, from_end } => self.mplace_subslice(base, from, to, from_end)?,
         })
     }
 
@@ -722,12 +721,8 @@ where
                     dest.layout.size,
                     "Size mismatch when writing pointer"
                 ),
-                Immediate::Scalar(ScalarMaybeUninit::Scalar(Scalar::Raw { size, .. })) => {
-                    assert_eq!(
-                        Size::from_bytes(size),
-                        dest.layout.size,
-                        "Size mismatch when writing bits"
-                    )
+                Immediate::Scalar(ScalarMaybeUninit::Scalar(Scalar::Int(int))) => {
+                    assert_eq!(int.size(), dest.layout.size, "Size mismatch when writing bits")
                 }
                 Immediate::Scalar(ScalarMaybeUninit::Uninit) => {} // uninit can have any size
                 Immediate::ScalarPair(_, _) => {
@@ -1078,7 +1073,7 @@ where
                 // their computation, but the in-memory tag is the smallest possible
                 // representation
                 let size = tag_layout.value.size(self);
-                let tag_val = truncate(discr_val, size);
+                let tag_val = size.truncate(discr_val);
 
                 let tag_dest = self.place_field(dest, tag_field)?;
                 self.write_scalar(Scalar::from_uint(tag_val, size), tag_dest)?;
@@ -1122,7 +1117,7 @@ where
 
     pub fn raw_const_to_mplace(
         &self,
-        raw: RawConst<'tcx>,
+        raw: ConstAlloc<'tcx>,
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, M::PointerTag>> {
         // This must be an allocation in `tcx`
         let _ = self.tcx.global_alloc(raw.alloc_id);

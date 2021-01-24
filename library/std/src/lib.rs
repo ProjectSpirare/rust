@@ -85,7 +85,7 @@
 //! # Contributing changes to the documentation
 //!
 //! Check out the rust contribution guidelines [here](
-//! https://rustc-dev-guide.rust-lang.org/getting-started.html).
+//! https://rustc-dev-guide.rust-lang.org/contributing.html#writing-documentation).
 //! The source for this documentation can be found on
 //! [GitHub](https://github.com/rust-lang/rust).
 //! To contribute changes, make sure you read the guidelines first, then submit
@@ -175,7 +175,7 @@
 //! [`str`]: prim@str
 //! [`mpsc`]: sync::mpsc
 //! [`std::cmp`]: cmp
-//! [`std::slice`]: slice
+//! [`std::slice`]: mod@slice
 //! [`use std::env`]: env/index.html
 //! [`use`]: ../book/ch07-02-defining-modules-to-control-scope-and-privacy.html
 //! [crates.io]: https://crates.io
@@ -185,7 +185,8 @@
 //! [other]: #what-is-in-the-standard-library-documentation
 //! [primitive types]: ../book/ch03-02-data-types.html
 //! [rust-discord]: https://discord.gg/rust-lang
-
+#![cfg_attr(not(bootstrap), doc = "[array]: prim@array")]
+#![cfg_attr(not(bootstrap), doc = "[slice]: prim@slice")]
 #![cfg_attr(not(feature = "restricted-std"), stable(feature = "rust1", since = "1.0.0"))]
 #![cfg_attr(feature = "restricted-std", unstable(feature = "restricted_std", issue = "none"))]
 #![doc(
@@ -206,11 +207,13 @@
 #![needs_panic_runtime]
 // std may use features in a platform-specific way
 #![allow(unused_features)]
-#![cfg_attr(test, feature(print_internals, set_stdio, update_panic_count))]
+#![feature(rustc_allow_const_fn_unstable)]
+#![cfg_attr(test, feature(internal_output_capture, print_internals, update_panic_count))]
 #![cfg_attr(
     all(target_vendor = "fortanix", target_env = "sgx"),
     feature(slice_index_methods, coerce_unsized, sgx_platform)
 )]
+#![deny(rustc::existing_doc_keyword)]
 #![cfg_attr(all(test, target_vendor = "fortanix", target_env = "sgx"), feature(fixed_size_array))]
 // std is implemented with unstable features, many of which are internal
 // compiler details that will never be stable
@@ -228,16 +231,19 @@
 #![feature(atomic_mut_ptr)]
 #![feature(box_syntax)]
 #![feature(c_variadic)]
-#![feature(can_vector)]
 #![feature(cfg_accessible)]
 #![feature(cfg_target_has_atomic)]
 #![feature(cfg_target_thread_local)]
 #![feature(char_error_internals)]
 #![feature(char_internals)]
-#![feature(clamp)]
 #![feature(concat_idents)]
 #![feature(const_cstr_unchecked)]
+#![feature(const_fn_floating_point_arithmetic)]
 #![feature(const_fn_transmute)]
+#![feature(const_fn)]
+#![feature(const_fn_fn_ptr_basics)]
+#![feature(const_io_structs)]
+#![feature(const_ip)]
 #![feature(const_ipv6)]
 #![feature(const_raw_ptr_deref)]
 #![feature(const_ipv4)]
@@ -245,30 +251,30 @@
 #![feature(core_intrinsics)]
 #![feature(custom_test_frameworks)]
 #![feature(decl_macro)]
-#![cfg_attr(bootstrap, feature(doc_alias))]
 #![feature(doc_cfg)]
 #![feature(doc_keyword)]
 #![feature(doc_masked)]
 #![feature(doc_spotlight)]
 #![feature(dropck_eyepatch)]
 #![feature(duration_constants)]
+#![feature(duration_zero)]
 #![feature(exact_size_is_empty)]
 #![feature(exhaustive_patterns)]
 #![feature(extend_one)]
 #![feature(external_doc)]
+#![feature(fmt_as_str)]
 #![feature(fn_traits)]
 #![feature(format_args_nl)]
 #![feature(gen_future)]
 #![feature(generator_trait)]
+#![feature(get_mut_unchecked)]
 #![feature(global_asm)]
-#![feature(hash_raw_entry)]
 #![feature(hashmap_internals)]
 #![feature(int_error_internals)]
 #![feature(int_error_matching)]
 #![feature(integer_atomics)]
 #![feature(into_future)]
 #![feature(lang_items)]
-#![feature(libc)]
 #![feature(link_args)]
 #![feature(linkage)]
 #![feature(llvm_asm)]
@@ -283,17 +289,17 @@
 #![feature(nll)]
 #![feature(nonnull_slice_from_raw_parts)]
 #![feature(once_cell)]
-#![feature(optin_builtin_traits)]
+#![feature(auto_traits)]
 #![feature(or_patterns)]
 #![feature(panic_info_message)]
 #![feature(panic_internals)]
 #![feature(panic_unwind)]
+#![feature(pin_static_ref)]
 #![feature(prelude_import)]
 #![feature(ptr_internals)]
 #![feature(raw)]
 #![feature(raw_ref_macros)]
 #![feature(ready_macro)]
-#![feature(renamed_spin_loop)]
 #![feature(rustc_attrs)]
 #![feature(rustc_private)]
 #![feature(shrink_to)]
@@ -301,22 +307,23 @@
 #![feature(slice_internals)]
 #![feature(slice_ptr_get)]
 #![feature(slice_ptr_len)]
-#![feature(slice_strip)]
 #![feature(staged_api)]
 #![feature(std_internals)]
 #![feature(stdsimd)]
 #![feature(stmt_expr_attributes)]
 #![feature(str_internals)]
+#![feature(str_split_once)]
 #![feature(test)]
 #![feature(thread_local)]
+#![feature(thread_local_internals)]
 #![feature(toowned_clone_into)]
 #![feature(total_cmp)]
 #![feature(trace_macros)]
+#![feature(try_blocks)]
 #![feature(try_reserve)]
 #![feature(unboxed_closures)]
 #![feature(unsafe_block_in_unsafe_fn)]
 #![feature(unsafe_cell_raw_get)]
-#![feature(untagged_unions)]
 #![feature(unwind_attributes)]
 #![feature(vec_into_raw_parts)]
 #![feature(wake_trait)]
@@ -404,18 +411,24 @@ pub use core::hash;
 #[stable(feature = "core_hint", since = "1.27.0")]
 pub use core::hint;
 #[stable(feature = "i128", since = "1.26.0")]
+#[allow(deprecated, deprecated_in_future)]
 pub use core::i128;
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated, deprecated_in_future)]
 pub use core::i16;
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated, deprecated_in_future)]
 pub use core::i32;
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated, deprecated_in_future)]
 pub use core::i64;
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated, deprecated_in_future)]
 pub use core::i8;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::intrinsics;
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated, deprecated_in_future)]
 pub use core::isize;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::iter;
@@ -436,16 +449,22 @@ pub use core::raw;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::result;
 #[stable(feature = "i128", since = "1.26.0")]
+#[allow(deprecated, deprecated_in_future)]
 pub use core::u128;
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated, deprecated_in_future)]
 pub use core::u16;
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated, deprecated_in_future)]
 pub use core::u32;
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated, deprecated_in_future)]
 pub use core::u64;
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated, deprecated_in_future)]
 pub use core::u8;
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated, deprecated_in_future)]
 pub use core::usize;
 
 pub mod f32;
@@ -558,5 +577,5 @@ include!("keyword_docs.rs");
 // This is required to avoid an unstable error when `restricted-std` is not
 // enabled. The use of #![feature(restricted_std)] in rustc-std-workspace-std
 // is unconditional, so the unstable feature needs to be defined somewhere.
-#[cfg_attr(not(feature = "restricted-std"), unstable(feature = "restricted_std", issue = "none"))]
+#[unstable(feature = "restricted_std", issue = "none")]
 mod __restricted_std_workaround {}

@@ -4,7 +4,9 @@
     unused_must_use,
     unused_variables,
     clippy::unused_unit,
-    clippy::or_fun_call
+    clippy::unnecessary_wraps,
+    clippy::or_fun_call,
+    clippy::needless_question_mark
 )]
 
 use std::fmt::Debug;

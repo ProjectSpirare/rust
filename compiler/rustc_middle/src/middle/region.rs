@@ -283,25 +283,29 @@ pub struct ScopeTree {
     /// To see that this method works, consider:
     ///
     /// Let `D` be our binding/temporary and `U` be our other HIR node, with
-    /// `HIR-postorder(U) < HIR-postorder(D)` (in our example, U would be
-    /// the yield and D would be one of the calls). Let's show that
-    /// `D` is storage-dead at `U`.
+    /// `HIR-postorder(U) < HIR-postorder(D)`. Suppose, as in our example,
+    /// U is the yield and D is one of the calls.
+    /// Let's show that `D` is storage-dead at `U`.
     ///
     /// Remember that storage-live/storage-dead refers to the state of
     /// the *storage*, and does not consider moves/drop flags.
     ///
     /// Then:
-    ///     1. From the ordering guarantee of HIR visitors (see
-    ///     `rustc_hir::intravisit`), `D` does not dominate `U`.
-    ///     2. Therefore, `D` is *potentially* storage-dead at `U` (because
-    ///     we might visit `U` without ever getting to `D`).
-    ///     3. However, we guarantee that at each HIR point, each
-    ///     binding/temporary is always either always storage-live
-    ///     or always storage-dead. This is what is being guaranteed
-    ///     by `terminating_scopes` including all blocks where the
-    ///     count of executions is not guaranteed.
-    ///     4. By `2.` and `3.`, `D` is *statically* storage-dead at `U`,
-    ///     QED.
+    ///
+    ///   1. From the ordering guarantee of HIR visitors (see
+    ///   `rustc_hir::intravisit`), `D` does not dominate `U`.
+    ///
+    ///   2. Therefore, `D` is *potentially* storage-dead at `U` (because
+    ///   we might visit `U` without ever getting to `D`).
+    ///
+    ///   3. However, we guarantee that at each HIR point, each
+    ///   binding/temporary is always either always storage-live
+    ///   or always storage-dead. This is what is being guaranteed
+    ///   by `terminating_scopes` including all blocks where the
+    ///   count of executions is not guaranteed.
+    ///
+    ///   4. By `2.` and `3.`, `D` is *statically* storage-dead at `U`,
+    ///   QED.
     ///
     /// This property ought to not on (3) in an essential way -- it
     /// is probably still correct even if we have "unrestricted" terminating
@@ -328,7 +332,7 @@ pub struct ScopeTree {
 pub struct YieldData {
     /// The `Span` of the yield.
     pub span: Span,
-    /// The number of expressions and patterns appearing before the `yield` in the body plus one.
+    /// The number of expressions and patterns appearing before the `yield` in the body, plus one.
     pub expr_and_pat_count: usize,
     pub source: hir::YieldSource,
 }
@@ -445,9 +449,7 @@ impl ScopeTree {
     }
 
     /// Checks whether the given scope contains a `yield`. If so,
-    /// returns `Some((span, expr_count))` with the span of a yield we found and
-    /// the number of expressions and patterns appearing before the `yield` in the body + 1.
-    /// If there a are multiple yields in a scope, the one with the highest number is returned.
+    /// returns `Some(YieldData)`. If not, returns `None`.
     pub fn yield_in_scope(&self, scope: Scope) -> Option<YieldData> {
         self.yield_in_scope.get(&scope).cloned()
     }

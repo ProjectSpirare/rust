@@ -1,14 +1,16 @@
 use rustc_hir::intravisit;
-use rustc_hir::{self, Body, FnDecl, HirId, HirIdSet, ItemKind, Node};
+use rustc_hir::{self, AssocItemKind, Body, FnDecl, HirId, HirIdSet, Impl, ItemKind, Node};
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::ty::{self, Ty};
+use rustc_middle::ty::{self, TraitRef, Ty};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
 use rustc_span::source_map::Span;
+use rustc_span::symbol::kw;
 use rustc_target::abi::LayoutOf;
+use rustc_target::spec::abi::Abi;
 use rustc_typeck::expr_use_visitor::{ConsumeMode, Delegate, ExprUseVisitor, PlaceBase, PlaceWithHirId};
 
-use crate::utils::span_lint;
+use crate::utils::{contains_ty, span_lint};
 
 #[derive(Copy, Clone)]
 pub struct BoxedLocal {
@@ -28,7 +30,6 @@ declare_clippy_lint! {
     /// **Example:**
     /// ```rust
     /// # fn foo(bar: usize) {}
-    ///
     /// // Bad
     /// let x = Box::new(1);
     /// foo(*x);
@@ -51,6 +52,7 @@ fn is_non_trait_box(ty: Ty<'_>) -> bool {
 struct EscapeDelegate<'a, 'tcx> {
     cx: &'a LateContext<'tcx>,
     set: HirIdSet,
+    trait_self_ty: Option<Ty<'a>>,
     too_large_for_stack: u64,
 }
 
@@ -60,25 +62,46 @@ impl<'tcx> LateLintPass<'tcx> for BoxedLocal {
     fn check_fn(
         &mut self,
         cx: &LateContext<'tcx>,
-        _: intravisit::FnKind<'tcx>,
+        fn_kind: intravisit::FnKind<'tcx>,
         _: &'tcx FnDecl<'_>,
         body: &'tcx Body<'_>,
         _: Span,
         hir_id: HirId,
     ) {
-        // If the method is an impl for a trait, don't warn.
+        if let Some(header) = fn_kind.header() {
+            if header.abi != Abi::Rust {
+                return;
+            }
+        }
+
         let parent_id = cx.tcx.hir().get_parent_item(hir_id);
         let parent_node = cx.tcx.hir().find(parent_id);
 
+        let mut trait_self_ty = None;
         if let Some(Node::Item(item)) = parent_node {
-            if let ItemKind::Impl { of_trait: Some(_), .. } = item.kind {
+            // If the method is an impl for a trait, don't warn.
+            if let ItemKind::Impl(Impl { of_trait: Some(_), .. }) = item.kind {
                 return;
+            }
+
+            // find `self` ty for this trait if relevant
+            if let ItemKind::Trait(_, _, _, _, items) = item.kind {
+                for trait_item in items {
+                    if trait_item.id.hir_id == hir_id {
+                        // be sure we have `self` parameter in this function
+                        if let AssocItemKind::Fn { has_self: true } = trait_item.kind {
+                            trait_self_ty =
+                                Some(TraitRef::identity(cx.tcx, trait_item.id.hir_id.owner.to_def_id()).self_ty());
+                        }
+                    }
+                }
             }
         }
 
         let mut v = EscapeDelegate {
             cx,
             set: HirIdSet::default(),
+            trait_self_ty,
             too_large_for_stack: self.too_large_for_stack,
         };
 
@@ -109,7 +132,7 @@ fn is_argument(map: rustc_middle::hir::map::Map<'_>, id: HirId) -> bool {
 }
 
 impl<'a, 'tcx> Delegate<'tcx> for EscapeDelegate<'a, 'tcx> {
-    fn consume(&mut self, cmt: &PlaceWithHirId<'tcx>, mode: ConsumeMode) {
+    fn consume(&mut self, cmt: &PlaceWithHirId<'tcx>, _: HirId, mode: ConsumeMode) {
         if cmt.place.projections.is_empty() {
             if let PlaceBase::Local(lid) = cmt.place.base {
                 if let ConsumeMode::Move = mode {
@@ -129,7 +152,7 @@ impl<'a, 'tcx> Delegate<'tcx> for EscapeDelegate<'a, 'tcx> {
         }
     }
 
-    fn borrow(&mut self, cmt: &PlaceWithHirId<'tcx>, _: ty::BorrowKind) {
+    fn borrow(&mut self, cmt: &PlaceWithHirId<'tcx>, _: HirId, _: ty::BorrowKind) {
         if cmt.place.projections.is_empty() {
             if let PlaceBase::Local(lid) = cmt.place.base {
                 self.set.remove(&lid);
@@ -137,7 +160,7 @@ impl<'a, 'tcx> Delegate<'tcx> for EscapeDelegate<'a, 'tcx> {
         }
     }
 
-    fn mutate(&mut self, cmt: &PlaceWithHirId<'tcx>) {
+    fn mutate(&mut self, cmt: &PlaceWithHirId<'tcx>, _: HirId) {
         if cmt.place.projections.is_empty() {
             let map = &self.cx.tcx.hir();
             if is_argument(*map, cmt.hir_id) {
@@ -147,10 +170,17 @@ impl<'a, 'tcx> Delegate<'tcx> for EscapeDelegate<'a, 'tcx> {
                     return;
                 }
 
+                // skip if there is a `self` parameter binding to a type
+                // that contains `Self` (i.e.: `self: Box<Self>`), see #4804
+                if let Some(trait_self_ty) = self.trait_self_ty {
+                    if map.name(cmt.hir_id) == kw::SelfLower && contains_ty(cmt.place.ty(), trait_self_ty) {
+                        return;
+                    }
+                }
+
                 if is_non_trait_box(cmt.place.ty()) && !self.is_large_box(cmt.place.ty()) {
                     self.set.insert(cmt.hir_id);
                 }
-                return;
             }
         }
     }

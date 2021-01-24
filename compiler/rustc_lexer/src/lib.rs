@@ -2,7 +2,7 @@
 //!
 //! The idea with `librustc_lexer` is to make a reusable library,
 //! by separating out pure lexing and rustc-specific concerns, like spans,
-//! error reporting an interning.  So, rustc_lexer operates directly on `&str`,
+//! error reporting, and interning.  So, rustc_lexer operates directly on `&str`,
 //! produces simple tokens which are a pair of type-tag and a bit of original text,
 //! and does not report errors, instead storing them as flags on the token.
 //!
@@ -48,6 +48,7 @@ impl Token {
 }
 
 /// Enum representing common lexeme types.
+// perf note: Changing all `usize` to `u32` doesn't change performance. See #77629
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TokenKind {
     // Multi-char tokens:
@@ -160,6 +161,7 @@ pub enum LiteralKind {
 /// - `r##~"abcde"##`: `InvalidStarter`
 /// - `r###"abcde"##`: `NoTerminator { expected: 3, found: 2, possible_terminator_offset: Some(11)`
 /// - Too many `#`s (>65535): `TooManyDelimiters`
+// perf note: It doesn't matter that this makes `Token` 36 bytes bigger. See #77629
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RawStrError {
     /// Non `#` characters exist between `r` and `"` eg. `r#~"..`
@@ -236,9 +238,10 @@ pub fn is_whitespace(c: char) -> bool {
     // Note that this set is stable (ie, it doesn't change with different
     // Unicode versions), so it's ok to just hard-code the values.
 
-    match c {
+    matches!(
+        c,
         // Usual ASCII suspects
-        | '\u{0009}' // \t
+        '\u{0009}'   // \t
         | '\u{000A}' // \n
         | '\u{000B}' // vertical tab
         | '\u{000C}' // form feed
@@ -255,9 +258,7 @@ pub fn is_whitespace(c: char) -> bool {
         // Dedicated whitespace characters from Unicode
         | '\u{2028}' // LINE SEPARATOR
         | '\u{2029}' // PARAGRAPH SEPARATOR
-        => true,
-        _ => false,
-    }
+    )
 }
 
 /// True if `c` is valid as a first character of an identifier.
@@ -266,8 +267,8 @@ pub fn is_whitespace(c: char) -> bool {
 pub fn is_id_start(c: char) -> bool {
     // This is XID_Start OR '_' (which formally is not a XID_Start).
     // We also add fast-path for ascii idents
-    ('a' <= c && c <= 'z')
-        || ('A' <= c && c <= 'Z')
+    ('a'..='z').contains(&c)
+        || ('A'..='Z').contains(&c)
         || c == '_'
         || (c > '\x7f' && unicode_xid::UnicodeXID::is_xid_start(c))
 }
@@ -278,9 +279,9 @@ pub fn is_id_start(c: char) -> bool {
 pub fn is_id_continue(c: char) -> bool {
     // This is exactly XID_Continue.
     // We also add fast-path for ascii idents
-    ('a' <= c && c <= 'z')
-        || ('A' <= c && c <= 'Z')
-        || ('0' <= c && c <= '9')
+    ('a'..='z').contains(&c)
+        || ('A'..='Z').contains(&c)
+        || ('0'..='9').contains(&c)
         || c == '_'
         || (c > '\x7f' && unicode_xid::UnicodeXID::is_xid_continue(c))
 }
@@ -689,7 +690,12 @@ impl Cursor<'_> {
         let mut max_hashes = 0;
 
         // Count opening '#' symbols.
-        let n_start_hashes = self.eat_while(|c| c == '#');
+        let mut eaten = 0;
+        while self.first() == '#' {
+            eaten += 1;
+            self.bump();
+        }
+        let n_start_hashes = eaten;
 
         // Check that string is started.
         match self.bump() {
@@ -724,16 +730,11 @@ impl Cursor<'_> {
             // Note that this will not consume extra trailing `#` characters:
             // `r###"abcde"####` is lexed as a `RawStr { n_hashes: 3 }`
             // followed by a `#` token.
-            let mut hashes_left = n_start_hashes;
-            let is_closing_hash = |c| {
-                if c == '#' && hashes_left != 0 {
-                    hashes_left -= 1;
-                    true
-                } else {
-                    false
-                }
-            };
-            let n_end_hashes = self.eat_while(is_closing_hash);
+            let mut n_end_hashes = 0;
+            while self.first() == '#' && n_end_hashes < n_start_hashes {
+                n_end_hashes += 1;
+                self.bump();
+            }
 
             if n_end_hashes == n_start_hashes {
                 return (n_start_hashes, None);
@@ -807,17 +808,9 @@ impl Cursor<'_> {
     }
 
     /// Eats symbols while predicate returns true or until the end of file is reached.
-    /// Returns amount of eaten symbols.
-    fn eat_while<F>(&mut self, mut predicate: F) -> usize
-    where
-        F: FnMut(char) -> bool,
-    {
-        let mut eaten: usize = 0;
+    fn eat_while(&mut self, mut predicate: impl FnMut(char) -> bool) {
         while predicate(self.first()) && !self.is_eof() {
-            eaten += 1;
             self.bump();
         }
-
-        eaten
     }
 }

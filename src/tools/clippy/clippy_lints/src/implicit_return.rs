@@ -1,8 +1,4 @@
-use crate::utils::{
-    fn_has_unsatisfiable_preds, match_def_path,
-    paths::{BEGIN_PANIC, BEGIN_PANIC_FMT},
-    snippet_opt, span_lint_and_then,
-};
+use crate::utils::{fn_has_unsatisfiable_preds, match_panic_def_id, snippet_opt, span_lint_and_then};
 use if_chain::if_chain;
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::FnKind;
@@ -72,8 +68,7 @@ fn expr_match(cx: &LateContext<'_>, expr: &Expr<'_>) {
                 if_chain! {
                     if let StmtKind::Semi(expr, ..) = &stmt.kind;
                     // make sure it's a break, otherwise we want to skip
-                    if let ExprKind::Break(.., break_expr) = &expr.kind;
-                    if let Some(break_expr) = break_expr;
+                    if let ExprKind::Break(.., Some(break_expr)) = &expr.kind;
                     then {
                             lint(cx, expr.span, break_expr.span, LINT_BREAK);
                     }
@@ -84,6 +79,13 @@ fn expr_match(cx: &LateContext<'_>, expr: &Expr<'_>) {
         ExprKind::Break(.., break_expr) => {
             if let Some(break_expr) = break_expr {
                 lint(cx, expr.span, break_expr.span, LINT_BREAK);
+            }
+        },
+        ExprKind::If(.., if_expr, else_expr) => {
+            expr_match(cx, if_expr);
+
+            if let Some(else_expr) = else_expr {
+                expr_match(cx, else_expr);
             }
         },
         ExprKind::Match(.., arms, source) => {
@@ -109,8 +111,7 @@ fn expr_match(cx: &LateContext<'_>, expr: &Expr<'_>) {
             if_chain! {
                 if let ExprKind::Path(qpath) = &expr.kind;
                 if let Some(path_def_id) = cx.qpath_res(qpath, expr.hir_id).opt_def_id();
-                if match_def_path(cx, path_def_id, &BEGIN_PANIC) ||
-                    match_def_path(cx, path_def_id, &BEGIN_PANIC_FMT);
+                if match_panic_def_id(cx, path_def_id);
                 then { }
                 else {
                     lint(cx, expr.span, expr.span, LINT_RETURN)

@@ -21,23 +21,8 @@ fn uncached_llvm_type<'a, 'tcx>(
     match layout.abi {
         Abi::Scalar(_) => bug!("handled elsewhere"),
         Abi::Vector { ref element, count } => {
-            // LLVM has a separate type for 64-bit SIMD vectors on X86 called
-            // `x86_mmx` which is needed for some SIMD operations. As a bit of a
-            // hack (all SIMD definitions are super unstable anyway) we
-            // recognize any one-element SIMD vector as "this should be an
-            // x86_mmx" type. In general there shouldn't be a need for other
-            // one-element SIMD vectors, so it's assumed this won't clash with
-            // much else.
-            let use_x86_mmx = count == 1
-                && layout.size.bits() == 64
-                && (cx.sess().target.target.arch == "x86"
-                    || cx.sess().target.target.arch == "x86_64");
-            if use_x86_mmx {
-                return cx.type_x86_mmx();
-            } else {
-                let element = layout.scalar_llvm_type_at(cx, element, Size::ZERO);
-                return cx.type_vector(element, count);
-            }
+            let element = layout.scalar_llvm_type_at(cx, element, Size::ZERO);
+            return cx.type_vector(element, count);
         }
         Abi::ScalarPair(..) => {
             return cx.type_struct(
@@ -55,9 +40,7 @@ fn uncached_llvm_type<'a, 'tcx>(
         // FIXME(eddyb) producing readable type names for trait objects can result
         // in problematically distinct types due to HRTB and subtyping (see #47638).
         // ty::Dynamic(..) |
-        ty::Adt(..) | ty::Closure(..) | ty::Foreign(..) | ty::Generator(..) | ty::Str
-            if !cx.sess().fewer_names() =>
-        {
+        ty::Adt(..) | ty::Closure(..) | ty::Foreign(..) | ty::Generator(..) | ty::Str => {
             let mut name = with_no_trimmed_paths(|| layout.ty.to_string());
             if let (&ty::Adt(def, _), &Variants::Single { index }) =
                 (layout.ty.kind(), &layout.variants)
@@ -72,12 +55,6 @@ fn uncached_llvm_type<'a, 'tcx>(
                 write!(&mut name, "::{}", ty::GeneratorSubsts::variant_name(index)).unwrap();
             }
             Some(name)
-        }
-        ty::Adt(..) => {
-            // If `Some` is returned then a named struct is created in LLVM. Name collisions are
-            // avoided by LLVM (with increasing suffixes). If rustc doesn't generate names then that
-            // can improve perf.
-            Some(String::new())
         }
         _ => None,
     };
@@ -267,7 +244,7 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
 
         // Make sure lifetimes are erased, to avoid generating distinct LLVM
         // types for Rust types that only differ in the choice of lifetimes.
-        let normal_ty = cx.tcx.erase_regions(&self.ty);
+        let normal_ty = cx.tcx.erase_regions(self.ty);
 
         let mut defer = None;
         let llty = if self.ty != normal_ty {

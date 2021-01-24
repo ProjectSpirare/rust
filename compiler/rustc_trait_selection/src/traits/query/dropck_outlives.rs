@@ -40,10 +40,10 @@ impl<'cx, 'tcx> AtExt<'tcx> for At<'cx, 'tcx> {
         }
 
         let mut orig_values = OriginalQueryValues::default();
-        let c_ty = self.infcx.canonicalize_query(&self.param_env.and(ty), &mut orig_values);
+        let c_ty = self.infcx.canonicalize_query(self.param_env.and(ty), &mut orig_values);
         let span = self.cause.span;
         debug!("c_ty = {:?}", c_ty);
-        if let Ok(result) = &tcx.dropck_outlives(c_ty) {
+        if let Ok(result) = tcx.dropck_outlives(c_ty) {
             if result.is_proven() {
                 if let Ok(InferOk { value, obligations }) =
                     self.infcx.instantiate_query_response_and_region_obligations(
@@ -53,7 +53,7 @@ impl<'cx, 'tcx> AtExt<'tcx> for At<'cx, 'tcx> {
                         result,
                     )
                 {
-                    let ty = self.infcx.resolve_vars_if_possible(&ty);
+                    let ty = self.infcx.resolve_vars_if_possible(ty);
                     let kinds = value.into_kinds_reporting_overflows(tcx, span, ty);
                     return InferOk { value: kinds, obligations };
                 }
@@ -110,7 +110,7 @@ pub fn trivial_dropck_outlives<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
         // check if *any* of those are trivial.
         ty::Tuple(ref tys) => tys.iter().all(|t| trivial_dropck_outlives(tcx, t.expect_ty())),
         ty::Closure(_, ref substs) => {
-            substs.as_closure().upvar_tys().all(|t| trivial_dropck_outlives(tcx, t))
+            trivial_dropck_outlives(tcx, substs.as_closure().tupled_upvars_ty())
         }
 
         ty::Adt(def, _) => {

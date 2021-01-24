@@ -28,9 +28,9 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::fold::{TypeFoldable, TypeVisitor};
 use rustc_middle::ty::relate::{self, Relate, RelateResult, TypeRelation};
-use rustc_middle::ty::subst::GenericArg;
 use rustc_middle::ty::{self, InferConst, Ty, TyCtxt};
 use std::fmt::Debug;
+use std::ops::ControlFlow;
 
 #[derive(PartialEq)]
 pub enum NormalizationStrategy {
@@ -119,12 +119,6 @@ pub trait TypeRelatingDelegate<'tcx> {
     fn forbid_inference_vars() -> bool;
 }
 
-#[derive(Clone, Debug)]
-struct ScopesAndKind<'tcx> {
-    scopes: Vec<BoundRegionScope<'tcx>>,
-    kind: GenericArg<'tcx>,
-}
-
 #[derive(Clone, Debug, Default)]
 struct BoundRegionScope<'tcx> {
     map: FxHashMap<ty::BoundRegion, ty::Region<'tcx>>,
@@ -182,7 +176,7 @@ where
                         universe
                     });
 
-                    let placeholder = ty::PlaceholderRegion { universe, name: br };
+                    let placeholder = ty::PlaceholderRegion { universe, name: br.kind };
                     delegate.next_placeholder_region(placeholder)
                 } else {
                     delegate.next_existential_region_var(true)
@@ -341,7 +335,7 @@ where
         // been fully instantiated and hence the set of scopes we have
         // doesn't matter -- just to be sure, put an empty vector
         // in there.
-        let old_a_scopes = ::std::mem::take(pair.vid_scopes(self));
+        let old_a_scopes = std::mem::take(pair.vid_scopes(self));
 
         // Relate the generalized kind to the original one.
         let result = pair.relate_generalized_ty(self, generalized_ty);
@@ -643,7 +637,7 @@ where
         if let (Some(a), Some(b)) = (a.no_bound_vars(), b.no_bound_vars()) {
             // Fast path for the common case.
             self.relate(a, b)?;
-            return Ok(ty::Binder::bind(a));
+            return Ok(ty::Binder::dummy(a));
         }
 
         if self.ambient_covariance() {
@@ -680,7 +674,7 @@ where
             //   itself occurs. Note that `'b` and `'c` must both
             //   include P. At the point, the call works because of
             //   subtyping (i.e., `&'b u32 <: &{P} u32`).
-            let variance = ::std::mem::replace(&mut self.ambient_variance, ty::Variance::Covariant);
+            let variance = std::mem::replace(&mut self.ambient_variance, ty::Variance::Covariant);
 
             self.relate(a.skip_binder(), b.skip_binder())?;
 
@@ -709,7 +703,7 @@ where
             // Reset ambient variance to contravariance. See the
             // covariant case above for an explanation.
             let variance =
-                ::std::mem::replace(&mut self.ambient_variance, ty::Variance::Contravariant);
+                std::mem::replace(&mut self.ambient_variance, ty::Variance::Contravariant);
 
             self.relate(a.skip_binder(), b.skip_binder())?;
 
@@ -747,15 +741,18 @@ struct ScopeInstantiator<'me, 'tcx> {
 }
 
 impl<'me, 'tcx> TypeVisitor<'tcx> for ScopeInstantiator<'me, 'tcx> {
-    fn visit_binder<T: TypeFoldable<'tcx>>(&mut self, t: &ty::Binder<T>) -> bool {
+    fn visit_binder<T: TypeFoldable<'tcx>>(
+        &mut self,
+        t: &ty::Binder<T>,
+    ) -> ControlFlow<Self::BreakTy> {
         self.target_index.shift_in(1);
         t.super_visit_with(self);
         self.target_index.shift_out(1);
 
-        false
+        ControlFlow::CONTINUE
     }
 
-    fn visit_region(&mut self, r: ty::Region<'tcx>) -> bool {
+    fn visit_region(&mut self, r: ty::Region<'tcx>) -> ControlFlow<Self::BreakTy> {
         let ScopeInstantiator { bound_region_scope, next_region, .. } = self;
 
         match r {
@@ -766,7 +763,7 @@ impl<'me, 'tcx> TypeVisitor<'tcx> for ScopeInstantiator<'me, 'tcx> {
             _ => {}
         }
 
-        false
+        ControlFlow::CONTINUE
     }
 }
 
@@ -1011,6 +1008,6 @@ where
         self.first_free_index.shift_in(1);
         let result = self.relate(a.skip_binder(), a.skip_binder())?;
         self.first_free_index.shift_out(1);
-        Ok(ty::Binder::bind(result))
+        Ok(a.rebind(result))
     }
 }

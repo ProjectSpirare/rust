@@ -12,11 +12,11 @@
 use rustc_ast as ast;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
-use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::itemlikevisit::ItemLikeVisitor;
 use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
+use rustc_span::def_id::{DefId, LOCAL_CRATE};
 use rustc_span::symbol::{sym, Symbol};
 
 struct DiagnosticItemCollector<'tcx> {
@@ -36,6 +36,10 @@ impl<'v, 'tcx> ItemLikeVisitor<'v> for DiagnosticItemCollector<'tcx> {
 
     fn visit_impl_item(&mut self, impl_item: &hir::ImplItem<'_>) {
         self.observe_item(&impl_item.attrs, impl_item.hir_id);
+    }
+
+    fn visit_foreign_item(&mut self, foreign_item: &hir::ForeignItem<'_>) {
+        self.observe_item(foreign_item.attrs, foreign_item.hir_id);
     }
 }
 
@@ -100,6 +104,10 @@ fn collect<'tcx>(tcx: TyCtxt<'tcx>) -> FxHashMap<Symbol, DefId> {
 
     // Collect diagnostic items in this crate.
     tcx.hir().krate().visit_all_item_likes(&mut collector);
+
+    for m in tcx.hir().krate().exported_macros {
+        collector.observe_item(m.attrs, m.hir_id);
+    }
 
     collector.items
 }

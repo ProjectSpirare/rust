@@ -1,9 +1,10 @@
 //! Values computed by queries that use MIR.
 
-use crate::mir::{Body, Promoted};
+use crate::mir::{abstract_const, Body, Promoted};
 use crate::ty::{self, Ty, TyCtxt};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::Lrc;
+use rustc_errors::ErrorReported;
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::bit_set::BitMatrix;
@@ -45,7 +46,7 @@ pub enum UnsafetyViolationDetails {
     UseOfMutableStatic,
     UseOfExternStatic,
     DerefOfRawPointer,
-    AssignToNonCopyUnionField,
+    AssignToDroppingUnionField,
     AccessToUnionField,
     MutationOfLayoutConstrainedField,
     BorrowOfLayoutConstrainedField,
@@ -93,8 +94,8 @@ impl UnsafetyViolationDetails {
                 "raw pointers may be NULL, dangling or unaligned; they can violate aliasing rules \
                  and cause data races: all of these are undefined behavior",
             ),
-            AssignToNonCopyUnionField => (
-                "assignment to non-`Copy` union field",
+            AssignToDroppingUnionField => (
+                "assignment to union field that might need dropping",
                 "the previous content of the field will be dropped, which causes undefined \
                  behavior if the field was not properly initialized",
             ),
@@ -232,14 +233,15 @@ pub struct BorrowCheckResult<'tcx> {
 
 /// The result of the `mir_const_qualif` query.
 ///
-/// Each field corresponds to an implementer of the `Qualif` trait in
-/// `librustc_mir/transform/check_consts/qualifs.rs`. See that file for more information on each
+/// Each field (except `error_occured`) corresponds to an implementer of the `Qualif` trait in
+/// `rustc_mir/src/transform/check_consts/qualifs.rs`. See that file for more information on each
 /// `Qualif`.
 #[derive(Clone, Copy, Debug, Default, TyEncodable, TyDecodable, HashStable)]
 pub struct ConstQualifs {
     pub has_mut_interior: bool,
     pub needs_drop: bool,
     pub custom_eq: bool,
+    pub error_occured: Option<ErrorReported>,
 }
 
 /// After we borrow check a closure, we are left with various
@@ -407,18 +409,12 @@ pub struct CoverageInfo {
     pub num_expressions: u32,
 }
 
+/// Shims which make dealing with `WithOptConstParam` easier.
+///
+/// For more information on why this is needed, consider looking
+/// at the docs for `WithOptConstParam` itself.
 impl<'tcx> TyCtxt<'tcx> {
-    pub fn mir_borrowck_opt_const_arg(
-        self,
-        def: ty::WithOptConstParam<LocalDefId>,
-    ) -> &'tcx BorrowCheckResult<'tcx> {
-        if let Some(param_did) = def.const_param_did {
-            self.mir_borrowck_const_arg((def.did, param_did))
-        } else {
-            self.mir_borrowck(def.did)
-        }
-    }
-
+    #[inline]
     pub fn mir_const_qualif_opt_const_arg(
         self,
         def: ty::WithOptConstParam<LocalDefId>,
@@ -430,7 +426,8 @@ impl<'tcx> TyCtxt<'tcx> {
         }
     }
 
-    pub fn promoted_mir_of_opt_const_arg(
+    #[inline]
+    pub fn promoted_mir_opt_const_arg(
         self,
         def: ty::WithOptConstParam<DefId>,
     ) -> &'tcx IndexVec<Promoted, Body<'tcx>> {
@@ -438,6 +435,39 @@ impl<'tcx> TyCtxt<'tcx> {
             self.promoted_mir_of_const_arg((did, param_did))
         } else {
             self.promoted_mir(def.did)
+        }
+    }
+
+    #[inline]
+    pub fn optimized_mir_or_const_arg_mir(
+        self,
+        def: ty::WithOptConstParam<DefId>,
+    ) -> &'tcx Body<'tcx> {
+        if let Some((did, param_did)) = def.as_const_arg() {
+            self.mir_for_ctfe_of_const_arg((did, param_did))
+        } else {
+            self.optimized_mir(def.did)
+        }
+    }
+
+    #[inline]
+    pub fn mir_for_ctfe_opt_const_arg(self, def: ty::WithOptConstParam<DefId>) -> &'tcx Body<'tcx> {
+        if let Some((did, param_did)) = def.as_const_arg() {
+            self.mir_for_ctfe_of_const_arg((did, param_did))
+        } else {
+            self.mir_for_ctfe(def.did)
+        }
+    }
+
+    #[inline]
+    pub fn mir_abstract_const_opt_const_arg(
+        self,
+        def: ty::WithOptConstParam<DefId>,
+    ) -> Result<Option<&'tcx [abstract_const::Node<'tcx>]>, ErrorReported> {
+        if let Some((did, param_did)) = def.as_const_arg() {
+            self.mir_abstract_const_of_const_arg((did, param_did))
+        } else {
+            self.mir_abstract_const(def.did)
         }
     }
 }

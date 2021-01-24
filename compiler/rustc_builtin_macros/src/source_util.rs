@@ -5,15 +5,14 @@ use rustc_ast::tokenstream::TokenStream;
 use rustc_ast_pretty::pprust;
 use rustc_expand::base::{self, *};
 use rustc_expand::module::DirectoryOwnership;
-use rustc_parse::{self, new_parser_from_file, parser::Parser};
+use rustc_parse::parser::{ForceCollect, Parser};
+use rustc_parse::{self, new_parser_from_file};
 use rustc_session::lint::builtin::INCOMPLETE_INCLUDE;
 use rustc_span::symbol::Symbol;
 use rustc_span::{self, Pos, Span};
 
 use smallvec::SmallVec;
 use std::rc::Rc;
-
-use rustc_data_structures::sync::Lrc;
 
 // These macros all relate to the file system; they either return
 // the column/row/filename of the expression, or they include
@@ -141,7 +140,7 @@ pub fn expand_include<'cx>(
         fn make_items(mut self: Box<ExpandResult<'a>>) -> Option<SmallVec<[P<ast::Item>; 1]>> {
             let mut ret = SmallVec::new();
             while self.p.token != token::Eof {
-                match self.p.parse_item() {
+                match self.p.parse_item(ForceCollect::No) {
                     Err(mut err) => {
                         err.emit();
                         break;
@@ -216,7 +215,7 @@ pub fn expand_include_bytes(
         }
     };
     match cx.source_map().load_binary_file(&file) {
-        Ok(bytes) => base::MacEager::expr(cx.expr_lit(sp, ast::LitKind::ByteStr(Lrc::new(bytes)))),
+        Ok(bytes) => base::MacEager::expr(cx.expr_lit(sp, ast::LitKind::ByteStr(bytes.into()))),
         Err(e) => {
             cx.span_err(sp, &format!("couldn't read {}: {}", file.display(), e));
             DummyResult::any(sp)

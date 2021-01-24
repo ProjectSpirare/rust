@@ -29,7 +29,7 @@ mod types {
         fn f2() -> Priv { panic!() } //~ ERROR private type `types::Priv` in public interface
         //~^ WARNING hard error
     }
-    extern {
+    extern "C" {
         pub static ES: Priv; //~ ERROR private type `types::Priv` in public interface
         //~^ WARNING hard error
         pub fn ef1(arg: Priv); //~ ERROR private type `types::Priv` in public interface
@@ -55,9 +55,9 @@ mod traits {
     pub trait Tr2<T: PrivTr> {} //~ ERROR private trait `traits::PrivTr` in public interface
         //~^ WARNING hard error
     pub trait Tr3 {
+        type Alias: PrivTr;
         //~^ ERROR private trait `traits::PrivTr` in public interface
         //~| WARNING hard error
-        type Alias: PrivTr;
         fn f<T: PrivTr>(arg: T) {} //~ ERROR private trait `traits::PrivTr` in public interface
         //~^ WARNING hard error
     }

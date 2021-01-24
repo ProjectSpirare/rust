@@ -326,7 +326,7 @@ impl<'a> CrateLoader<'a> {
         self.verify_no_symbol_conflicts(&crate_root)?;
 
         let private_dep =
-            self.sess.opts.externs.get(&name.as_str()).map(|e| e.is_private_dep).unwrap_or(false);
+            self.sess.opts.externs.get(&name.as_str()).map_or(false, |e| e.is_private_dep);
 
         // Claim this crate number and cache it
         let cnum = self.cstore.alloc_new_crate_num();
@@ -706,13 +706,20 @@ impl<'a> CrateLoader<'a> {
         self.inject_dependency_if(cnum, "a panic runtime", &|data| data.needs_panic_runtime());
     }
 
-    fn inject_profiler_runtime(&mut self) {
+    fn inject_profiler_runtime(&mut self, krate: &ast::Crate) {
         if (self.sess.opts.debugging_opts.instrument_coverage
             || self.sess.opts.debugging_opts.profile
             || self.sess.opts.cg.profile_generate.enabled())
             && !self.sess.opts.debugging_opts.no_profiler_runtime
         {
             info!("loading profiler");
+
+            if self.sess.contains_name(&krate.attrs, sym::no_core) {
+                self.sess.err(
+                    "`profiler_builtins` crate (required by compiler options) \
+                               is not compatible with crate attribute `#![no_core]`",
+                );
+            }
 
             let name = sym::profiler_builtins;
             let cnum = self.resolve_crate(name, DUMMY_SP, CrateDepKind::Implicit, None);
@@ -752,10 +759,7 @@ impl<'a> CrateLoader<'a> {
         // At this point we've determined that we need an allocator. Let's see
         // if our compilation session actually needs an allocator based on what
         // we're emitting.
-        let all_rlib = self.sess.crate_types().iter().all(|ct| match *ct {
-            CrateType::Rlib => true,
-            _ => false,
-        });
+        let all_rlib = self.sess.crate_types().iter().all(|ct| matches!(*ct, CrateType::Rlib));
         if all_rlib {
             return;
         }
@@ -882,7 +886,7 @@ impl<'a> CrateLoader<'a> {
     }
 
     pub fn postprocess(&mut self, krate: &ast::Crate) {
-        self.inject_profiler_runtime();
+        self.inject_profiler_runtime(krate);
         self.inject_allocator_crate(krate);
         self.inject_panic_runtime(krate);
 

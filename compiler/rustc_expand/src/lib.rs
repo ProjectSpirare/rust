@@ -1,5 +1,4 @@
 #![feature(bool_to_option)]
-#![feature(cow_is_borrowed)]
 #![feature(crate_visibility_modifier)]
 #![feature(decl_macro)]
 #![feature(or_patterns)]
@@ -37,16 +36,13 @@ crate mod mbe;
 mod tests;
 #[cfg(test)]
 mod parse {
-    #[cfg(test)]
     mod tests;
 }
 #[cfg(test)]
 mod tokenstream {
-    #[cfg(test)]
     mod tests;
 }
 #[cfg(test)]
 mod mut_visit {
-    #[cfg(test)]
     mod tests;
 }

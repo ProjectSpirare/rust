@@ -1,13 +1,14 @@
 use super::ty::AllowPlus;
-use super::{BlockMode, Parser, PathStyle, SemiColonMode, SeqSep, TokenExpectType, TokenType};
+use super::TokenType;
+use super::{BlockMode, Parser, PathStyle, Restrictions, SemiColonMode, SeqSep, TokenExpectType};
 
+use rustc_ast as ast;
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, Lit, LitKind, TokenKind};
 use rustc_ast::util::parser::AssocOp;
-use rustc_ast::{
-    self as ast, AngleBracketedArgs, AttrVec, BinOpKind, BindingMode, BlockCheckMode, Expr,
-    ExprKind, Item, ItemKind, Mutability, Param, Pat, PatKind, PathSegment, QSelf, Ty, TyKind,
-};
+use rustc_ast::{AngleBracketedArg, AngleBracketedArgs, AnonConst, AttrVec};
+use rustc_ast::{BinOpKind, BindingMode, Block, BlockCheckMode, Expr, ExprKind, GenericArg, Item};
+use rustc_ast::{ItemKind, Mutability, Param, Pat, PatKind, Path, PathSegment, QSelf, Ty, TyKind};
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{pluralize, struct_span_err};
@@ -18,7 +19,8 @@ use rustc_span::{MultiSpan, Span, SpanSnippetError, DUMMY_SP};
 
 use tracing::{debug, trace};
 
-const TURBOFISH: &str = "use `::<...>` instead of `<...>` to specify type arguments";
+const TURBOFISH_SUGGESTION_STR: &str =
+    "use `::<...>` instead of `<...>` to specify type or const arguments";
 
 /// Creates a placeholder argument.
 pub(super) fn dummy_arg(ident: Ident) -> Param {
@@ -119,6 +121,28 @@ crate enum ConsumeClosingDelim {
     No,
 }
 
+#[derive(Clone, Copy)]
+pub enum AttemptLocalParseRecovery {
+    Yes,
+    No,
+}
+
+impl AttemptLocalParseRecovery {
+    pub fn yes(&self) -> bool {
+        match self {
+            AttemptLocalParseRecovery::Yes => true,
+            AttemptLocalParseRecovery::No => false,
+        }
+    }
+
+    pub fn no(&self) -> bool {
+        match self {
+            AttemptLocalParseRecovery::Yes => false,
+            AttemptLocalParseRecovery::No => true,
+        }
+    }
+}
+
 impl<'a> Parser<'a> {
     pub(super) fn span_fatal_err<S: Into<MultiSpan>>(
         &self,
@@ -195,6 +219,7 @@ impl<'a> Parser<'a> {
         edible: &[TokenKind],
         inedible: &[TokenKind],
     ) -> PResult<'a, bool /* recovered */> {
+        debug!("expected_one_of_not_found(edible: {:?}, inedible: {:?})", edible, inedible);
         fn tokens_to_string(tokens: &[TokenType]) -> String {
             let mut i = tokens.iter();
             // This might be a sign we need a connect method on `Iterator`.
@@ -220,6 +245,7 @@ impl<'a> Parser<'a> {
             .collect::<Vec<_>>();
         expected.sort_by_cached_key(|x| x.to_string());
         expected.dedup();
+
         let expect = tokens_to_string(&expected[..]);
         let actual = super::token_descr(&self.token);
         let (msg_exp, (label_sp, label_exp)) = if expected.len() > 1 {
@@ -245,6 +271,16 @@ impl<'a> Parser<'a> {
         };
         self.last_unexpected_token_span = Some(self.token.span);
         let mut err = self.struct_span_err(self.token.span, &msg_exp);
+
+        // Add suggestion for a missing closing angle bracket if '>' is included in expected_tokens
+        // there are unclosed angle brackets
+        if self.unmatched_angle_bracket_count > 0
+            && self.token.kind == TokenKind::Eq
+            && expected.iter().any(|tok| matches!(tok, TokenType::Token(TokenKind::Gt)))
+        {
+            err.span_label(self.prev_token.span, "maybe try to close unmatched angle bracket");
+        }
+
         let sp = if self.token == token::Eof {
             // This is EOF; don't want to point at the following char, but rather the last token.
             self.prev_token.span
@@ -319,6 +355,66 @@ impl<'a> Parser<'a> {
             }
             _ => false,
         }
+    }
+
+    pub fn maybe_suggest_struct_literal(
+        &mut self,
+        lo: Span,
+        s: BlockCheckMode,
+    ) -> Option<PResult<'a, P<Block>>> {
+        if self.token.is_ident() && self.look_ahead(1, |t| t == &token::Colon) {
+            // We might be having a struct literal where people forgot to include the path:
+            // fn foo() -> Foo {
+            //     field: value,
+            // }
+            let mut snapshot = self.clone();
+            let path =
+                Path { segments: vec![], span: self.prev_token.span.shrink_to_lo(), tokens: None };
+            let struct_expr = snapshot.parse_struct_expr(path, AttrVec::new(), false);
+            let block_tail = self.parse_block_tail(lo, s, AttemptLocalParseRecovery::No);
+            return Some(match (struct_expr, block_tail) {
+                (Ok(expr), Err(mut err)) => {
+                    // We have encountered the following:
+                    // fn foo() -> Foo {
+                    //     field: value,
+                    // }
+                    // Suggest:
+                    // fn foo() -> Foo { Path {
+                    //     field: value,
+                    // } }
+                    err.delay_as_bug();
+                    self.struct_span_err(expr.span, "struct literal body without path")
+                        .multipart_suggestion(
+                            "you might have forgotten to add the struct literal inside the block",
+                            vec![
+                                (expr.span.shrink_to_lo(), "{ SomeStruct ".to_string()),
+                                (expr.span.shrink_to_hi(), " }".to_string()),
+                            ],
+                            Applicability::MaybeIncorrect,
+                        )
+                        .emit();
+                    *self = snapshot;
+                    Ok(self.mk_block(
+                        vec![self.mk_stmt_err(expr.span)],
+                        s,
+                        lo.to(self.prev_token.span),
+                    ))
+                }
+                (Err(mut err), Ok(tail)) => {
+                    // We have a block tail that contains a somehow valid type ascription expr.
+                    err.cancel();
+                    Ok(tail)
+                }
+                (Err(mut snapshot_err), Err(err)) => {
+                    // We don't know what went wrong, emit the normal error.
+                    snapshot_err.cancel();
+                    self.consume_block(token::Brace, ConsumeClosingDelim::Yes);
+                    Err(err)
+                }
+                (Ok(_), Ok(tail)) => Ok(tail),
+            });
+        }
+        None
     }
 
     pub fn maybe_annotate_with_ascription(
@@ -426,7 +522,7 @@ impl<'a> Parser<'a> {
         //
         // `x.foo::<u32>>>(3)`
         let parsed_angle_bracket_args =
-            segment.args.as_ref().map(|args| args.is_angle_bracketed()).unwrap_or(false);
+            segment.args.as_ref().map_or(false, |args| args.is_angle_bracketed());
 
         debug!(
             "check_trailing_angle_brackets: parsed_angle_bracket_args={:?}",
@@ -575,7 +671,7 @@ impl<'a> Parser<'a> {
                                 Ok(_) => {
                                     e.span_suggestion_verbose(
                                         binop.span.shrink_to_lo(),
-                                        "use `::<...>` instead of `<...>` to specify type arguments",
+                                        TURBOFISH_SUGGESTION_STR,
                                         "::".to_string(),
                                         Applicability::MaybeIncorrect,
                                     );
@@ -730,7 +826,7 @@ impl<'a> Parser<'a> {
                 let suggest = |err: &mut DiagnosticBuilder<'_>| {
                     err.span_suggestion_verbose(
                         op.span.shrink_to_lo(),
-                        TURBOFISH,
+                        TURBOFISH_SUGGESTION_STR,
                         "::".to_string(),
                         Applicability::MaybeIncorrect,
                     );
@@ -804,7 +900,7 @@ impl<'a> Parser<'a> {
                         {
                             // All we know is that this is `foo < bar >` and *nothing* else. Try to
                             // be helpful, but don't attempt to recover.
-                            err.help(TURBOFISH);
+                            err.help(TURBOFISH_SUGGESTION_STR);
                             err.help("or use `(...)` if you meant to specify fn arguments");
                         }
 
@@ -1124,7 +1220,13 @@ impl<'a> Parser<'a> {
             self.recover_await_prefix(await_sp)?
         };
         let sp = self.error_on_incorrect_await(lo, hi, &expr, is_question);
-        let expr = self.mk_expr(lo.to(sp), ExprKind::Await(expr), attrs);
+        let kind = match expr.kind {
+            // Avoid knock-down errors as we don't know whether to interpret this as `foo().await?`
+            // or `foo()?.await` (the very reason we went with postfix syntax 😅).
+            ExprKind::Try(_) => ExprKind::Err,
+            _ => ExprKind::Await(expr),
+        };
+        let expr = self.mk_expr(lo.to(sp), kind, attrs);
         self.maybe_recover_from_bad_qpath(expr, true)
     }
 
@@ -1268,11 +1370,7 @@ impl<'a> Parser<'a> {
         (self.token == token::Lt && // `foo:<bar`, likely a typoed turbofish.
             self.look_ahead(1, |t| t.is_ident() && !t.is_reserved_ident()))
             || self.token.is_ident() &&
-            match node {
-                // `foo::` → `foo:` or `foo.bar::` → `foo.bar:`
-                ast::ExprKind::Path(..) | ast::ExprKind::Field(..) => true,
-                _ => false,
-            } &&
+            matches!(node, ast::ExprKind::Path(..) | ast::ExprKind::Field(..)) &&
             !self.token.is_reserved_ident() &&           // v `foo:bar(baz)`
             self.look_ahead(1, |t| t == &token::OpenDelim(token::Paren))
             || self.look_ahead(1, |t| t == &token::OpenDelim(token::Brace)) // `foo:bar {`
@@ -1465,14 +1563,6 @@ impl<'a> Parser<'a> {
                 )
                 .emit();
         }
-    }
-
-    pub(super) fn expected_semi_or_open_brace<T>(&mut self) -> PResult<'a, T> {
-        let token_str = super::token_descr(&self.token);
-        let msg = &format!("expected `;` or `{{`, found {}", token_str);
-        let mut err = self.struct_span_err(self.token.span, msg);
-        err.span_label(self.token.span, "expected `;` or `{`");
-        Err(err)
     }
 
     pub(super) fn eat_incorrect_doc_comment_for_param_type(&mut self) {
@@ -1690,5 +1780,165 @@ impl<'a> Parser<'a> {
                 seen_inputs.insert(ident);
             }
         }
+    }
+
+    /// Handle encountering a symbol in a generic argument list that is not a `,` or `>`. In this
+    /// case, we emit an error and try to suggest enclosing a const argument in braces if it looks
+    /// like the user has forgotten them.
+    pub fn handle_ambiguous_unbraced_const_arg(
+        &mut self,
+        args: &mut Vec<AngleBracketedArg>,
+    ) -> PResult<'a, bool> {
+        // If we haven't encountered a closing `>`, then the argument is malformed.
+        // It's likely that the user has written a const expression without enclosing it
+        // in braces, so we try to recover here.
+        let arg = args.pop().unwrap();
+        // FIXME: for some reason using `unexpected` or `expected_one_of_not_found` has
+        // adverse side-effects to subsequent errors and seems to advance the parser.
+        // We are causing this error here exclusively in case that a `const` expression
+        // could be recovered from the current parser state, even if followed by more
+        // arguments after a comma.
+        let mut err = self.struct_span_err(
+            self.token.span,
+            &format!("expected one of `,` or `>`, found {}", super::token_descr(&self.token)),
+        );
+        err.span_label(self.token.span, "expected one of `,` or `>`");
+        match self.recover_const_arg(arg.span(), err) {
+            Ok(arg) => {
+                args.push(AngleBracketedArg::Arg(arg));
+                if self.eat(&token::Comma) {
+                    return Ok(true); // Continue
+                }
+            }
+            Err(mut err) => {
+                args.push(arg);
+                // We will emit a more generic error later.
+                err.delay_as_bug();
+            }
+        }
+        return Ok(false); // Don't continue.
+    }
+
+    /// Attempt to parse a generic const argument that has not been enclosed in braces.
+    /// There are a limited number of expressions that are permitted without being encoded
+    /// in braces:
+    /// - Literals.
+    /// - Single-segment paths (i.e. standalone generic const parameters).
+    /// All other expressions that can be parsed will emit an error suggesting the expression be
+    /// wrapped in braces.
+    pub fn handle_unambiguous_unbraced_const_arg(&mut self) -> PResult<'a, P<Expr>> {
+        let start = self.token.span;
+        let expr = self.parse_expr_res(Restrictions::CONST_EXPR, None).map_err(|mut err| {
+            err.span_label(
+                start.shrink_to_lo(),
+                "while parsing a const generic argument starting here",
+            );
+            err
+        })?;
+        if !self.expr_is_valid_const_arg(&expr) {
+            self.struct_span_err(
+                expr.span,
+                "expressions must be enclosed in braces to be used as const generic \
+                    arguments",
+            )
+            .multipart_suggestion(
+                "enclose the `const` expression in braces",
+                vec![
+                    (expr.span.shrink_to_lo(), "{ ".to_string()),
+                    (expr.span.shrink_to_hi(), " }".to_string()),
+                ],
+                Applicability::MachineApplicable,
+            )
+            .emit();
+        }
+        Ok(expr)
+    }
+
+    /// Try to recover from possible generic const argument without `{` and `}`.
+    ///
+    /// When encountering code like `foo::< bar + 3 >` or `foo::< bar - baz >` we suggest
+    /// `foo::<{ bar + 3 }>` and `foo::<{ bar - baz }>`, respectively. We only provide a suggestion
+    /// if we think that that the resulting expression would be well formed.
+    pub fn recover_const_arg(
+        &mut self,
+        start: Span,
+        mut err: DiagnosticBuilder<'a>,
+    ) -> PResult<'a, GenericArg> {
+        let is_op = AssocOp::from_token(&self.token)
+            .and_then(|op| {
+                if let AssocOp::Greater
+                | AssocOp::Less
+                | AssocOp::ShiftRight
+                | AssocOp::GreaterEqual
+                // Don't recover from `foo::<bar = baz>`, because this could be an attempt to
+                // assign a value to a defaulted generic parameter.
+                | AssocOp::Assign
+                | AssocOp::AssignOp(_) = op
+                {
+                    None
+                } else {
+                    Some(op)
+                }
+            })
+            .is_some();
+        // This will be true when a trait object type `Foo +` or a path which was a `const fn` with
+        // type params has been parsed.
+        let was_op =
+            matches!(self.prev_token.kind, token::BinOp(token::Plus | token::Shr) | token::Gt);
+        if !is_op && !was_op {
+            // We perform these checks and early return to avoid taking a snapshot unnecessarily.
+            return Err(err);
+        }
+        let snapshot = self.clone();
+        if is_op {
+            self.bump();
+        }
+        match self.parse_expr_res(Restrictions::CONST_EXPR, None) {
+            Ok(expr) => {
+                if token::Comma == self.token.kind || self.token.kind.should_end_const_arg() {
+                    // Avoid the following output by checking that we consumed a full const arg:
+                    // help: expressions must be enclosed in braces to be used as const generic
+                    //       arguments
+                    //    |
+                    // LL |     let sr: Vec<{ (u32, _, _) = vec![] };
+                    //    |                 ^                      ^
+                    err.multipart_suggestion(
+                        "expressions must be enclosed in braces to be used as const generic \
+                         arguments",
+                        vec![
+                            (start.shrink_to_lo(), "{ ".to_string()),
+                            (expr.span.shrink_to_hi(), " }".to_string()),
+                        ],
+                        Applicability::MaybeIncorrect,
+                    );
+                    let value = self.mk_expr_err(start.to(expr.span));
+                    err.emit();
+                    return Ok(GenericArg::Const(AnonConst { id: ast::DUMMY_NODE_ID, value }));
+                }
+            }
+            Err(mut err) => {
+                err.cancel();
+            }
+        }
+        *self = snapshot;
+        Err(err)
+    }
+
+    /// Get the diagnostics for the cases where `move async` is found.
+    ///
+    /// `move_async_span` starts at the 'm' of the move keyword and ends with the 'c' of the async keyword
+    pub(super) fn incorrect_move_async_order_found(
+        &self,
+        move_async_span: Span,
+    ) -> DiagnosticBuilder<'a> {
+        let mut err =
+            self.struct_span_err(move_async_span, "the order of `move` and `async` is incorrect");
+        err.span_suggestion_verbose(
+            move_async_span,
+            "try switching the order",
+            "async move".to_owned(),
+            Applicability::MaybeIncorrect,
+        );
+        err
     }
 }

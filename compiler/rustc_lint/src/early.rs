@@ -18,6 +18,7 @@ use crate::context::{EarlyContext, LintContext, LintStore};
 use crate::passes::{EarlyLintPass, EarlyLintPassObject};
 use rustc_ast as ast;
 use rustc_ast::visit as ast_visit;
+use rustc_attr::HasAttrs;
 use rustc_session::lint::{BufferedEarlyLint, LintBuffer, LintPass};
 use rustc_session::Session;
 use rustc_span::symbol::Ident;
@@ -119,8 +120,22 @@ impl<'a, T: EarlyLintPass> ast_visit::Visitor<'a> for EarlyContextAndPass<'a, T>
     }
 
     fn visit_stmt(&mut self, s: &'a ast::Stmt) {
-        run_early_pass!(self, check_stmt, s);
-        self.check_id(s.id);
+        // Add the statement's lint attributes to our
+        // current state when checking the statement itself.
+        // This allows us to handle attributes like
+        // `#[allow(unused_doc_comments)]`, which apply to
+        // sibling attributes on the same target
+        //
+        // Note that statements get their attributes from
+        // the AST struct that they wrap (e.g. an item)
+        self.with_lint_attrs(s.id, s.attrs(), |cx| {
+            run_early_pass!(cx, check_stmt, s);
+            cx.check_id(s.id);
+        });
+        // The visitor for the AST struct wrapped
+        // by the statement (e.g. `Item`) will call
+        // `with_lint_attrs`, so do this walk
+        // outside of the above `with_lint_attrs` call
         ast_visit::walk_stmt(self, s);
     }
 
@@ -195,6 +210,11 @@ impl<'a, T: EarlyLintPass> ast_visit::Visitor<'a> for EarlyContextAndPass<'a, T>
         run_early_pass!(self, check_expr_post, e);
     }
 
+    fn visit_generic_arg(&mut self, arg: &'a ast::GenericArg) {
+        run_early_pass!(self, check_generic_arg, arg);
+        ast_visit::walk_generic_arg(self, arg);
+    }
+
     fn visit_generic_param(&mut self, param: &'a ast::GenericParam) {
         run_early_pass!(self, check_generic_param, param);
         ast_visit::walk_generic_param(self, param);
@@ -250,15 +270,9 @@ impl<'a, T: EarlyLintPass> ast_visit::Visitor<'a> for EarlyContextAndPass<'a, T>
         self.check_id(id);
     }
 
-    fn visit_mac(&mut self, mac: &'a ast::MacCall) {
-        // FIXME(#54110): So, this setup isn't really right. I think
-        // that (a) the librustc_ast visitor ought to be doing this as
-        // part of `walk_mac`, and (b) we should be calling
-        // `visit_path`, *but* that would require a `NodeId`, and I
-        // want to get #53686 fixed quickly. -nmatsakis
-        ast_visit::walk_path(self, &mac.path);
-
+    fn visit_mac_call(&mut self, mac: &'a ast::MacCall) {
         run_early_pass!(self, check_mac, mac);
+        ast_visit::walk_mac(self, mac);
     }
 }
 
@@ -365,17 +379,9 @@ pub fn check_ast_crate<T: EarlyLintPass>(
     // All of the buffered lints should have been emitted at this point.
     // If not, that means that we somehow buffered a lint for a node id
     // that was not lint-checked (perhaps it doesn't exist?). This is a bug.
-    //
-    // Rustdoc runs everybody-loops before the early lints and removes
-    // function bodies, so it's totally possible for linted
-    // node ids to not exist (e.g., macros defined within functions for the
-    // unused_macro lint) anymore. So we only run this check
-    // when we're not in rustdoc mode. (see issue #47639)
-    if !sess.opts.actually_rustdoc {
-        for (_id, lints) in buffered.map {
-            for early_lint in lints {
-                sess.delay_span_bug(early_lint.span, "failed to process buffered lint here");
-            }
+    for (_id, lints) in buffered.map {
+        for early_lint in lints {
+            sess.delay_span_bug(early_lint.span, "failed to process buffered lint here");
         }
     }
 }

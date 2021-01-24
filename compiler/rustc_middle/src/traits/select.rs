@@ -101,13 +101,14 @@ pub enum SelectionCandidate<'tcx> {
         /// `false` if there are no *further* obligations.
         has_nested: bool,
     },
-    ParamCandidate(ty::PolyTraitRef<'tcx>),
+    ParamCandidate(ty::ConstnessAnd<ty::PolyTraitRef<'tcx>>),
     ImplCandidate(DefId),
     AutoImplCandidate(DefId),
 
-    /// This is a trait matching with a projected type as `Self`, and
-    /// we found an applicable bound in the trait definition.
-    ProjectionCandidate,
+    /// This is a trait matching with a projected type as `Self`, and we found
+    /// an applicable bound in the trait definition. The `usize` is an index
+    /// into the list returned by `tcx.item_bounds`.
+    ProjectionCandidate(usize),
 
     /// Implementation of a `Fn`-family trait by one of the anonymous types
     /// generated for a `||` expression.
@@ -126,7 +127,10 @@ pub enum SelectionCandidate<'tcx> {
 
     TraitAliasCandidate(DefId),
 
-    ObjectCandidate,
+    /// Matching `dyn Trait` with a supertrait of `Trait`. The index is the
+    /// position in the iterator returned by
+    /// `rustc_infer::traits::util::supertraits`.
+    ObjectCandidate(usize),
 
     BuiltinObjectCandidate,
 

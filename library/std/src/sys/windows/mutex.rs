@@ -23,12 +23,16 @@ use crate::cell::{Cell, UnsafeCell};
 use crate::mem::{self, MaybeUninit};
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sys::c;
-use crate::sys::compat;
 
 pub struct Mutex {
     // This is either directly an SRWLOCK (if supported), or a Box<Inner> otherwise.
     lock: AtomicUsize,
 }
+
+// Windows SRW Locks are movable (while not borrowed).
+// ReentrantMutexes (in Inner) are not, but those are stored indirectly through
+// a Box, so do not move when the Mutex it self is moved.
+pub type MovableMutex = Mutex;
 
 unsafe impl Send for Mutex {}
 unsafe impl Sync for Mutex {}
@@ -40,8 +44,8 @@ struct Inner {
 
 #[derive(Clone, Copy)]
 enum Kind {
-    SRWLock = 1,
-    CriticalSection = 2,
+    SRWLock,
+    CriticalSection,
 }
 
 #[inline]
@@ -119,9 +123,9 @@ impl Mutex {
         let inner = box Inner { remutex: ReentrantMutex::uninitialized(), held: Cell::new(false) };
         inner.remutex.init();
         let inner = Box::into_raw(inner);
-        match self.lock.compare_and_swap(0, inner as usize, Ordering::SeqCst) {
-            0 => inner,
-            n => {
+        match self.lock.compare_exchange(0, inner as usize, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => inner,
+            Err(n) => {
                 Box::from_raw(inner).remutex.destroy();
                 n as *const _
             }
@@ -130,21 +134,7 @@ impl Mutex {
 }
 
 fn kind() -> Kind {
-    static KIND: AtomicUsize = AtomicUsize::new(0);
-
-    let val = KIND.load(Ordering::SeqCst);
-    if val == Kind::SRWLock as usize {
-        return Kind::SRWLock;
-    } else if val == Kind::CriticalSection as usize {
-        return Kind::CriticalSection;
-    }
-
-    let ret = match compat::lookup("kernel32", "AcquireSRWLockExclusive") {
-        None => Kind::CriticalSection,
-        Some(..) => Kind::SRWLock,
-    };
-    KIND.store(ret as usize, Ordering::SeqCst);
-    ret
+    if c::AcquireSRWLockExclusive::is_available() { Kind::SRWLock } else { Kind::CriticalSection }
 }
 
 pub struct ReentrantMutex {

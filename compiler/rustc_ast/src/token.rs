@@ -15,7 +15,7 @@ use rustc_span::hygiene::ExpnKind;
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::{kw, sym};
 use rustc_span::symbol::{Ident, Symbol};
-use rustc_span::{self, FileName, RealFileName, Span, DUMMY_SP};
+use rustc_span::{self, edition::Edition, FileName, RealFileName, Span, DUMMY_SP};
 use std::borrow::Cow;
 use std::{fmt, mem};
 
@@ -52,16 +52,6 @@ pub enum DelimToken {
     Brace,
     /// An empty delimiter.
     NoDelim,
-}
-
-impl DelimToken {
-    pub fn len(self) -> usize {
-        if self == NoDelim { 0 } else { 1 }
-    }
-
-    pub fn is_empty(self) -> bool {
-        self == NoDelim
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
@@ -140,10 +130,7 @@ impl LitKind {
     }
 
     crate fn may_have_suffix(self) -> bool {
-        match self {
-            Integer | Float | Err => true,
-            _ => false,
-        }
+        matches!(self, Integer | Float | Err)
     }
 }
 
@@ -163,6 +150,7 @@ pub fn ident_can_begin_expr(name: Symbol, span: Span, is_raw: bool) -> bool {
             kw::Do,
             kw::Box,
             kw::Break,
+            kw::Const,
             kw::Continue,
             kw::False,
             kw::For,
@@ -312,6 +300,10 @@ impl TokenKind {
             _ => None,
         }
     }
+
+    pub fn should_end_const_arg(&self) -> bool {
+        matches!(self, Gt | Ge | BinOp(Shr) | BinOpEq(Shr))
+    }
 }
 
 impl Token {
@@ -348,18 +340,21 @@ impl Token {
     }
 
     pub fn is_op(&self) -> bool {
-        match self.kind {
-            OpenDelim(..) | CloseDelim(..) | Literal(..) | DocComment(..) | Ident(..)
-            | Lifetime(..) | Interpolated(..) | Eof => false,
-            _ => true,
-        }
+        !matches!(
+            self.kind,
+            OpenDelim(..)
+                | CloseDelim(..)
+                | Literal(..)
+                | DocComment(..)
+                | Ident(..)
+                | Lifetime(..)
+                | Interpolated(..)
+                | Eof
+        )
     }
 
     pub fn is_like_plus(&self) -> bool {
-        match self.kind {
-            BinOp(Plus) | BinOpEq(Plus) => true,
-            _ => false,
-        }
+        matches!(self.kind, BinOp(Plus) | BinOpEq(Plus))
     }
 
     /// Returns `true` if the token can appear at the start of an expression.
@@ -381,13 +376,10 @@ impl Token {
             ModSep                            | // global path
             Lifetime(..)                      | // labeled loop
             Pound                             => true, // expression attributes
-            Interpolated(ref nt) => match **nt {
-                NtLiteral(..) |
+            Interpolated(ref nt) => matches!(**nt, NtLiteral(..) |
                 NtExpr(..)    |
                 NtBlock(..)   |
-                NtPath(..) => true,
-                _ => false,
-            },
+                NtPath(..)),
             _ => false,
         }
     }
@@ -407,10 +399,7 @@ impl Token {
             Lifetime(..)                | // lifetime bound in trait object
             Lt | BinOp(Shl)             | // associated path
             ModSep                      => true, // global path
-            Interpolated(ref nt) => match **nt {
-                NtTy(..) | NtPath(..) => true,
-                _ => false,
-            },
+            Interpolated(ref nt) => matches!(**nt, NtTy(..) | NtPath(..)),
             _ => false,
         }
     }
@@ -419,10 +408,7 @@ impl Token {
     pub fn can_begin_const_arg(&self) -> bool {
         match self.kind {
             OpenDelim(Brace) => true,
-            Interpolated(ref nt) => match **nt {
-                NtExpr(..) | NtBlock(..) | NtLiteral(..) => true,
-                _ => false,
-            },
+            Interpolated(ref nt) => matches!(**nt, NtExpr(..) | NtBlock(..) | NtLiteral(..)),
             _ => self.can_begin_literal_maybe_minus(),
         }
     }
@@ -436,12 +422,9 @@ impl Token {
             || self == &OpenDelim(Paren)
     }
 
-    /// Returns `true` if the token is any literal
+    /// Returns `true` if the token is any literal.
     pub fn is_lit(&self) -> bool {
-        match self.kind {
-            Literal(..) => true,
-            _ => false,
-        }
+        matches!(self.kind, Literal(..))
     }
 
     /// Returns `true` if the token is any literal, a minus (which can prefix a literal,
@@ -707,7 +690,16 @@ pub enum NonterminalKind {
     Item,
     Block,
     Stmt,
-    Pat,
+    Pat2018 {
+        /// Keep track of whether the user used `:pat2018` or `:pat` and we inferred it from the
+        /// edition of the span. This is used for diagnostics.
+        inferred: bool,
+    },
+    Pat2021 {
+        /// Keep track of whether the user used `:pat2018` or `:pat` and we inferred it from the
+        /// edition of the span. This is used for diagnostics.
+        inferred: bool,
+    },
     Expr,
     Ty,
     Ident,
@@ -720,12 +712,24 @@ pub enum NonterminalKind {
 }
 
 impl NonterminalKind {
-    pub fn from_symbol(symbol: Symbol) -> Option<NonterminalKind> {
+    /// The `edition` closure is used to get the edition for the given symbol. Doing
+    /// `span.edition()` is expensive, so we do it lazily.
+    pub fn from_symbol(
+        symbol: Symbol,
+        edition: impl FnOnce() -> Edition,
+    ) -> Option<NonterminalKind> {
         Some(match symbol {
             sym::item => NonterminalKind::Item,
             sym::block => NonterminalKind::Block,
             sym::stmt => NonterminalKind::Stmt,
-            sym::pat => NonterminalKind::Pat,
+            sym::pat => match edition() {
+                Edition::Edition2015 | Edition::Edition2018 => {
+                    NonterminalKind::Pat2018 { inferred: true }
+                }
+                Edition::Edition2021 => NonterminalKind::Pat2021 { inferred: true },
+            },
+            sym::pat2018 => NonterminalKind::Pat2018 { inferred: false },
+            sym::pat2021 => NonterminalKind::Pat2021 { inferred: false },
             sym::expr => NonterminalKind::Expr,
             sym::ty => NonterminalKind::Ty,
             sym::ident => NonterminalKind::Ident,
@@ -743,7 +747,10 @@ impl NonterminalKind {
             NonterminalKind::Item => sym::item,
             NonterminalKind::Block => sym::block,
             NonterminalKind::Stmt => sym::stmt,
-            NonterminalKind::Pat => sym::pat,
+            NonterminalKind::Pat2018 { inferred: false } => sym::pat2018,
+            NonterminalKind::Pat2021 { inferred: false } => sym::pat2021,
+            NonterminalKind::Pat2018 { inferred: true }
+            | NonterminalKind::Pat2021 { inferred: true } => sym::pat,
             NonterminalKind::Expr => sym::expr,
             NonterminalKind::Ty => sym::ty,
             NonterminalKind::Ident => sym::ident,
@@ -764,7 +771,7 @@ impl fmt::Display for NonterminalKind {
 }
 
 impl Nonterminal {
-    fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         match self {
             NtItem(item) => item.span,
             NtBlock(block) => block.span,
@@ -787,13 +794,20 @@ impl Nonterminal {
     /// See issue #73345 for more details.
     /// FIXME(#73933): Remove this eventually.
     pub fn pretty_printing_compatibility_hack(&self) -> bool {
-        if let NtItem(item) = self {
-            let name = item.ident.name;
-            if name == sym::ProceduralMasqueradeDummyType || name == sym::ProcMacroHack {
-                if let ast::ItemKind::Enum(enum_def, _) = &item.kind {
-                    if let [variant] = &*enum_def.variants {
-                        return variant.ident.name == sym::Input;
-                    }
+        let item = match self {
+            NtItem(item) => item,
+            NtStmt(stmt) => match &stmt.kind {
+                ast::StmtKind::Item(item) => item,
+                _ => return false,
+            },
+            _ => return false,
+        };
+
+        let name = item.ident.name;
+        if name == sym::ProceduralMasqueradeDummyType || name == sym::ProcMacroHack {
+            if let ast::ItemKind::Enum(enum_def, _) = &item.kind {
+                if let [variant] = &*enum_def.variants {
+                    return variant.ident.name == sym::Input;
                 }
             }
         }
@@ -810,10 +824,10 @@ impl Nonterminal {
             if let ExpnKind::Macro(_, macro_name) = orig_span.ctxt().outer_expn_data().kind {
                 let filename = source_map.span_to_filename(orig_span);
                 if let FileName::Real(RealFileName::Named(path)) = filename {
-                    let matches_prefix = |prefix| {
-                        // Check for a path that ends with 'prefix*/src/lib.rs'
+                    let matches_prefix = |prefix, filename| {
+                        // Check for a path that ends with 'prefix*/src/<filename>'
                         let mut iter = path.components().rev();
-                        iter.next().and_then(|p| p.as_os_str().to_str()) == Some("lib.rs")
+                        iter.next().and_then(|p| p.as_os_str().to_str()) == Some(filename)
                             && iter.next().and_then(|p| p.as_os_str().to_str()) == Some("src")
                             && iter
                                 .next()
@@ -821,11 +835,22 @@ impl Nonterminal {
                                 .map_or(false, |p| p.starts_with(prefix))
                     };
 
-                    if (macro_name == sym::impl_macros && matches_prefix("time-macros-impl"))
-                        || (macro_name == sym::arrays && matches_prefix("js-sys"))
+                    if (macro_name == sym::impl_macros
+                        && matches_prefix("time-macros-impl", "lib.rs"))
+                        || (macro_name == sym::arrays && matches_prefix("js-sys", "lib.rs"))
                     {
                         let snippet = source_map.span_to_snippet(orig_span);
                         if snippet.as_deref() == Ok("$name") {
+                            return Some((*ident, *is_raw));
+                        }
+                    }
+
+                    if macro_name == sym::tuple_from_req
+                        && (matches_prefix("actix-web", "extract.rs")
+                            || matches_prefix("actori-web", "extract.rs"))
+                    {
+                        let snippet = source_map.span_to_snippet(orig_span);
+                        if snippet.as_deref() == Ok("$T") {
                             return Some((*ident, *is_raw));
                         }
                     }

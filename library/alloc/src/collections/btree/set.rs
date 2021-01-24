@@ -9,6 +9,7 @@ use core::iter::{FromIterator, FusedIterator, Peekable};
 use core::ops::{BitAnd, BitOr, BitXor, RangeBounds, Sub};
 
 use super::map::{BTreeMap, Keys};
+use super::merge_iter::MergeIterInner;
 use super::Recover;
 
 // FIXME(conventions): implement bounded iterators
@@ -21,6 +22,9 @@ use super::Recover;
 /// It is a logic error for an item to be modified in such a way that the item's ordering relative
 /// to any other item, as determined by the [`Ord`] trait, changes while it is in the set. This is
 /// normally only possible through [`Cell`], [`RefCell`], global state, I/O, or unsafe code.
+/// The behavior resulting from such a logic error is not specified, but will not result in
+/// undefined behavior. This could include panics, incorrect results, aborts, memory leaks, and
+/// non-termination.
 ///
 /// [`Ord`]: core::cmp::Ord
 /// [`Cell`]: core::cell::Cell
@@ -112,77 +116,6 @@ pub struct IntoIter<T> {
 #[stable(feature = "btree_range", since = "1.17.0")]
 pub struct Range<'a, T: 'a> {
     iter: super::map::Range<'a, T, ()>,
-}
-
-/// Core of SymmetricDifference and Union.
-/// More efficient than btree.map.MergeIter,
-/// and crucially for SymmetricDifference, nexts() reports on both sides.
-#[derive(Clone)]
-struct MergeIterInner<I>
-where
-    I: Iterator,
-    I::Item: Copy,
-{
-    a: I,
-    b: I,
-    peeked: Option<MergeIterPeeked<I>>,
-}
-
-#[derive(Copy, Clone, Debug)]
-enum MergeIterPeeked<I: Iterator> {
-    A(I::Item),
-    B(I::Item),
-}
-
-impl<I> MergeIterInner<I>
-where
-    I: ExactSizeIterator + FusedIterator,
-    I::Item: Copy + Ord,
-{
-    fn new(a: I, b: I) -> Self {
-        MergeIterInner { a, b, peeked: None }
-    }
-
-    fn nexts(&mut self) -> (Option<I::Item>, Option<I::Item>) {
-        let mut a_next = match self.peeked {
-            Some(MergeIterPeeked::A(next)) => Some(next),
-            _ => self.a.next(),
-        };
-        let mut b_next = match self.peeked {
-            Some(MergeIterPeeked::B(next)) => Some(next),
-            _ => self.b.next(),
-        };
-        let ord = match (a_next, b_next) {
-            (None, None) => Equal,
-            (_, None) => Less,
-            (None, _) => Greater,
-            (Some(a1), Some(b1)) => a1.cmp(&b1),
-        };
-        self.peeked = match ord {
-            Less => b_next.take().map(MergeIterPeeked::B),
-            Equal => None,
-            Greater => a_next.take().map(MergeIterPeeked::A),
-        };
-        (a_next, b_next)
-    }
-
-    fn lens(&self) -> (usize, usize) {
-        match self.peeked {
-            Some(MergeIterPeeked::A(_)) => (1 + self.a.len(), self.b.len()),
-            Some(MergeIterPeeked::B(_)) => (self.a.len(), 1 + self.b.len()),
-            _ => (self.a.len(), self.b.len()),
-        }
-    }
-}
-
-impl<I> Debug for MergeIterInner<I>
-where
-    I: Iterator + Debug,
-    I::Item: Copy + Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("MergeIterInner").field(&self.a).field(&self.b).finish()
-    }
 }
 
 /// A lazy iterator producing elements in the difference of `BTreeSet`s.
@@ -284,13 +217,15 @@ impl<T: fmt::Debug> fmt::Debug for Union<'_, T> {
 // This constant is used by functions that compare two sets.
 // It estimates the relative size at which searching performs better
 // than iterating, based on the benchmarks in
-// https://github.com/ssomers/rust_bench_btreeset_intersection;
+// https://github.com/ssomers/rust_bench_btreeset_intersection.
 // It's used to divide rather than multiply sizes, to rule out overflow,
 // and it's a power of two to make that division cheap.
 const ITER_PERFORMANCE_TIPPING_SIZE_DIFF: usize = 16;
 
 impl<T: Ord> BTreeSet<T> {
-    /// Makes a new `BTreeSet` with a reasonable choice of B.
+    /// Makes a new, empty `BTreeSet`.
+    ///
+    /// Does not allocate anything on its own.
     ///
     /// # Examples
     ///
@@ -747,7 +682,7 @@ impl<T: Ord> BTreeSet<T> {
     /// ```
     #[unstable(feature = "map_first_last", issue = "62924")]
     pub fn pop_first(&mut self) -> Option<T> {
-        self.map.first_entry().map(|entry| entry.remove_entry().0)
+        self.map.pop_first().map(|kv| kv.0)
     }
 
     /// Removes the last value from the set and returns it, if any.
@@ -769,7 +704,7 @@ impl<T: Ord> BTreeSet<T> {
     /// ```
     #[unstable(feature = "map_first_last", issue = "62924")]
     pub fn pop_last(&mut self) -> Option<T> {
-        self.map.last_entry().map(|entry| entry.remove_entry().0)
+        self.map.pop_last().map(|kv| kv.0)
     }
 
     /// Adds a value to the set.
@@ -866,6 +801,30 @@ impl<T: Ord> BTreeSet<T> {
         Q: Ord,
     {
         Recover::take(&mut self.map, value)
+    }
+
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// In other words, remove all elements `e` such that `f(&e)` returns `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(btree_retain)]
+    /// use std::collections::BTreeSet;
+    ///
+    /// let xs = [1, 2, 3, 4, 5, 6];
+    /// let mut set: BTreeSet<i32> = xs.iter().cloned().collect();
+    /// // Keep only the even numbers.
+    /// set.retain(|&k| k % 2 == 0);
+    /// assert!(set.iter().eq([2, 4, 6].iter()));
+    /// ```
+    #[unstable(feature = "btree_retain", issue = "79025")]
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        self.drain_filter(|v| !f(v));
     }
 
     /// Moves all elements from `other` into `Self`, leaving `other` empty.
@@ -1019,8 +978,10 @@ impl<T> BTreeSet<T> {
     /// v.insert(1);
     /// assert_eq!(v.len(), 1);
     /// ```
+    #[doc(alias = "length")]
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn len(&self) -> usize {
+    #[rustc_const_unstable(feature = "const_btree_new", issue = "71835")]
+    pub const fn len(&self) -> usize {
         self.map.len()
     }
 
@@ -1037,7 +998,8 @@ impl<T> BTreeSet<T> {
     /// assert!(!v.is_empty());
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn is_empty(&self) -> bool {
+    #[rustc_const_unstable(feature = "const_btree_new", issue = "71835")]
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
@@ -1165,7 +1127,7 @@ impl<'a, T: 'a + Ord + Copy> Extend<&'a T> for BTreeSet<T> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Ord> Default for BTreeSet<T> {
-    /// Makes an empty `BTreeSet<T>` with a reasonable choice of B.
+    /// Creates an empty `BTreeSet`.
     fn default() -> BTreeSet<T> {
         BTreeSet::new()
     }
@@ -1461,7 +1423,7 @@ impl<'a, T: Ord> Iterator for SymmetricDifference<'a, T> {
 
     fn next(&mut self) -> Option<&'a T> {
         loop {
-            let (a_next, b_next) = self.0.nexts();
+            let (a_next, b_next) = self.0.nexts(Self::Item::cmp);
             if a_next.and(b_next).is_none() {
                 return a_next.or(b_next);
             }
@@ -1555,7 +1517,7 @@ impl<'a, T: Ord> Iterator for Union<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<&'a T> {
-        let (a_next, b_next) = self.0.nexts();
+        let (a_next, b_next) = self.0.nexts(Self::Item::cmp);
         a_next.or(b_next)
     }
 

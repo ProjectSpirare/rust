@@ -1,5 +1,3 @@
-//! See the Book for more information.
-
 pub use self::freshen::TypeFreshener;
 pub use self::LateBoundRegionConversionTime::*;
 pub use self::RegionVariableOrigin::*;
@@ -21,7 +19,7 @@ use rustc_middle::infer::canonical::{Canonical, CanonicalVarValues};
 use rustc_middle::infer::unify_key::{ConstVarValue, ConstVariableValue};
 use rustc_middle::infer::unify_key::{ConstVariableOrigin, ConstVariableOriginKind, ToType};
 use rustc_middle::mir;
-use rustc_middle::mir::interpret::ConstEvalResult;
+use rustc_middle::mir::interpret::EvalToConstValueResult;
 use rustc_middle::traits::select;
 use rustc_middle::ty::error::{ExpectedFound, TypeError, UnconstrainedNumeric};
 use rustc_middle::ty::fold::{TypeFoldable, TypeFolder};
@@ -113,13 +111,6 @@ impl Default for RegionckMode {
 }
 
 impl RegionckMode {
-    pub fn suppressed(self) -> bool {
-        match self {
-            Self::Solve => false,
-            Self::Erase { suppress_errors } => suppress_errors,
-        }
-    }
-
     /// Indicates that the MIR borrowck will repeat these region
     /// checks, so we should ignore errors if NLL is (unconditionally)
     /// enabled.
@@ -351,13 +342,8 @@ pub struct InferCtxt<'a, 'tcx> {
     universe: Cell<ty::UniverseIndex>,
 }
 
-/// A map returned by `replace_bound_vars_with_placeholders()`
-/// indicating the placeholder region that each late-bound region was
-/// replaced with.
-pub type PlaceholderMap<'tcx> = BTreeMap<ty::BoundRegion, ty::Region<'tcx>>;
-
 /// See the `error_reporting` module for more details.
-#[derive(Clone, Debug, PartialEq, Eq, TypeFoldable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TypeFoldable)]
 pub enum ValuePairs<'tcx> {
     Types(ExpectedFound<Ty<'tcx>>),
     Regions(ExpectedFound<ty::Region<'tcx>>),
@@ -425,15 +411,6 @@ pub enum SubregionOrigin<'tcx> {
 #[cfg(target_arch = "x86_64")]
 static_assert_size!(SubregionOrigin<'_>, 32);
 
-/// Places that type/region parameters can appear.
-#[derive(Clone, Copy, Debug)]
-pub enum ParameterOrigin {
-    Path,               // foo::bar
-    MethodCall,         // foo.bar() <-- parameters on impl providing bar()
-    OverloadedOperator, // a + b when overloaded
-    OverloadedDeref,    // *a when overloaded
-}
-
 /// Times when we replace late-bound regions with variables:
 #[derive(Clone, Copy, Debug)]
 pub enum LateBoundRegionConversionTime {
@@ -473,7 +450,7 @@ pub enum RegionVariableOrigin {
 
     /// Region variables created for bound regions
     /// in a function or method that is called
-    LateBoundRegion(Span, ty::BoundRegion, LateBoundRegionConversionTime),
+    LateBoundRegion(Span, ty::BoundRegionKind, LateBoundRegionConversionTime),
 
     UpvarRegion(ty::UpvarId, Span),
 
@@ -511,21 +488,6 @@ pub enum NLLRegionVariableOrigin {
         /// rather than blaming the source of the constraint C.
         from_forall: bool,
     },
-}
-
-impl NLLRegionVariableOrigin {
-    pub fn is_universal(self) -> bool {
-        match self {
-            NLLRegionVariableOrigin::FreeRegion => true,
-            NLLRegionVariableOrigin::Placeholder(..) => true,
-            NLLRegionVariableOrigin::Existential { .. } => false,
-            NLLRegionVariableOrigin::RootEmptyRegion => false,
-        }
-    }
-
-    pub fn is_existential(self) -> bool {
-        !self.is_universal()
-    }
 }
 
 // FIXME(eddyb) investigate overlap between this and `TyOrConstInferVar`.
@@ -714,8 +676,6 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
 
     pub fn unsolved_variables(&self) -> Vec<Ty<'tcx>> {
         let mut inner = self.inner.borrow_mut();
-        // FIXME(const_generics): should there be an equivalent function for const variables?
-
         let mut vars: Vec<Ty<'_>> = inner
             .type_variables()
             .unsolved_variables()
@@ -992,8 +952,8 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         }
 
         Some(self.commit_if_ok(|_snapshot| {
-            let (ty::SubtypePredicate { a_is_expected, a, b }, _) =
-                self.replace_bound_vars_with_placeholders(&predicate);
+            let ty::SubtypePredicate { a_is_expected, a, b } =
+                self.replace_bound_vars_with_placeholders(predicate);
 
             let ok = self.at(cause, param_env).sub_exp(a_is_expected, a, b)?;
 
@@ -1007,8 +967,8 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         predicate: ty::PolyRegionOutlivesPredicate<'tcx>,
     ) -> UnitResult<'tcx> {
         self.commit_if_ok(|_snapshot| {
-            let (ty::OutlivesPredicate(r_a, r_b), _) =
-                self.replace_bound_vars_with_placeholders(&predicate);
+            let ty::OutlivesPredicate(r_a, r_b) =
+                self.replace_bound_vars_with_placeholders(predicate);
             let origin = SubregionOrigin::from_obligation_cause(cause, || {
                 RelateRegionParamBound(cause.span)
             });
@@ -1163,7 +1123,10 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
             }
             GenericParamDefKind::Const { .. } => {
                 let origin = ConstVariableOrigin {
-                    kind: ConstVariableOriginKind::ConstParameterDefinition(param.name),
+                    kind: ConstVariableOriginKind::ConstParameterDefinition(
+                        param.name,
+                        param.def_id,
+                    ),
                     span,
                 };
                 let const_var_id =
@@ -1275,7 +1238,6 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
     }
 
     /// Gives temporary access to the region constraint data.
-    #[allow(non_camel_case_types)] // bug with impl trait
     pub fn with_region_constraints<R>(
         &self,
         op: impl FnOnce(&RegionConstraintData<'tcx>) -> R,
@@ -1302,7 +1264,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
     }
 
     pub fn ty_to_string(&self, t: Ty<'tcx>) -> String {
-        self.resolve_vars_if_possible(&t).to_string()
+        self.resolve_vars_if_possible(t).to_string()
     }
 
     pub fn tys_to_string(&self, ts: &[Ty<'tcx>]) -> String {
@@ -1310,7 +1272,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         format!("({})", tstrs.join(", "))
     }
 
-    pub fn trait_ref_to_string(&self, t: &ty::TraitRef<'tcx>) -> String {
+    pub fn trait_ref_to_string(&self, t: ty::TraitRef<'tcx>) -> String {
         self.resolve_vars_if_possible(t).print_only_trait_path().to_string()
     }
 
@@ -1350,12 +1312,12 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
     /// is left as is. This is an idempotent operation that does
     /// not affect inference state in any way and so you can do it
     /// at will.
-    pub fn resolve_vars_if_possible<T>(&self, value: &T) -> T
+    pub fn resolve_vars_if_possible<T>(&self, value: T) -> T
     where
         T: TypeFoldable<'tcx>,
     {
         if !value.needs_infer() {
-            return value.clone(); // Avoid duplicated subst-folding.
+            return value; // Avoid duplicated subst-folding.
         }
         let mut r = resolve::OpportunisticVarResolver::new(self);
         value.fold_with(&mut r)
@@ -1370,9 +1332,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
     where
         T: TypeFoldable<'tcx>,
     {
-        let mut r = resolve::UnresolvedTypeFinder::new(self);
-        value.visit_with(&mut r);
-        r.first_unresolved
+        value.visit_with(&mut resolve::UnresolvedTypeFinder::new(self)).break_value()
     }
 
     pub fn probe_const_var(
@@ -1385,7 +1345,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         }
     }
 
-    pub fn fully_resolve<T: TypeFoldable<'tcx>>(&self, value: &T) -> FixupResult<'tcx, T> {
+    pub fn fully_resolve<T: TypeFoldable<'tcx>>(&self, value: T) -> FixupResult<'tcx, T> {
         /*!
          * Attempts to resolve all type/region/const variables in
          * `value`. Region inference must have been run already (e.g.,
@@ -1419,7 +1379,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
     where
         M: FnOnce(String) -> DiagnosticBuilder<'tcx>,
     {
-        let actual_ty = self.resolve_vars_if_possible(&actual_ty);
+        let actual_ty = self.resolve_vars_if_possible(actual_ty);
         debug!("type_error_struct_with_diag({:?}, {:?})", sp, actual_ty);
 
         // Don't report an error if actual type is `Error`.
@@ -1456,12 +1416,13 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         &self,
         span: Span,
         lbrct: LateBoundRegionConversionTime,
-        value: &ty::Binder<T>,
+        value: ty::Binder<T>,
     ) -> (T, BTreeMap<ty::BoundRegion, ty::Region<'tcx>>)
     where
         T: TypeFoldable<'tcx>,
     {
-        let fld_r = |br| self.next_region_var(LateBoundRegion(span, br, lbrct));
+        let fld_r =
+            |br: ty::BoundRegion| self.next_region_var(LateBoundRegion(span, br.kind, lbrct));
         let fld_t = |_| {
             self.next_ty_var(TypeVariableOrigin {
                 kind: TypeVariableOriginKind::MiscVariable,
@@ -1542,9 +1503,9 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         substs: SubstsRef<'tcx>,
         promoted: Option<mir::Promoted>,
         span: Option<Span>,
-    ) -> ConstEvalResult<'tcx> {
+    ) -> EvalToConstValueResult<'tcx> {
         let mut original_values = OriginalQueryValues::default();
-        let canonical = self.canonicalize_query(&(param_env, substs), &mut original_values);
+        let canonical = self.canonicalize_query((param_env, substs), &mut original_values);
 
         let (param_env, substs) = canonical.value;
         // The return value is the evaluated value which doesn't contain any reference to inference
@@ -1572,7 +1533,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
                 // Note: if these two lines are combined into one we get
                 // dynamic borrow errors on `self.inner`.
                 let known = self.inner.borrow_mut().type_variables().probe(v).known();
-                known.map(|t| self.shallow_resolve_ty(t)).unwrap_or(typ)
+                known.map_or(typ, |t| self.shallow_resolve_ty(t))
             }
 
             ty::Infer(ty::IntVar(v)) => self

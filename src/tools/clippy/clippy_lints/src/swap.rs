@@ -1,7 +1,6 @@
 use crate::utils::sugg::Sugg;
 use crate::utils::{
     differing_macro_contexts, eq_expr_value, is_type_diagnostic_item, snippet_with_applicability, span_lint_and_then,
-    walk_ptrs_ty,
 };
 use if_chain::if_chain;
 use rustc_errors::Applicability;
@@ -9,6 +8,7 @@ use rustc_hir::{Block, Expr, ExprKind, PatKind, QPath, StmtKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty;
 use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_span::sym;
 
 declare_clippy_lint! {
     /// **What it does:** Checks for manual swapping.
@@ -91,7 +91,7 @@ fn check_manual_swap(cx: &LateContext<'_>, block: &Block<'_>) {
             if let ExprKind::Path(QPath::Resolved(None, ref rhs2)) = rhs2.kind;
             if rhs2.segments.len() == 1;
 
-            if ident.as_str() == rhs2.segments[0].ident.as_str();
+            if ident.name == rhs2.segments[0].ident.name;
             if eq_expr_value(cx, tmp_init, lhs1);
             if eq_expr_value(cx, rhs1, lhs2);
             then {
@@ -194,11 +194,11 @@ fn check_for_slice<'a>(cx: &LateContext<'_>, lhs1: &'a Expr<'_>, lhs2: &'a Expr<
     if let ExprKind::Index(ref lhs1, ref idx1) = lhs1.kind {
         if let ExprKind::Index(ref lhs2, ref idx2) = lhs2.kind {
             if eq_expr_value(cx, lhs1, lhs2) {
-                let ty = walk_ptrs_ty(cx.typeck_results().expr_ty(lhs1));
+                let ty = cx.typeck_results().expr_ty(lhs1).peel_refs();
 
                 if matches!(ty.kind(), ty::Slice(_))
                     || matches!(ty.kind(), ty::Array(_, _))
-                    || is_type_diagnostic_item(cx, ty, sym!(vec_type))
+                    || is_type_diagnostic_item(cx, ty, sym::vec_type)
                     || is_type_diagnostic_item(cx, ty, sym!(vecdeque_type))
                 {
                     return Slice::Swappable(lhs1, idx1, idx2);

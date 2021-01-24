@@ -1,4 +1,4 @@
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
+#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![feature(nll)]
 #![feature(or_patterns)]
 #![recursion_limit = "256"]
@@ -318,7 +318,7 @@ impl<'tcx> SaveContext<'tcx> {
                     attributes: lower_attributes(item.attrs.to_vec(), self),
                 }))
             }
-            hir::ItemKind::Impl { ref of_trait, ref self_ty, ref items, .. } => {
+            hir::ItemKind::Impl(hir::Impl { ref of_trait, ref self_ty, ref items, .. }) => {
                 if let hir::TyKind::Path(hir::QPath::Resolved(_, ref path)) = self_ty.kind {
                     // Common case impl for a struct or something basic.
                     if generated_code(path.span) {
@@ -410,7 +410,7 @@ impl<'tcx> SaveContext<'tcx> {
             match self.tcx.impl_of_method(def_id) {
                 Some(impl_id) => match self.tcx.hir().get_if_local(impl_id) {
                     Some(Node::Item(item)) => match item.kind {
-                        hir::ItemKind::Impl { ref self_ty, .. } => {
+                        hir::ItemKind::Impl(hir::Impl { ref self_ty, .. }) => {
                             let hir = self.tcx.hir();
 
                             let mut qualname = String::from("<");
@@ -630,9 +630,14 @@ impl<'tcx> SaveContext<'tcx> {
             })
             | Node::Ty(&hir::Ty { kind: hir::TyKind::Path(ref qpath), .. }) => match qpath {
                 hir::QPath::Resolved(_, path) => path.res,
-                hir::QPath::TypeRelative(..) | hir::QPath::LangItem(..) => self
-                    .maybe_typeck_results
-                    .map_or(Res::Err, |typeck_results| typeck_results.qpath_res(qpath, hir_id)),
+                hir::QPath::TypeRelative(..) | hir::QPath::LangItem(..) => {
+                    // #75962: `self.typeck_results` may be different from the `hir_id`'s result.
+                    if self.tcx.has_typeck_results(hir_id.owner.to_def_id()) {
+                        self.tcx.typeck(hir_id.owner).qpath_res(qpath, hir_id)
+                    } else {
+                        Res::Err
+                    }
+                }
             },
 
             Node::Binding(&hir::Pat {
@@ -665,7 +670,7 @@ impl<'tcx> SaveContext<'tcx> {
     ) -> Option<Ref> {
         // Returns true if the path is function type sugar, e.g., `Fn(A) -> B`.
         fn fn_type(seg: &hir::PathSegment<'_>) -> bool {
-            seg.args.map(|args| args.parenthesized).unwrap_or(false)
+            seg.args.map_or(false, |args| args.parenthesized)
         }
 
         let res = self.get_path_res(id);
@@ -794,7 +799,9 @@ impl<'tcx> SaveContext<'tcx> {
 
             // These are not macros.
             // FIXME(eddyb) maybe there is a way to handle them usefully?
-            ExpnKind::Root | ExpnKind::AstPass(_) | ExpnKind::Desugaring(_) => return None,
+            ExpnKind::Inlined | ExpnKind::Root | ExpnKind::AstPass(_) | ExpnKind::Desugaring(_) => {
+                return None;
+            }
         };
 
         let callee_span = self.span_from_span(callee.def_site);
@@ -818,7 +825,7 @@ impl<'tcx> SaveContext<'tcx> {
         for attr in attrs {
             if let Some(val) = attr.doc_str() {
                 // FIXME: Should save-analysis beautify doc strings itself or leave it to users?
-                result.push_str(&beautify_doc_string(val));
+                result.push_str(&beautify_doc_string(val).as_str());
                 result.push('\n');
             } else if self.tcx.sess.check_name(attr, sym::doc) {
                 if let Some(meta_list) = attr.meta_item_list() {

@@ -99,7 +99,7 @@ impl<'cx, 'tcx> ItemLikeVisitor<'tcx> for InferVisitor<'cx, 'tcx> {
         // we walk the crates again and re-calculate predicates for all
         // items.
         let item_predicates_len: usize =
-            self.global_inferred_outlives.get(&item_did.to_def_id()).map(|p| p.len()).unwrap_or(0);
+            self.global_inferred_outlives.get(&item_did.to_def_id()).map_or(0, |p| p.len());
         if item_required_predicates.len() > item_predicates_len {
             *self.predicates_added = true;
             self.global_inferred_outlives.insert(item_did.to_def_id(), item_required_predicates);
@@ -109,6 +109,8 @@ impl<'cx, 'tcx> ItemLikeVisitor<'tcx> for InferVisitor<'cx, 'tcx> {
     fn visit_trait_item(&mut self, _trait_item: &'tcx hir::TraitItem<'tcx>) {}
 
     fn visit_impl_item(&mut self, _impl_item: &'tcx hir::ImplItem<'tcx>) {}
+
+    fn visit_foreign_item(&mut self, _foreign_item: &'tcx hir::ForeignItem<'tcx>) {}
 }
 
 fn insert_required_predicates_to_be_wf<'tcx>(

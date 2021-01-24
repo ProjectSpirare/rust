@@ -37,6 +37,12 @@ pub fn AddFunctionAttrStringValue(llfn: &'a Value, idx: AttributePlace, attr: &C
     }
 }
 
+pub fn AddFunctionAttrString(llfn: &'a Value, idx: AttributePlace, attr: &CStr) {
+    unsafe {
+        LLVMRustAddFunctionAttrStringValue(llfn, idx.as_uint(), attr.as_ptr(), std::ptr::null())
+    }
+}
+
 #[derive(Copy, Clone)]
 pub enum AttributePlace {
     ReturnValue,
@@ -112,11 +118,6 @@ pub fn SetUnnamedAddress(global: &'a Value, unnamed: UnnamedAddr) {
     }
 }
 
-pub fn set_thread_local(global: &'a Value, is_thread_local: bool) {
-    unsafe {
-        LLVMSetThreadLocal(global, is_thread_local as Bool);
-    }
-}
 pub fn set_thread_local_mode(global: &'a Value, mode: ThreadLocalMode) {
     unsafe {
         LLVMSetThreadLocalMode(global, mode);
@@ -219,9 +220,21 @@ pub fn set_linkage(llglobal: &Value, linkage: Linkage) {
     }
 }
 
+pub fn set_visibility(llglobal: &Value, visibility: Visibility) {
+    unsafe {
+        LLVMRustSetVisibility(llglobal, visibility);
+    }
+}
+
 pub fn set_alignment(llglobal: &Value, bytes: usize) {
     unsafe {
         ffi::LLVMSetAlignment(llglobal, bytes as c_uint);
+    }
+}
+
+pub fn set_comdat(llmod: &Module, llglobal: &Value, name: &str) {
+    unsafe {
+        LLVMRustSetComdat(llmod, llglobal, name.as_ptr().cast(), name.len());
     }
 }
 

@@ -9,7 +9,7 @@
 // `InferredIndex` is a newtype'd int representing the index of such
 // a variable.
 
-use rustc_arena::TypedArena;
+use rustc_arena::DroplessArena;
 use rustc_hir as hir;
 use rustc_hir::itemlikevisit::ItemLikeVisitor;
 use rustc_hir::HirIdMap;
@@ -47,7 +47,7 @@ impl<'a> fmt::Debug for VarianceTerm<'a> {
 
 pub struct TermsContext<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
-    pub arena: &'a TypedArena<VarianceTerm<'a>>,
+    pub arena: &'a DroplessArena,
 
     // For marker types, UnsafeCell, and other lang items where
     // variance is hardcoded, records the item-id and the hardcoded
@@ -64,7 +64,7 @@ pub struct TermsContext<'a, 'tcx> {
 
 pub fn determine_parameters_to_be_inferred<'a, 'tcx>(
     tcx: TyCtxt<'tcx>,
-    arena: &'a mut TypedArena<VarianceTerm<'a>>,
+    arena: &'a DroplessArena,
 ) -> TermsContext<'a, 'tcx> {
     let mut terms_cx = TermsContext {
         tcx,
@@ -153,14 +153,6 @@ impl<'a, 'tcx, 'v> ItemLikeVisitor<'v> for TermsContext<'a, 'tcx> {
                 self.add_inferreds_for_item(item.hir_id);
             }
 
-            hir::ItemKind::ForeignMod(ref foreign_mod) => {
-                for foreign_item in foreign_mod.items {
-                    if let hir::ForeignItemKind::Fn(..) = foreign_item.kind {
-                        self.add_inferreds_for_item(foreign_item.hir_id);
-                    }
-                }
-            }
-
             _ => {}
         }
     }
@@ -174,6 +166,12 @@ impl<'a, 'tcx, 'v> ItemLikeVisitor<'v> for TermsContext<'a, 'tcx> {
     fn visit_impl_item(&mut self, impl_item: &hir::ImplItem<'_>) {
         if let hir::ImplItemKind::Fn(..) = impl_item.kind {
             self.add_inferreds_for_item(impl_item.hir_id);
+        }
+    }
+
+    fn visit_foreign_item(&mut self, foreign_item: &hir::ForeignItem<'_>) {
+        if let hir::ForeignItemKind::Fn(..) = foreign_item.kind {
+            self.add_inferreds_for_item(foreign_item.hir_id);
         }
     }
 }

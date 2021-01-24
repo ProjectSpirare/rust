@@ -51,6 +51,8 @@ pub fn span_lint<T: LintContext>(cx: &T, lint: &'static Lint, sp: impl Into<Mult
 ///
 /// The `help` message can be optionally attached to a `Span`.
 ///
+/// If you change the signature, remember to update the internal lint `CollapsibleCalls`
+///
 /// # Example
 ///
 /// ```ignore
@@ -86,6 +88,8 @@ pub fn span_lint_and_help<'a, T: LintContext>(
 ///
 /// The `note` message is presented separately from the main lint message
 /// and is attached to a specific span:
+///
+/// If you change the signature, remember to update the internal lint `CollapsibleCalls`
 ///
 /// # Example
 ///
@@ -126,6 +130,7 @@ pub fn span_lint_and_note<'a, T: LintContext>(
 /// Like `span_lint` but allows to add notes, help and suggestions using a closure.
 ///
 /// If you need to customize your lint output a lot, use this function.
+/// If you change the signature, remember to update the internal lint `CollapsibleCalls`
 pub fn span_lint_and_then<'a, T: LintContext, F>(cx: &'a T, lint: &'static Lint, sp: Span, msg: &str, f: F)
 where
     F: for<'b> FnOnce(&mut DiagnosticBuilder<'b>),
@@ -168,6 +173,10 @@ pub fn span_lint_hir_and_then(
 /// In the example below, `help` is `"try"` and `sugg` is the suggested replacement `".any(|x| x >
 /// 2)"`.
 ///
+/// If you change the signature, remember to update the internal lint `CollapsibleCalls`
+///
+/// # Example
+///
 /// ```ignore
 /// error: This `.fold` can be more succinctly expressed as `.any`
 /// --> $DIR/methods.rs:390:13
@@ -177,7 +186,9 @@ pub fn span_lint_hir_and_then(
 ///     |
 ///     = note: `-D fold-any` implied by `-D warnings`
 /// ```
-#[allow(clippy::collapsible_span_lint_calls)]
+
+#[allow(clippy::unknown_clippy_lints)]
+#[cfg_attr(feature = "internal-lints", allow(clippy::collapsible_span_lint_calls))]
 pub fn span_lint_and_sugg<'a, T: LintContext>(
     cx: &'a T,
     lint: &'static Lint,

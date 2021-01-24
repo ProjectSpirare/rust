@@ -32,8 +32,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         if self.suggest_calling_boxed_future_when_appropriate(err, expr, expected, expr_ty) {
             return;
         }
+        self.suggest_no_capture_closure(err, expected, expr_ty);
         self.suggest_boxing_when_appropriate(err, expr, expected, expr_ty);
-        self.suggest_missing_await(err, expr, expected, expr_ty);
         self.suggest_missing_parentheses(err, expr);
         self.note_need_for_fn_pointer(err, expected, expr_ty);
         self.note_internal_mutation_in_method(err, expr, expected, expr_ty);
@@ -117,11 +117,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         ty
     }
 
-    // Checks that the type of `expr` can be coerced to `expected`.
-    //
-    // N.B., this code relies on `self.diverges` to be accurate. In
-    // particular, assignments to `!` will be permitted if the
-    // diverges flag is currently "always".
+    /// Checks that the type of `expr` can be coerced to `expected`.
+    ///
+    /// N.B., this code relies on `self.diverges` to be accurate. In particular, assignments to `!`
+    /// will be permitted if the diverges flag is currently "always".
     pub fn demand_coerce_diag(
         &self,
         expr: &hir::Expr<'_>,
@@ -362,17 +361,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         false
     }
 
-    fn replace_prefix<A, B, C>(&self, s: A, old: B, new: C) -> Option<String>
-    where
-        A: AsRef<str>,
-        B: AsRef<str>,
-        C: AsRef<str>,
-    {
-        let s = s.as_ref();
-        let old = old.as_ref();
-        if s.starts_with(old) { Some(new.as_ref().to_owned() + &s[old.len()..]) } else { None }
-    }
-
     /// This function is used to determine potential "simple" improvements or users' errors and
     /// provide them useful help. For example:
     ///
@@ -403,6 +391,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return None;
         }
 
+        let replace_prefix = |s: &str, old: &str, new: &str| {
+            s.strip_prefix(old).map(|stripped| new.to_string() + stripped)
+        };
+
         let is_struct_pat_shorthand_field =
             self.is_hir_id_from_struct_pattern_shorthand_field(expr.hir_id, sp);
 
@@ -418,7 +410,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 (&ty::Str, &ty::Array(arr, _) | &ty::Slice(arr)) if arr == self.tcx.types.u8 => {
                     if let hir::ExprKind::Lit(_) = expr.kind {
                         if let Ok(src) = sm.span_to_snippet(sp) {
-                            if let Some(src) = self.replace_prefix(src, "b\"", "\"") {
+                            if let Some(src) = replace_prefix(&src, "b\"", "\"") {
                                 return Some((
                                     sp,
                                     "consider removing the leading `b`",
@@ -432,7 +424,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 (&ty::Array(arr, _) | &ty::Slice(arr), &ty::Str) if arr == self.tcx.types.u8 => {
                     if let hir::ExprKind::Lit(_) = expr.kind {
                         if let Ok(src) = sm.span_to_snippet(sp) {
-                            if let Some(src) = self.replace_prefix(src, "\"", "b\"") {
+                            if let Some(src) = replace_prefix(&src, "\"", "b\"") {
                                 return Some((
                                     sp,
                                     "consider adding a leading `b`",
@@ -557,11 +549,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // we may want to suggest removing a `&`.
                 if sm.is_imported(expr.span) {
                     if let Ok(src) = sm.span_to_snippet(sp) {
-                        if let Some(src) = self.replace_prefix(src, "&", "") {
+                        if let Some(src) = src.strip_prefix('&') {
                             return Some((
                                 sp,
                                 "consider removing the borrow",
-                                src,
+                                src.to_string(),
                                 Applicability::MachineApplicable,
                             ));
                         }
@@ -593,22 +585,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                     let new_prefix = "&mut ".to_owned() + derefs;
                                     match mutbl_a {
                                         hir::Mutability::Mut => {
-                                            if let Some(s) =
-                                                self.replace_prefix(src, "&mut ", new_prefix)
-                                            {
-                                                Some((s, Applicability::MachineApplicable))
-                                            } else {
-                                                None
-                                            }
+                                            replace_prefix(&src, "&mut ", &new_prefix)
+                                                .map(|s| (s, Applicability::MachineApplicable))
                                         }
                                         hir::Mutability::Not => {
-                                            if let Some(s) =
-                                                self.replace_prefix(src, "&", new_prefix)
-                                            {
-                                                Some((s, Applicability::Unspecified))
-                                            } else {
-                                                None
-                                            }
+                                            replace_prefix(&src, "&", &new_prefix)
+                                                .map(|s| (s, Applicability::Unspecified))
                                         }
                                     }
                                 }
@@ -616,22 +598,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                     let new_prefix = "&".to_owned() + derefs;
                                     match mutbl_a {
                                         hir::Mutability::Mut => {
-                                            if let Some(s) =
-                                                self.replace_prefix(src, "&mut ", new_prefix)
-                                            {
-                                                Some((s, Applicability::MachineApplicable))
-                                            } else {
-                                                None
-                                            }
+                                            replace_prefix(&src, "&mut ", &new_prefix)
+                                                .map(|s| (s, Applicability::MachineApplicable))
                                         }
                                         hir::Mutability::Not => {
-                                            if let Some(s) =
-                                                self.replace_prefix(src, "&", new_prefix)
-                                            {
-                                                Some((s, Applicability::MachineApplicable))
-                                            } else {
-                                                None
-                                            }
+                                            replace_prefix(&src, "&", &new_prefix)
+                                                .map(|s| (s, Applicability::MachineApplicable))
                                         }
                                     }
                                 }
@@ -755,8 +727,20 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
         }
 
-        let msg = format!("you can convert an `{}` to `{}`", checked_ty, expected_ty);
-        let cast_msg = format!("you can cast an `{} to `{}`", checked_ty, expected_ty);
+        let msg = format!(
+            "you can convert {} `{}` to {} `{}`",
+            checked_ty.kind().article(),
+            checked_ty,
+            expected_ty.kind().article(),
+            expected_ty,
+        );
+        let cast_msg = format!(
+            "you can cast {} `{}` to {} `{}`",
+            checked_ty.kind().article(),
+            checked_ty,
+            expected_ty.kind().article(),
+            expected_ty,
+        );
         let lit_msg = format!(
             "change the type of the numeric literal from `{}` to `{}`",
             checked_ty, expected_ty,
@@ -803,10 +787,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // can be given the suggestion "u32::from(x) > y" rather than
                 // "x > y.try_into().unwrap()".
                 let lhs_expr_and_src = expected_ty_expr.and_then(|expr| {
-                    match self.tcx.sess.source_map().span_to_snippet(expr.span).ok() {
-                        Some(src) => Some((expr, src)),
-                        None => None,
-                    }
+                    self.tcx
+                        .sess
+                        .source_map()
+                        .span_to_snippet(expr.span)
+                        .ok()
+                        .map(|src| (expr, src))
                 });
                 let (span, msg, suggestion) = if let (Some((lhs_expr, lhs_src)), false) =
                     (lhs_expr_and_src, exp_to_found_is_fallible)
@@ -818,7 +804,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let suggestion = format!("{}::from({})", checked_ty, lhs_src);
                     (lhs_expr.span, msg, suggestion)
                 } else {
-                    let msg = format!("{} and panic if the converted value wouldn't fit", msg);
+                    let msg = format!("{} and panic if the converted value doesn't fit", msg);
                     let suggestion =
                         format!("{}{}.try_into().unwrap()", prefix, with_opt_paren(&src));
                     (expr.span, msg, suggestion)

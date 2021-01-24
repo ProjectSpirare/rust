@@ -24,11 +24,11 @@ use crate::sys_common::{thread_info, util};
 use crate::thread;
 
 #[cfg(not(test))]
-use crate::io::set_panic;
+use crate::io::set_output_capture;
 // make sure to use the stderr output configured
 // by libtest in the real copy of std
 #[cfg(test)]
-use realstd::io::set_panic;
+use realstd::io::set_output_capture;
 
 // Binary interface to the panic runtime that the standard library depends on.
 //
@@ -44,11 +44,11 @@ use realstd::io::set_panic;
 extern "C" {
     fn __rust_panic_cleanup(payload: *mut u8) -> *mut (dyn Any + Send + 'static);
 
-    /// `payload` is actually a `*mut &mut dyn BoxMeUp` but that would cause FFI warnings.
-    /// It cannot be `Box<dyn BoxMeUp>` because the other end of this call does not depend
-    /// on liballoc, and thus cannot use `Box`.
+    /// `payload` is passed through another layer of raw pointers as `&mut dyn Trait` is not
+    /// FFI-safe. `BoxMeUp` lazily performs allocation only when needed (this avoids allocations
+    /// when using the "abort" panic runtime).
     #[unwind(allowed)]
-    fn __rust_start_panic(payload: usize) -> u32;
+    fn __rust_start_panic(payload: *mut &mut dyn BoxMeUp) -> u32;
 }
 
 /// This function is called by the panic runtime if FFI code catches a Rust
@@ -218,11 +218,9 @@ fn default_hook(info: &PanicInfo<'_>) {
         }
     };
 
-    if let Some(mut local) = set_panic(None) {
-        // NB. In `cfg(test)` this uses the forwarding impl
-        // for `Box<dyn (::realstd::io::Write) + Send>`.
-        write(&mut local);
-        set_panic(Some(local));
+    if let Some(local) = set_output_capture(None) {
+        write(&mut *local.lock().unwrap_or_else(|e| e.into_inner()));
+        set_output_capture(Some(local));
     } else if let Some(mut out) = panic_output() {
         write(&mut out);
     }
@@ -478,10 +476,26 @@ pub fn begin_panic_handler(info: &PanicInfo<'_>) -> ! {
         }
     }
 
+    struct StrPanicPayload(&'static str);
+
+    unsafe impl BoxMeUp for StrPanicPayload {
+        fn take_box(&mut self) -> *mut (dyn Any + Send) {
+            Box::into_raw(Box::new(self.0))
+        }
+
+        fn get(&mut self) -> &(dyn Any + Send) {
+            &self.0
+        }
+    }
+
     let loc = info.location().unwrap(); // The current implementation always returns Some
     let msg = info.message().unwrap(); // The current implementation always returns Some
     crate::sys_common::backtrace::__rust_end_short_backtrace(move || {
-        rust_panic_with_hook(&mut PanicPayload::new(msg), info.message(), loc);
+        if let Some(msg) = msg.as_str() {
+            rust_panic_with_hook(&mut StrPanicPayload(msg), info.message(), loc);
+        } else {
+            rust_panic_with_hook(&mut PanicPayload::new(msg), info.message(), loc);
+        }
     })
 }
 
@@ -623,7 +637,7 @@ pub fn rust_panic_without_hook(payload: Box<dyn Any + Send>) -> ! {
 fn rust_panic(mut msg: &mut dyn BoxMeUp) -> ! {
     let code = unsafe {
         let obj = &mut msg as *mut &mut dyn BoxMeUp;
-        __rust_start_panic(obj as usize)
+        __rust_start_panic(obj)
     };
     rtabort!("failed to initiate panic, error {}", code)
 }

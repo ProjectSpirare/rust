@@ -93,12 +93,12 @@ handled naturally. `./configure` should almost never be used for local
 installations, and is primarily useful for CI. Prefer to customize behavior
 using `config.toml`.
 
-Finally, rustbuild makes use of the [gcc-rs crate] which has [its own
+Finally, rustbuild makes use of the [cc-rs crate] which has [its own
 method][env-vars] of configuring C compilers and C flags via environment
 variables.
 
-[gcc-rs crate]: https://github.com/alexcrichton/gcc-rs
-[env-vars]: https://github.com/alexcrichton/gcc-rs#external-configuration-via-environment-variables
+[cc-rs crate]: https://github.com/alexcrichton/cc-rs
+[env-vars]: https://github.com/alexcrichton/cc-rs#external-configuration-via-environment-variables
 
 ## Build stages
 
@@ -201,7 +201,6 @@ build/
     # Output for all compiletest-based test suites
     test/
       ui/
-      compile-fail/
       debuginfo/
       ...
 
@@ -312,6 +311,20 @@ are:
   for command line flags and then `bootstrap/config.rs` to copy the flags to the
   `Config` struct.
 * Adding a sanity check? Take a look at `bootstrap/sanity.rs`.
+
+If you make a major change, please remember to:
+
++ Update `VERSION` in `src/bootstrap/main.rs`.
+* Update `changelog-seen = N` in `config.toml.example`.
+* Add an entry in `src/bootstrap/CHANGELOG.md`.
+
+A 'major change' includes
+
+* A new option or
+* A change in the default options.
+
+Changes that do not affect contributors to the compiler or users
+building rustc from source don't need an update to `VERSION`.
 
 If you have any questions feel free to reach out on the `#t-infra` channel in
 the [Rust Zulip server][rust-zulip] or ask on internals.rust-lang.org. When

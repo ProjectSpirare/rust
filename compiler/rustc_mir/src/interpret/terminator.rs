@@ -24,16 +24,16 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
             Goto { target } => self.go_to_block(target),
 
-            SwitchInt { ref discr, ref values, ref targets, switch_ty } => {
+            SwitchInt { ref discr, ref targets, switch_ty } => {
                 let discr = self.read_immediate(self.eval_operand(discr, None)?)?;
                 trace!("SwitchInt({:?})", *discr);
                 assert_eq!(discr.layout.ty, switch_ty);
 
                 // Branch to the `otherwise` case by default, if no match is found.
-                assert!(!targets.is_empty());
-                let mut target_block = targets[targets.len() - 1];
+                assert!(!targets.iter().is_empty());
+                let mut target_block = targets.otherwise();
 
-                for (index, &const_int) in values.iter().enumerate() {
+                for (const_int, target) in targets.iter() {
                     // Compare using binary_op, to also support pointer values
                     let res = self
                         .overflowing_binary_op(
@@ -43,7 +43,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                         )?
                         .0;
                     if res.to_bool()? {
-                        target_block = targets[index];
+                        target_block = target;
                         break;
                     }
                 }
@@ -64,7 +64,12 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     }
                     ty::FnDef(def_id, substs) => {
                         let sig = func.layout.ty.fn_sig(*self.tcx);
-                        (FnVal::Instance(self.resolve(def_id, substs)?), sig.abi())
+                        (
+                            FnVal::Instance(
+                                self.resolve(ty::WithOptConstParam::unknown(def_id), substs)?,
+                            ),
+                            sig.abi(),
+                        )
                     }
                     _ => span_bug!(
                         terminator.source_info.span,
@@ -105,7 +110,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             }
 
             Abort => {
-                M::abort(self)?;
+                M::abort(self, "the program aborted execution".to_owned())?;
             }
 
             // When we encounter Resume, we've finished unwinding
@@ -214,7 +219,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         let instance = match fn_val {
             FnVal::Instance(instance) => instance,
             FnVal::Other(extra) => {
-                return M::call_extra_fn(self, extra, args, ret, unwind);
+                return M::call_extra_fn(self, extra, caller_abi, args, ret, unwind);
             }
         };
 
@@ -259,10 +264,11 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             | ty::InstanceDef::CloneShim(..)
             | ty::InstanceDef::Item(_) => {
                 // We need MIR for this fn
-                let body = match M::find_mir_or_eval_fn(self, instance, args, ret, unwind)? {
-                    Some(body) => body,
-                    None => return Ok(()),
-                };
+                let body =
+                    match M::find_mir_or_eval_fn(self, instance, caller_abi, args, ret, unwind)? {
+                        Some(body) => body,
+                        None => return Ok(()),
+                    };
 
                 self.push_stack_frame(
                     instance,
@@ -385,9 +391,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             ty::InstanceDef::Virtual(_, idx) => {
                 let mut args = args.to_vec();
                 // We have to implement all "object safe receivers".  Currently we
-                // support built-in pointers (&, &mut, Box) as well as unsized-self.  We do
+                // support built-in pointers `(&, &mut, Box)` as well as unsized-self.  We do
                 // not yet support custom self types.
-                // Also see librustc_codegen_llvm/abi.rs and librustc_codegen_llvm/mir/block.rs.
+                // Also see `compiler/rustc_codegen_llvm/src/abi.rs` and `compiler/rustc_codegen_ssa/src/mir/block.rs`.
                 let receiver_place = match args[0].layout.ty.builtin_deref(true) {
                     Some(_) => {
                         // Built-in pointer.

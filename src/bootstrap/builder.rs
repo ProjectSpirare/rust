@@ -19,7 +19,7 @@ use crate::compile;
 use crate::config::TargetSelection;
 use crate::dist;
 use crate::doc;
-use crate::flags::Subcommand;
+use crate::flags::{Color, Subcommand};
 use crate::install;
 use crate::native;
 use crate::run;
@@ -172,15 +172,7 @@ impl StepDescription {
         }
 
         // Determine the targets participating in this rule.
-        let targets = if self.only_hosts {
-            if builder.config.skip_only_host_steps {
-                return; // don't run anything
-            } else {
-                &builder.hosts
-            }
-        } else {
-            &builder.targets
-        };
+        let targets = if self.only_hosts { &builder.hosts } else { &builder.targets };
 
         for target in targets {
             let run = RunConfig { builder, path: pathset.path(builder), target: *target };
@@ -201,36 +193,36 @@ impl StepDescription {
             );
         }
 
-        if paths.is_empty() {
-            for (desc, should_run) in v.iter().zip(should_runs) {
+        if paths.is_empty() || builder.config.include_default_paths {
+            for (desc, should_run) in v.iter().zip(&should_runs) {
                 if desc.default && should_run.is_really_default {
                     for pathset in &should_run.paths {
                         desc.maybe_run(builder, pathset);
                     }
                 }
             }
-        } else {
-            for path in paths {
-                // strip CurDir prefix if present
-                let path = match path.strip_prefix(".") {
-                    Ok(p) => p,
-                    Err(_) => path,
-                };
+        }
 
-                let mut attempted_run = false;
-                for (desc, should_run) in v.iter().zip(&should_runs) {
-                    if let Some(suite) = should_run.is_suite_path(path) {
-                        attempted_run = true;
-                        desc.maybe_run(builder, suite);
-                    } else if let Some(pathset) = should_run.pathset_for_path(path) {
-                        attempted_run = true;
-                        desc.maybe_run(builder, pathset);
-                    }
-                }
+        for path in paths {
+            // strip CurDir prefix if present
+            let path = match path.strip_prefix(".") {
+                Ok(p) => p,
+                Err(_) => path,
+            };
 
-                if !attempted_run {
-                    panic!("error: no rules matched {}", path.display());
+            let mut attempted_run = false;
+            for (desc, should_run) in v.iter().zip(&should_runs) {
+                if let Some(suite) = should_run.is_suite_path(path) {
+                    attempted_run = true;
+                    desc.maybe_run(builder, suite);
+                } else if let Some(pathset) = should_run.pathset_for_path(path) {
+                    attempted_run = true;
+                    desc.maybe_run(builder, pathset);
                 }
+            }
+
+            if !attempted_run {
+                panic!("error: no rules matched {}", path.display());
             }
         }
     }
@@ -272,7 +264,7 @@ impl<'a> ShouldRun<'a> {
     /// `all_krates` should probably be removed at some point.
     pub fn all_krates(mut self, name: &str) -> Self {
         let mut set = BTreeSet::new();
-        for krate in self.builder.in_tree_crates(name) {
+        for krate in self.builder.in_tree_crates(name, None) {
             let path = krate.local_path(self.builder);
             set.insert(path);
         }
@@ -285,7 +277,7 @@ impl<'a> ShouldRun<'a> {
     ///
     /// `make_run` will be called separately for each matching command-line path.
     pub fn krate(mut self, name: &str) -> Self {
-        for krate in self.builder.in_tree_crates(name) {
+        for krate in self.builder.in_tree_crates(name, None) {
             let path = krate.local_path(self.builder);
             self.paths.insert(PathSet::one(path));
         }
@@ -352,6 +344,7 @@ impl<'a> Builder<'a> {
             Kind::Build => describe!(
                 compile::Std,
                 compile::Rustc,
+                compile::CodegenBackend,
                 compile::StartupObjects,
                 tool::BuildManifest,
                 tool::Rustbook,
@@ -378,15 +371,19 @@ impl<'a> Builder<'a> {
                 tool::CargoMiri,
                 native::Lld
             ),
-            Kind::Check | Kind::Clippy | Kind::Fix | Kind::Format => {
-                describe!(check::Std, check::Rustc, check::Rustdoc, check::Clippy, check::Bootstrap)
-            }
+            Kind::Check | Kind::Clippy { .. } | Kind::Fix | Kind::Format => describe!(
+                check::Std,
+                check::Rustc,
+                check::Rustdoc,
+                check::CodegenBackend,
+                check::Clippy,
+                check::Bootstrap
+            ),
             Kind::Test => describe!(
                 crate::toolstate::ToolStateCheck,
                 test::ExpandYamlAnchors,
                 test::Tidy,
                 test::Ui,
-                test::CompileFail,
                 test::RunPassValgrind,
                 test::MirOpt,
                 test::Codegen,
@@ -415,6 +412,7 @@ impl<'a> Builder<'a> {
                 test::TheBook,
                 test::UnstableBook,
                 test::RustcBook,
+                test::LintDocs,
                 test::RustcGuide,
                 test::EmbeddedBook,
                 test::EditionGuide,
@@ -426,6 +424,7 @@ impl<'a> Builder<'a> {
                 test::RustdocJSNotStd,
                 test::RustdocTheme,
                 test::RustdocUi,
+                test::RustdocJson,
                 // Run bootstrap close to the end as it's unlikely to fail
                 test::Bootstrap,
                 // Run run-make last, since these won't pass without make on Windows
@@ -470,7 +469,8 @@ impl<'a> Builder<'a> {
                 dist::LlvmTools,
                 dist::RustDev,
                 dist::Extended,
-                dist::HashSign
+                dist::BuildManifest,
+                dist::ReproducibleArtifacts,
             ),
             Kind::Install => describe!(
                 install::Docs,
@@ -485,7 +485,7 @@ impl<'a> Builder<'a> {
                 install::Src,
                 install::Rustc
             ),
-            Kind::Run => describe!(run::ExpandYamlAnchors,),
+            Kind::Run => describe!(run::ExpandYamlAnchors, run::BuildManifest),
         }
     }
 
@@ -540,8 +540,8 @@ impl<'a> Builder<'a> {
     pub fn new(build: &Build) -> Builder<'_> {
         let (kind, paths) = match build.config.cmd {
             Subcommand::Build { ref paths } => (Kind::Build, &paths[..]),
-            Subcommand::Check { ref paths } => (Kind::Check, &paths[..]),
-            Subcommand::Clippy { ref paths } => (Kind::Clippy, &paths[..]),
+            Subcommand::Check { ref paths, all_targets: _ } => (Kind::Check, &paths[..]),
+            Subcommand::Clippy { ref paths, .. } => (Kind::Clippy, &paths[..]),
             Subcommand::Fix { ref paths } => (Kind::Fix, &paths[..]),
             Subcommand::Doc { ref paths, .. } => (Kind::Doc, &paths[..]),
             Subcommand::Test { ref paths, .. } => (Kind::Test, &paths[..]),
@@ -549,7 +549,9 @@ impl<'a> Builder<'a> {
             Subcommand::Dist { ref paths } => (Kind::Dist, &paths[..]),
             Subcommand::Install { ref paths } => (Kind::Install, &paths[..]),
             Subcommand::Run { ref paths } => (Kind::Run, &paths[..]),
-            Subcommand::Format { .. } | Subcommand::Clean { .. } => panic!(),
+            Subcommand::Format { .. } | Subcommand::Clean { .. } | Subcommand::Setup { .. } => {
+                panic!()
+            }
         };
 
         Self::new_internal(build, kind, paths.to_owned())
@@ -635,6 +637,10 @@ impl<'a> Builder<'a> {
         self.ensure(Libdir { compiler, target })
     }
 
+    pub fn sysroot_codegen_backends(&self, compiler: Compiler) -> PathBuf {
+        self.sysroot_libdir(compiler, compiler.host).with_file_name("codegen-backends")
+    }
+
     /// Returns the compiler's libdir where it stores the dynamic libraries that
     /// it itself links against.
     ///
@@ -703,6 +709,15 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Gets the paths to all of the compiler's codegen backends.
+    fn codegen_backends(&self, compiler: Compiler) -> impl Iterator<Item = PathBuf> {
+        fs::read_dir(self.sysroot_codegen_backends(compiler))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+    }
+
     pub fn rustdoc(&self, compiler: Compiler) -> PathBuf {
         self.ensure(tool::Rustdoc { compiler })
     }
@@ -721,6 +736,7 @@ impl<'a> Builder<'a> {
         if self.config.deny_warnings {
             cmd.arg("-Dwarnings");
         }
+        cmd.arg("-Znormalize-docs");
 
         // Remove make-related flags that can cause jobserver problems.
         cmd.env_remove("MAKEFLAGS");
@@ -767,6 +783,12 @@ impl<'a> Builder<'a> {
         let mut cargo = Command::new(&self.initial_cargo);
         let out_dir = self.stage_out(compiler, mode);
 
+        // Codegen backends are not yet tracked by -Zbinary-dep-depinfo,
+        // so we need to explicitly clear out if they've been updated.
+        for backend in self.codegen_backends(compiler) {
+            self.clear_if_dirty(&out_dir, &backend);
+        }
+
         if cmd == "doc" || cmd == "rustdoc" {
             let my_out = match mode {
                 // This is the intended out directory for compiler documentation.
@@ -790,6 +812,26 @@ impl<'a> Builder<'a> {
         cargo.env("REAL_LIBRARY_PATH_VAR", &util::dylib_path_var());
         if let Some(e) = env::var_os(util::dylib_path_var()) {
             cargo.env("REAL_LIBRARY_PATH", e);
+        }
+
+        // Found with `rg "init_env_logger\("`. If anyone uses `init_env_logger`
+        // from out of tree it shouldn't matter, since x.py is only used for
+        // building in-tree.
+        let color_logs = ["RUSTDOC_LOG_COLOR", "RUSTC_LOG_COLOR", "RUST_LOG_COLOR"];
+        match self.build.config.color {
+            Color::Always => {
+                cargo.arg("--color=always");
+                for log in &color_logs {
+                    cargo.env(log, "always");
+                }
+            }
+            Color::Never => {
+                cargo.arg("--color=never");
+                for log in &color_logs {
+                    cargo.env(log, "never");
+                }
+            }
+            Color::Auto => {} // nothing to do
         }
 
         if cmd != "install" {
@@ -830,7 +872,41 @@ impl<'a> Builder<'a> {
                 cargo.args(s.split_whitespace());
             }
             rustflags.env("RUSTFLAGS_BOOTSTRAP");
-            rustflags.arg("--cfg=bootstrap");
+            if cmd == "clippy" {
+                // clippy overwrites sysroot if we pass it to cargo.
+                // Pass it directly to clippy instead.
+                // NOTE: this can't be fixed in clippy because we explicitly don't set `RUSTC`,
+                // so it has no way of knowing the sysroot.
+                rustflags.arg("--sysroot");
+                rustflags.arg(
+                    self.sysroot(compiler)
+                        .as_os_str()
+                        .to_str()
+                        .expect("sysroot must be valid UTF-8"),
+                );
+                // Only run clippy on a very limited subset of crates (in particular, not build scripts).
+                cargo.arg("-Zunstable-options");
+                // Explicitly does *not* set `--cfg=bootstrap`, since we're using a nightly clippy.
+                let host_version = Command::new("rustc").arg("--version").output().map_err(|_| ());
+                let output = host_version.and_then(|output| {
+                    if output.status.success() {
+                        Ok(output)
+                    } else {
+                        Err(())
+                    }
+                }).unwrap_or_else(|_| {
+                    eprintln!(
+                        "error: `x.py clippy` requires a host `rustc` toolchain with the `clippy` component"
+                    );
+                    eprintln!("help: try `rustup component add clippy`");
+                    std::process::exit(1);
+                });
+                if !t!(std::str::from_utf8(&output.stdout)).contains("nightly") {
+                    rustflags.arg("--cfg=bootstrap");
+                }
+            } else {
+                rustflags.arg("--cfg=bootstrap");
+            }
         }
 
         if self.config.rust_new_symbol_mangling {
@@ -848,7 +924,7 @@ impl<'a> Builder<'a> {
 
         match mode {
             Mode::Std | Mode::ToolBootstrap | Mode::ToolStd => {}
-            Mode::Rustc | Mode::ToolRustc => {
+            Mode::Rustc | Mode::Codegen | Mode::ToolRustc => {
                 // Build proc macros both for the host and the target
                 if target != compiler.host && cmd != "check" {
                     cargo.arg("-Zdual-proc-macros");
@@ -909,6 +985,8 @@ impl<'a> Builder<'a> {
             // problem, somehow -- not really clear why -- but we know that this
             // fixes things.
             Mode::ToolRustc => metadata.push_str("tool-rustc"),
+            // Same for codegen backends.
+            Mode::Codegen => metadata.push_str("codegen"),
             _ => {}
         }
         cargo.env("__CARGO_DEFAULT_LIB_METADATA", &metadata);
@@ -953,7 +1031,6 @@ impl<'a> Builder<'a> {
         // src/bootstrap/bin/{rustc.rs,rustdoc.rs}
         cargo
             .env("RUSTBUILD_NATIVE_DIR", self.native_dir(target))
-            .env("RUSTC", self.out.join("bootstrap/debug/rustc"))
             .env("RUSTC_REAL", self.rustc(compiler))
             .env("RUSTC_STAGE", stage.to_string())
             .env("RUSTC_SYSROOT", &sysroot)
@@ -969,6 +1046,11 @@ impl<'a> Builder<'a> {
             )
             .env("RUSTC_ERROR_METADATA_DST", self.extended_error_dir())
             .env("RUSTC_BREAK_ON_ICE", "1");
+        // Clippy support is a hack and uses the default `cargo-clippy` in path.
+        // Don't override RUSTC so that the `cargo-clippy` in path will be run.
+        if cmd != "clippy" {
+            cargo.env("RUSTC", self.out.join("bootstrap/debug/rustc"));
+        }
 
         // Dealing with rpath here is a little special, so let's go into some
         // detail. First off, `-rpath` is a linker option on Unix platforms
@@ -1035,7 +1117,7 @@ impl<'a> Builder<'a> {
         }
 
         let debuginfo_level = match mode {
-            Mode::Rustc => self.config.rust_debuginfo_level_rustc,
+            Mode::Rustc | Mode::Codegen => self.config.rust_debuginfo_level_rustc,
             Mode::Std => self.config.rust_debuginfo_level_std,
             Mode::ToolBootstrap | Mode::ToolStd | Mode::ToolRustc => {
                 self.config.rust_debuginfo_level_tools
@@ -1050,6 +1132,19 @@ impl<'a> Builder<'a> {
                 self.config.rust_debug_assertions.to_string()
             },
         );
+
+        // `dsymutil` adds time to builds on Apple platforms for no clear benefit, and also makes
+        // it more difficult for debuggers to find debug info. The compiler currently defaults to
+        // running `dsymutil` to preserve its historical default, but when compiling the compiler
+        // itself, we skip it by default since we know it's safe to do so in that case.
+        // See https://github.com/rust-lang/rust/issues/79361 for more info on this flag.
+        if target.contains("apple") {
+            if self.config.rust_run_dsymutil {
+                rustflags.arg("-Zrun-dsymutil=yes");
+            } else {
+                rustflags.arg("-Zrun-dsymutil=no");
+            }
+        }
 
         if self.config.cmd.bless() {
             // Bless `expect!` tests.
@@ -1117,6 +1212,14 @@ impl<'a> Builder<'a> {
                 let llvm_libdir = output(Command::new(&llvm_config).arg("--libdir"));
                 add_link_lib_path(vec![llvm_libdir.trim().into()], &mut cargo);
             }
+        }
+
+        // Compile everything except libraries and proc macros with the more
+        // efficient initial-exec TLS model. This doesn't work with `dlopen`,
+        // so we can't use it by default in general, but we can use it for tools
+        // and our own internal libraries.
+        if !mode.must_support_dlopen() {
+            rustflags.arg("-Ztls-model=initial-exec");
         }
 
         if self.config.incremental {
@@ -1441,7 +1544,7 @@ impl Rustflags {
     fn arg(&mut self, arg: &str) -> &mut Self {
         assert_eq!(arg.split(' ').count(), 1);
         if !self.0.is_empty() {
-            self.0.push_str(" ");
+            self.0.push(' ');
         }
         self.0.push_str(arg);
         self

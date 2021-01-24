@@ -1,19 +1,27 @@
-//! The source positions and related helper functions.
+//! Source positions and related helper functions.
+//!
+//! Important concepts in this module include:
+//!
+//! - the *span*, represented by [`SpanData`] and related types;
+//! - source code as represented by a [`SourceMap`]; and
+//! - interned strings, represented by [`Symbol`]s, with some common symbols available statically in the [`sym`] module.
+//!
+//! Unlike most compilers, the span contains not only the position in the source code, but also various other metadata,
+//! such as the edition and macro hygiene. This metadata is stored in [`SyntaxContext`] and [`ExpnData`].
 //!
 //! ## Note
 //!
 //! This API is completely unstable and subject to change.
 
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
+#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
+#![feature(array_windows)]
 #![feature(crate_visibility_modifier)]
 #![feature(const_fn)]
 #![feature(const_panic)]
 #![feature(negative_impls)]
 #![feature(nll)]
-#![feature(optin_builtin_traits)]
 #![feature(min_specialization)]
 #![feature(option_expect_none)]
-#![feature(refcell_take)]
 
 #[macro_use]
 extern crate rustc_macros;
@@ -35,6 +43,7 @@ use hygiene::Transparency;
 pub use hygiene::{DesugaringKind, ExpnData, ExpnId, ExpnKind, ForLoopLoc, MacroKind};
 pub mod def_id;
 use def_id::{CrateNum, DefId, LOCAL_CRATE};
+pub mod lev_distance;
 mod span_encoding;
 pub use span_encoding::{Span, DUMMY_SP};
 
@@ -53,13 +62,17 @@ use std::cell::RefCell;
 use std::cmp::{self, Ordering};
 use std::fmt;
 use std::hash::Hash;
-use std::ops::{Add, Sub};
+use std::ops::{Add, Range, Sub};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::thread::LocalKey;
 
 use md5::Md5;
 use sha1::Digest;
 use sha1::Sha1;
+use sha2::Sha256;
+
+use tracing::debug;
 
 #[cfg(test)]
 mod tests;
@@ -121,7 +134,7 @@ pub enum RealFileName {
 
 impl RealFileName {
     /// Returns the path suitable for reading from the file system on the local host.
-    /// Avoid embedding this in build artifacts; see `stable_name` for that.
+    /// Avoid embedding this in build artifacts; see `stable_name()` for that.
     pub fn local_path(&self) -> &Path {
         match self {
             RealFileName::Named(p)
@@ -130,7 +143,7 @@ impl RealFileName {
     }
 
     /// Returns the path suitable for reading from the file system on the local host.
-    /// Avoid embedding this in build artifacts; see `stable_name` for that.
+    /// Avoid embedding this in build artifacts; see `stable_name()` for that.
     pub fn into_local_path(self) -> PathBuf {
         match self {
             RealFileName::Named(p)
@@ -140,7 +153,7 @@ impl RealFileName {
 
     /// Returns the path suitable for embedding into build artifacts. Note that
     /// a virtualized path will not correspond to a valid file system path; see
-    /// `local_path` for something that is more likely to return paths into the
+    /// `local_path()` for something that is more likely to return paths into the
     /// local host file system.
     pub fn stable_name(&self) -> &Path {
         match self {
@@ -170,7 +183,7 @@ pub enum FileName {
     /// Custom sources for explicit parser calls from plugins and drivers.
     Custom(String),
     DocTest(PathBuf, isize),
-    /// Post-substitution inline assembly from LLVM
+    /// Post-substitution inline assembly from LLVM.
     InlineAsm(u64),
 }
 
@@ -179,7 +192,7 @@ impl std::fmt::Display for FileName {
         use FileName::*;
         match *self {
             Real(RealFileName::Named(ref path)) => write!(fmt, "{}", path.display()),
-            // FIXME: might be nice to display both compoments of Devirtualized.
+            // FIXME: might be nice to display both components of Devirtualized.
             // But for now (to backport fix for issue #70924), best to not
             // perturb diagnostics so its obvious test suite still works.
             Real(RealFileName::Devirtualized { ref local_path, virtual_name: _ }) => {
@@ -220,12 +233,6 @@ impl FileName {
             | DocTest(_, _)
             | InlineAsm(_) => false,
         }
-    }
-
-    pub fn quote_expansion_source_code(src: &str) -> FileName {
-        let mut hasher = StableHasher::new();
-        src.hash(&mut hasher);
-        FileName::QuoteExpansion(hasher.finish())
     }
 
     pub fn macro_expansion_source_code(src: &str) -> FileName {
@@ -269,14 +276,17 @@ impl FileName {
     }
 }
 
+/// Represents a span.
+///
 /// Spans represent a region of code, used for error reporting. Positions in spans
-/// are *absolute* positions from the beginning of the source_map, not positions
-/// relative to `SourceFile`s. Methods on the `SourceMap` can be used to relate spans back
+/// are *absolute* positions from the beginning of the [`SourceMap`], not positions
+/// relative to [`SourceFile`]s. Methods on the `SourceMap` can be used to relate spans back
 /// to the original source.
-/// You must be careful if the span crosses more than one file - you will not be
+///
+/// You must be careful if the span crosses more than one file, since you will not be
 /// able to use many of the functions on spans in source_map and you cannot assume
-/// that the length of the `span = hi - lo`; there may be space in the `BytePos`
-/// range between files.
+/// that the length of the span is equal to `span.hi - span.lo`; there may be space in the
+/// [`BytePos`] range between files.
 ///
 /// `SpanData` is public because `Span` uses a thread-local interner and can't be
 /// sent to other threads, but some pieces of performance infra run in a separate thread.
@@ -291,6 +301,10 @@ pub struct SpanData {
 }
 
 impl SpanData {
+    #[inline]
+    pub fn span(&self) -> Span {
+        Span::new(self.lo, self.hi, self.ctxt)
+    }
     #[inline]
     pub fn with_lo(&self, lo: BytePos) -> Span {
         Span::new(lo, self.hi, self.ctxt)
@@ -387,7 +401,7 @@ impl Span {
         Span::new(lo, hi, SyntaxContext::root())
     }
 
-    /// Returns a new span representing an empty span at the beginning of this span
+    /// Returns a new span representing an empty span at the beginning of this span.
     #[inline]
     pub fn shrink_to_lo(self) -> Span {
         let span = self.data();
@@ -401,7 +415,7 @@ impl Span {
     }
 
     #[inline]
-    /// Returns true if hi == lo
+    /// Returns `true` if `hi == lo`.
     pub fn is_empty(&self) -> bool {
         let span = self.data();
         span.hi == span.lo
@@ -459,7 +473,7 @@ impl Span {
 
     /// Edition of the crate from which this span came.
     pub fn edition(self) -> edition::Edition {
-        self.ctxt().outer_expn_data().edition
+        self.ctxt().edition()
     }
 
     #[inline]
@@ -470,6 +484,11 @@ impl Span {
     #[inline]
     pub fn rust_2018(&self) -> bool {
         self.edition() >= edition::Edition::Edition2018
+    }
+
+    #[inline]
+    pub fn rust_2021(&self) -> bool {
+        self.edition() >= edition::Edition::Edition2021
     }
 
     /// Returns the source callee.
@@ -515,7 +534,7 @@ impl Span {
     }
 
     /// Checks if a span is "internal" to a macro in which `unsafe`
-    /// can be used without triggering the `unsafe_code` lint
+    /// can be used without triggering the `unsafe_code` lint.
     //  (that is, a macro marked with `#[allow_internal_unsafe]`).
     pub fn allows_unsafe(&self) -> bool {
         self.ctxt().outer_expn_data().allow_internal_unsafe
@@ -703,6 +722,7 @@ impl Span {
     }
 }
 
+/// A span together with some additional data.
 #[derive(Clone, Debug)]
 pub struct SpanLabel {
     /// The span we are going to include in the final snippet.
@@ -743,14 +763,14 @@ impl<D: Decoder> Decodable<D> for Span {
 }
 
 /// Calls the provided closure, using the provided `SourceMap` to format
-/// any spans that are debug-printed during the closure'e exectuino.
+/// any spans that are debug-printed during the closure's execution.
 ///
 /// Normally, the global `TyCtxt` is used to retrieve the `SourceMap`
-/// (see `rustc_interface::callbacks::span_debug1). However, some parts
+/// (see `rustc_interface::callbacks::span_debug1`). However, some parts
 /// of the compiler (e.g. `rustc_parse`) may debug-print `Span`s before
 /// a `TyCtxt` is available. In this case, we fall back to
 /// the `SourceMap` provided to this function. If that is not available,
-/// we fall back to printing the raw `Span` field values
+/// we fall back to printing the raw `Span` field values.
 pub fn with_source_map<T, F: FnOnce() -> T>(source_map: Lrc<SourceMap>, f: F) -> T {
     SESSION_GLOBALS.with(|session_globals| {
         *session_globals.source_map.borrow_mut() = Some(source_map);
@@ -997,9 +1017,9 @@ pub enum ExternalSource {
     Unneeded,
     Foreign {
         kind: ExternalSourceKind,
-        /// This SourceFile's byte-offset within the source_map of its original crate
+        /// This SourceFile's byte-offset within the source_map of its original crate.
         original_start_pos: BytePos,
-        /// The end of this SourceFile within the source_map of its original crate
+        /// The end of this SourceFile within the source_map of its original crate.
         original_end_pos: BytePos,
     },
 }
@@ -1018,10 +1038,7 @@ pub enum ExternalSourceKind {
 
 impl ExternalSource {
     pub fn is_absent(&self) -> bool {
-        match self {
-            ExternalSource::Foreign { kind: ExternalSourceKind::Present(_), .. } => false,
-            _ => true,
-        }
+        !matches!(self, ExternalSource::Foreign { kind: ExternalSourceKind::Present(_), .. })
     }
 
     pub fn get_source(&self) -> Option<&Lrc<String>> {
@@ -1039,6 +1056,7 @@ pub struct OffsetOverflowError;
 pub enum SourceFileHashAlgorithm {
     Md5,
     Sha1,
+    Sha256,
 }
 
 impl FromStr for SourceFileHashAlgorithm {
@@ -1048,6 +1066,7 @@ impl FromStr for SourceFileHashAlgorithm {
         match s {
             "md5" => Ok(SourceFileHashAlgorithm::Md5),
             "sha1" => Ok(SourceFileHashAlgorithm::Sha1),
+            "sha256" => Ok(SourceFileHashAlgorithm::Sha256),
             _ => Err(()),
         }
     }
@@ -1060,7 +1079,7 @@ rustc_data_structures::impl_stable_hash_via_hash!(SourceFileHashAlgorithm);
 #[derive(HashStable_Generic, Encodable, Decodable)]
 pub struct SourceFileHash {
     pub kind: SourceFileHashAlgorithm,
-    value: [u8; 20],
+    value: [u8; 32],
 }
 
 impl SourceFileHash {
@@ -1075,6 +1094,9 @@ impl SourceFileHash {
             }
             SourceFileHashAlgorithm::Sha1 => {
                 value.copy_from_slice(&Sha1::digest(data));
+            }
+            SourceFileHashAlgorithm::Sha256 => {
+                value.copy_from_slice(&Sha256::digest(data));
             }
         }
         hash
@@ -1095,11 +1117,12 @@ impl SourceFileHash {
         match self.kind {
             SourceFileHashAlgorithm::Md5 => 16,
             SourceFileHashAlgorithm::Sha1 => 20,
+            SourceFileHashAlgorithm::Sha256 => 32,
         }
     }
 }
 
-/// A single source in the `SourceMap`.
+/// A single source in the [`SourceMap`].
 #[derive(Clone)]
 pub struct SourceFile {
     /// The name of the file that the source came from. Source that doesn't
@@ -1158,7 +1181,12 @@ impl<S: Encoder> Encodable<S> for SourceFile {
                     let max_line_length = if lines.len() == 1 {
                         0
                     } else {
-                        lines.windows(2).map(|w| w[1] - w[0]).map(|bp| bp.to_usize()).max().unwrap()
+                        lines
+                            .array_windows()
+                            .map(|&[fst, snd]| snd - fst)
+                            .map(|bp| bp.to_usize())
+                            .max()
+                            .unwrap()
                     };
 
                     let bytes_per_diff: u8 = match max_line_length {
@@ -1173,7 +1201,7 @@ impl<S: Encoder> Encodable<S> for SourceFile {
                     // Encode the first element.
                     lines[0].encode(s)?;
 
-                    let diff_iter = (&lines[..]).windows(2).map(|w| (w[1] - w[0]));
+                    let diff_iter = lines[..].array_windows().map(|&[fst, snd]| snd - fst);
 
                     match bytes_per_diff {
                         1 => {
@@ -1426,22 +1454,31 @@ impl SourceFile {
         if line_index >= 0 { Some(line_index as usize) } else { None }
     }
 
-    pub fn line_bounds(&self, line_index: usize) -> (BytePos, BytePos) {
-        if self.start_pos == self.end_pos {
-            return (self.start_pos, self.end_pos);
+    pub fn line_bounds(&self, line_index: usize) -> Range<BytePos> {
+        if self.is_empty() {
+            return self.start_pos..self.end_pos;
         }
 
         assert!(line_index < self.lines.len());
         if line_index == (self.lines.len() - 1) {
-            (self.lines[line_index], self.end_pos)
+            self.lines[line_index]..self.end_pos
         } else {
-            (self.lines[line_index], self.lines[line_index + 1])
+            self.lines[line_index]..self.lines[line_index + 1]
         }
     }
 
+    /// Returns whether or not the file contains the given `SourceMap` byte
+    /// position. The position one past the end of the file is considered to be
+    /// contained by the file. This implies that files for which `is_empty`
+    /// returns true still contain one byte position according to this function.
     #[inline]
     pub fn contains(&self, byte_pos: BytePos) -> bool {
         byte_pos >= self.start_pos && byte_pos <= self.end_pos
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.start_pos == self.end_pos
     }
 
     /// Calculates the original byte position relative to the start of the file
@@ -1457,6 +1494,88 @@ impl SourceFile {
         };
 
         BytePos::from_u32(pos.0 - self.start_pos.0 + diff)
+    }
+
+    /// Converts an absolute `BytePos` to a `CharPos` relative to the `SourceFile`.
+    pub fn bytepos_to_file_charpos(&self, bpos: BytePos) -> CharPos {
+        // The number of extra bytes due to multibyte chars in the `SourceFile`.
+        let mut total_extra_bytes = 0;
+
+        for mbc in self.multibyte_chars.iter() {
+            debug!("{}-byte char at {:?}", mbc.bytes, mbc.pos);
+            if mbc.pos < bpos {
+                // Every character is at least one byte, so we only
+                // count the actual extra bytes.
+                total_extra_bytes += mbc.bytes as u32 - 1;
+                // We should never see a byte position in the middle of a
+                // character.
+                assert!(bpos.to_u32() >= mbc.pos.to_u32() + mbc.bytes as u32);
+            } else {
+                break;
+            }
+        }
+
+        assert!(self.start_pos.to_u32() + total_extra_bytes <= bpos.to_u32());
+        CharPos(bpos.to_usize() - self.start_pos.to_usize() - total_extra_bytes as usize)
+    }
+
+    /// Looks up the file's (1-based) line number and (0-based `CharPos`) column offset, for a
+    /// given `BytePos`.
+    pub fn lookup_file_pos(&self, pos: BytePos) -> (usize, CharPos) {
+        let chpos = self.bytepos_to_file_charpos(pos);
+        match self.lookup_line(pos) {
+            Some(a) => {
+                let line = a + 1; // Line numbers start at 1
+                let linebpos = self.lines[a];
+                let linechpos = self.bytepos_to_file_charpos(linebpos);
+                let col = chpos - linechpos;
+                debug!("byte pos {:?} is on the line at byte pos {:?}", pos, linebpos);
+                debug!("char pos {:?} is on the line at char pos {:?}", chpos, linechpos);
+                debug!("byte is on line: {}", line);
+                assert!(chpos >= linechpos);
+                (line, col)
+            }
+            None => (0, chpos),
+        }
+    }
+
+    /// Looks up the file's (1-based) line number, (0-based `CharPos`) column offset, and (0-based)
+    /// column offset when displayed, for a given `BytePos`.
+    pub fn lookup_file_pos_with_col_display(&self, pos: BytePos) -> (usize, CharPos, usize) {
+        let (line, col_or_chpos) = self.lookup_file_pos(pos);
+        if line > 0 {
+            let col = col_or_chpos;
+            let linebpos = self.lines[line - 1];
+            let col_display = {
+                let start_width_idx = self
+                    .non_narrow_chars
+                    .binary_search_by_key(&linebpos, |x| x.pos())
+                    .unwrap_or_else(|x| x);
+                let end_width_idx = self
+                    .non_narrow_chars
+                    .binary_search_by_key(&pos, |x| x.pos())
+                    .unwrap_or_else(|x| x);
+                let special_chars = end_width_idx - start_width_idx;
+                let non_narrow: usize = self.non_narrow_chars[start_width_idx..end_width_idx]
+                    .iter()
+                    .map(|x| x.width())
+                    .sum();
+                col.0 - special_chars + non_narrow
+            };
+            (line, col, col_display)
+        } else {
+            let chpos = col_or_chpos;
+            let col_display = {
+                let end_width_idx = self
+                    .non_narrow_chars
+                    .binary_search_by_key(&pos, |x| x.pos())
+                    .unwrap_or_else(|x| x);
+                let non_narrow: usize =
+                    self.non_narrow_chars[0..end_width_idx].iter().map(|x| x.width()).sum();
+                chpos.0 - end_width_idx + non_narrow
+            };
+            (0, chpos, col_display)
+        }
     }
 }
 
@@ -1476,7 +1595,7 @@ fn normalize_src(src: &mut String, start_pos: BytePos) -> Vec<NormalizedPos> {
 
 /// Removes UTF-8 BOM, if any.
 fn remove_bom(src: &mut String, normalized_pos: &mut Vec<NormalizedPos>) {
-    if src.starts_with("\u{feff}") {
+    if src.starts_with('\u{feff}') {
         src.drain(..3);
         normalized_pos.push(NormalizedPos { pos: BytePos(0), diff: 3 });
     }
@@ -1484,7 +1603,7 @@ fn remove_bom(src: &mut String, normalized_pos: &mut Vec<NormalizedPos>) {
 
 /// Replaces `\r\n` with `\n` in-place in `src`.
 ///
-/// Returns error if there's a lone `\r` in the string
+/// Returns error if there's a lone `\r` in the string.
 fn normalize_newlines(src: &mut String, normalized_pos: &mut Vec<NormalizedPos>) {
     if !src.as_bytes().contains(&b'\r') {
         return;
@@ -1554,58 +1673,74 @@ pub trait Pos {
     fn to_u32(&self) -> u32;
 }
 
-/// A byte offset. Keep this small (currently 32-bits), as AST contains
-/// a lot of them.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub struct BytePos(pub u32);
+macro_rules! impl_pos {
+    (
+        $(
+            $(#[$attr:meta])*
+            $vis:vis struct $ident:ident($inner_vis:vis $inner_ty:ty);
+        )*
+    ) => {
+        $(
+            $(#[$attr])*
+            $vis struct $ident($inner_vis $inner_ty);
 
-/// A character offset. Because of multibyte UTF-8 characters, a byte offset
-/// is not equivalent to a character offset. The `SourceMap` will convert `BytePos`
-/// values to `CharPos` values as necessary.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct CharPos(pub usize);
+            impl Pos for $ident {
+                #[inline(always)]
+                fn from_usize(n: usize) -> $ident {
+                    $ident(n as $inner_ty)
+                }
 
-// FIXME: lots of boilerplate in these impls, but so far my attempts to fix
-// have been unsuccessful.
+                #[inline(always)]
+                fn to_usize(&self) -> usize {
+                    self.0 as usize
+                }
 
-impl Pos for BytePos {
-    #[inline(always)]
-    fn from_usize(n: usize) -> BytePos {
-        BytePos(n as u32)
-    }
+                #[inline(always)]
+                fn from_u32(n: u32) -> $ident {
+                    $ident(n as $inner_ty)
+                }
 
-    #[inline(always)]
-    fn to_usize(&self) -> usize {
-        self.0 as usize
-    }
+                #[inline(always)]
+                fn to_u32(&self) -> u32 {
+                    self.0 as u32
+                }
+            }
 
-    #[inline(always)]
-    fn from_u32(n: u32) -> BytePos {
-        BytePos(n)
-    }
+            impl Add for $ident {
+                type Output = $ident;
 
-    #[inline(always)]
-    fn to_u32(&self) -> u32 {
-        self.0
-    }
+                #[inline(always)]
+                fn add(self, rhs: $ident) -> $ident {
+                    $ident(self.0 + rhs.0)
+                }
+            }
+
+            impl Sub for $ident {
+                type Output = $ident;
+
+                #[inline(always)]
+                fn sub(self, rhs: $ident) -> $ident {
+                    $ident(self.0 - rhs.0)
+                }
+            }
+        )*
+    };
 }
 
-impl Add for BytePos {
-    type Output = BytePos;
+impl_pos! {
+    /// A byte offset.
+    ///
+    /// Keep this small (currently 32-bits), as AST contains a lot of them.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+    pub struct BytePos(pub u32);
 
-    #[inline(always)]
-    fn add(self, rhs: BytePos) -> BytePos {
-        BytePos((self.to_usize() + rhs.to_usize()) as u32)
-    }
-}
-
-impl Sub for BytePos {
-    type Output = BytePos;
-
-    #[inline(always)]
-    fn sub(self, rhs: BytePos) -> BytePos {
-        BytePos((self.to_usize() - rhs.to_usize()) as u32)
-    }
+    /// A character offset.
+    ///
+    /// Because of multibyte UTF-8 characters, a byte offset
+    /// is not equivalent to a character offset. The [`SourceMap`] will convert [`BytePos`]
+    /// values to `CharPos` values as necessary.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    pub struct CharPos(pub usize);
 }
 
 impl<S: rustc_serialize::Encoder> Encodable<S> for BytePos {
@@ -1617,46 +1752,6 @@ impl<S: rustc_serialize::Encoder> Encodable<S> for BytePos {
 impl<D: rustc_serialize::Decoder> Decodable<D> for BytePos {
     fn decode(d: &mut D) -> Result<BytePos, D::Error> {
         Ok(BytePos(d.read_u32()?))
-    }
-}
-
-impl Pos for CharPos {
-    #[inline(always)]
-    fn from_usize(n: usize) -> CharPos {
-        CharPos(n)
-    }
-
-    #[inline(always)]
-    fn to_usize(&self) -> usize {
-        self.0
-    }
-
-    #[inline(always)]
-    fn from_u32(n: u32) -> CharPos {
-        CharPos(n as usize)
-    }
-
-    #[inline(always)]
-    fn to_u32(&self) -> u32 {
-        self.0 as u32
-    }
-}
-
-impl Add for CharPos {
-    type Output = CharPos;
-
-    #[inline(always)]
-    fn add(self, rhs: CharPos) -> CharPos {
-        CharPos(self.to_usize() + rhs.to_usize())
-    }
-}
-
-impl Sub for CharPos {
-    type Output = CharPos;
-
-    #[inline(always)]
-    fn sub(self, rhs: CharPos) -> CharPos {
-        CharPos(self.to_usize() - rhs.to_usize())
     }
 }
 
@@ -1766,16 +1861,26 @@ fn lookup_line(lines: &[BytePos], pos: BytePos) -> isize {
 }
 
 /// Requirements for a `StableHashingContext` to be used in this crate.
-/// This is a hack to allow using the `HashStable_Generic` derive macro
-/// instead of implementing everything in librustc_middle.
+///
+/// This is a hack to allow using the [`HashStable_Generic`] derive macro
+/// instead of implementing everything in rustc_middle.
 pub trait HashStableContext {
     fn hash_def_id(&mut self, _: DefId, hasher: &mut StableHasher);
+    /// Obtains a cache for storing the `Fingerprint` of an `ExpnId`.
+    /// This method allows us to have multiple `HashStableContext` implementations
+    /// that hash things in a different way, without the results of one polluting
+    /// the cache of the other.
+    fn expn_id_cache() -> &'static LocalKey<ExpnIdCache>;
     fn hash_crate_num(&mut self, _: CrateNum, hasher: &mut StableHasher);
     fn hash_spans(&self) -> bool;
     fn byte_pos_to_line_and_col(
         &mut self,
         byte: BytePos,
     ) -> Option<(Lrc<SourceFile>, usize, BytePos)>;
+    fn span_data_to_lines_and_cols(
+        &mut self,
+        span: &SpanData,
+    ) -> Option<(Lrc<SourceFile>, usize, BytePos, usize, BytePos)>;
 }
 
 impl<CTX> HashStable<CTX> for Span
@@ -1787,6 +1892,7 @@ where
     /// offsets into the `SourceMap`). Instead, we hash the (file name, line, column)
     /// triple, which stays the same even if the containing `SourceFile` has moved
     /// within the `SourceMap`.
+    ///
     /// Also note that we are hashing byte offsets for the column, not unicode
     /// codepoint offsets. For the purpose of the hash that's sufficient.
     /// Also, hashing filenames is expensive so we avoid doing it twice when the
@@ -1799,8 +1905,9 @@ where
             return;
         }
 
-        if *self == DUMMY_SP {
-            std::hash::Hash::hash(&TAG_INVALID_SPAN, hasher);
+        if self.is_dummy() {
+            Hash::hash(&TAG_INVALID_SPAN, hasher);
+            self.ctxt().hash_stable(ctx, hasher);
             return;
         }
 
@@ -1808,31 +1915,38 @@ where
         // position that belongs to it, as opposed to hashing the first
         // position past it.
         let span = self.data();
-        let (file_lo, line_lo, col_lo) = match ctx.byte_pos_to_line_and_col(span.lo) {
+        let (file, line_lo, col_lo, line_hi, col_hi) = match ctx.span_data_to_lines_and_cols(&span)
+        {
             Some(pos) => pos,
             None => {
-                std::hash::Hash::hash(&TAG_INVALID_SPAN, hasher);
+                Hash::hash(&TAG_INVALID_SPAN, hasher);
                 span.ctxt.hash_stable(ctx, hasher);
                 return;
             }
         };
 
-        if !file_lo.contains(span.hi) {
-            std::hash::Hash::hash(&TAG_INVALID_SPAN, hasher);
-            span.ctxt.hash_stable(ctx, hasher);
-            return;
-        }
-
-        std::hash::Hash::hash(&TAG_VALID_SPAN, hasher);
+        Hash::hash(&TAG_VALID_SPAN, hasher);
         // We truncate the stable ID hash and line and column numbers. The chances
         // of causing a collision this way should be minimal.
-        std::hash::Hash::hash(&(file_lo.name_hash as u64), hasher);
+        Hash::hash(&(file.name_hash as u64), hasher);
 
-        let col = (col_lo.0 as u64) & 0xFF;
-        let line = ((line_lo as u64) & 0xFF_FF_FF) << 8;
-        let len = ((span.hi - span.lo).0 as u64) << 32;
-        let line_col_len = col | line | len;
-        std::hash::Hash::hash(&line_col_len, hasher);
+        // Hash both the length and the end location (line/column) of a span. If we
+        // hash only the length, for example, then two otherwise equal spans with
+        // different end locations will have the same hash. This can cause a problem
+        // during incremental compilation wherein a previous result for a query that
+        // depends on the end location of a span will be incorrectly reused when the
+        // end location of the span it depends on has changed (see issue #74890). A
+        // similar analysis applies if some query depends specifically on the length
+        // of the span, but we only hash the end location. So hash both.
+
+        let col_lo_trunc = (col_lo.0 as u64) & 0xFF;
+        let line_lo_trunc = ((line_lo as u64) & 0xFF_FF_FF) << 8;
+        let col_hi_trunc = (col_hi.0 as u64) & 0xFF << 32;
+        let line_hi_trunc = ((line_hi as u64) & 0xFF_FF_FF) << 40;
+        let col_line = col_lo_trunc | line_lo_trunc | col_hi_trunc | line_hi_trunc;
+        let len = (span.hi - span.lo).0;
+        Hash::hash(&col_line, hasher);
+        Hash::hash(&len, hasher);
         span.ctxt.hash_stable(ctx, hasher);
     }
 }
@@ -1853,15 +1967,10 @@ impl<CTX: HashStableContext> HashStable<CTX> for SyntaxContext {
     }
 }
 
+pub type ExpnIdCache = RefCell<Vec<Option<Fingerprint>>>;
+
 impl<CTX: HashStableContext> HashStable<CTX> for ExpnId {
     fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        // Since the same expansion context is usually referenced many
-        // times, we cache a stable hash of it and hash that instead of
-        // recursing every time.
-        thread_local! {
-            static CACHE: RefCell<Vec<Option<Fingerprint>>> = Default::default();
-        }
-
         const TAG_ROOT: u8 = 0;
         const TAG_NOT_ROOT: u8 = 1;
 
@@ -1870,10 +1979,11 @@ impl<CTX: HashStableContext> HashStable<CTX> for ExpnId {
             return;
         }
 
-        TAG_NOT_ROOT.hash_stable(ctx, hasher);
+        // Since the same expansion context is usually referenced many
+        // times, we cache a stable hash of it and hash that instead of
+        // recursing every time.
         let index = self.as_u32() as usize;
-
-        let res = CACHE.with(|cache| cache.borrow().get(index).copied().flatten());
+        let res = CTX::expn_id_cache().with(|cache| cache.borrow().get(index).copied().flatten());
 
         if let Some(res) = res {
             res.hash_stable(ctx, hasher);
@@ -1881,10 +1991,11 @@ impl<CTX: HashStableContext> HashStable<CTX> for ExpnId {
             let new_len = index + 1;
 
             let mut sub_hasher = StableHasher::new();
+            TAG_NOT_ROOT.hash_stable(ctx, &mut sub_hasher);
             self.expn_data().hash_stable(ctx, &mut sub_hasher);
             let sub_hash: Fingerprint = sub_hasher.finish();
 
-            CACHE.with(|cache| {
+            CTX::expn_id_cache().with(|cache| {
                 let mut cache = cache.borrow_mut();
                 if cache.len() < new_len {
                     cache.resize(new_len, None);

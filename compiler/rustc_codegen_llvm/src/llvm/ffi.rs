@@ -5,8 +5,9 @@ use rustc_codegen_ssa::coverageinfo::map as coverage_map;
 
 use super::debuginfo::{
     DIArray, DIBasicType, DIBuilder, DICompositeType, DIDerivedType, DIDescriptor, DIEnumerator,
-    DIFile, DIFlags, DIGlobalVariableExpression, DILexicalBlock, DINameSpace, DISPFlags, DIScope,
-    DISubprogram, DISubrange, DITemplateTypeParameter, DIType, DIVariable, DebugEmissionKind,
+    DIFile, DIFlags, DIGlobalVariableExpression, DILexicalBlock, DILocation, DINameSpace,
+    DISPFlags, DIScope, DISubprogram, DISubrange, DITemplateTypeParameter, DIType, DIVariable,
+    DebugEmissionKind,
 };
 
 use libc::{c_char, c_int, c_uint, size_t};
@@ -483,6 +484,7 @@ pub enum DiagnosticKind {
     OptimizationFailure,
     PGOProfile,
     Linker,
+    Unsupported,
 }
 
 /// LLVMRustDiagnosticLevel
@@ -556,6 +558,7 @@ pub enum ChecksumKind {
     None,
     MD5,
     SHA1,
+    SHA256,
 }
 
 extern "C" {
@@ -639,7 +642,7 @@ pub type InlineAsmDiagHandler = unsafe extern "C" fn(&SMDiagnostic, *const c_voi
 pub mod coverageinfo {
     use super::coverage_map;
 
-    /// Aligns with [llvm::coverage::CounterMappingRegion::RegionKind](https://github.com/rust-lang/llvm-project/blob/rustc/10.0-2020-05-05/llvm/include/llvm/ProfileData/Coverage/CoverageMapping.h#L205-L221)
+    /// Aligns with [llvm::coverage::CounterMappingRegion::RegionKind](https://github.com/rust-lang/llvm-project/blob/rustc/11.0-2020-10-12/llvm/include/llvm/ProfileData/Coverage/CoverageMapping.h#L206-L222)
     #[derive(Copy, Clone, Debug)]
     #[repr(C)]
     pub enum RegionKind {
@@ -662,13 +665,13 @@ pub mod coverageinfo {
 
     /// This struct provides LLVM's representation of a "CoverageMappingRegion", encoded into the
     /// coverage map, in accordance with the
-    /// [LLVM Code Coverage Mapping Format](https://github.com/rust-lang/llvm-project/blob/llvmorg-8.0.0/llvm/docs/CoverageMappingFormat.rst#llvm-code-coverage-mapping-format).
+    /// [LLVM Code Coverage Mapping Format](https://github.com/rust-lang/llvm-project/blob/rustc/11.0-2020-10-12/llvm/docs/CoverageMappingFormat.rst#llvm-code-coverage-mapping-format).
     /// The struct composes fields representing the `Counter` type and value(s) (injected counter
     /// ID, or expression type and operands), the source file (an indirect index into a "filenames
     /// array", encoded separately), and source location (start and end positions of the represented
     /// code region).
     ///
-    /// Aligns with [llvm::coverage::CounterMappingRegion](https://github.com/rust-lang/llvm-project/blob/rustc/10.0-2020-05-05/llvm/include/llvm/ProfileData/Coverage/CoverageMapping.h#L223-L226)
+    /// Aligns with [llvm::coverage::CounterMappingRegion](https://github.com/rust-lang/llvm-project/blob/rustc/11.0-2020-10-12/llvm/include/llvm/ProfileData/Coverage/CoverageMapping.h#L224-L227)
     /// Important: The Rust struct layout (order and types of fields) must match its C++
     /// counterpart.
     #[derive(Copy, Clone, Debug)]
@@ -793,6 +796,7 @@ pub mod debuginfo {
     pub struct DIBuilder<'a>(InvariantOpaque<'a>);
 
     pub type DIDescriptor = Metadata;
+    pub type DILocation = Metadata;
     pub type DIScope = DIDescriptor;
     pub type DIFile = DIScope;
     pub type DILexicalBlock = DIScope;
@@ -948,7 +952,6 @@ extern "C" {
 
     // Operations on other types
     pub fn LLVMVoidTypeInContext(C: &Context) -> &Type;
-    pub fn LLVMX86MMXTypeInContext(C: &Context) -> &Type;
     pub fn LLVMRustMetadataTypeInContext(C: &Context) -> &Type;
 
     // Operations on all values
@@ -1705,6 +1708,10 @@ extern "C" {
         PM: &PassManager<'_>,
     );
 
+    pub fn LLVMGetHostCPUFeatures() -> *mut c_char;
+
+    pub fn LLVMDisposeMessage(message: *mut c_char);
+
     // Stuff that's in llvm-wrapper/ because it's not upstream yet.
 
     /// Opens an object file.
@@ -1788,10 +1795,14 @@ extern "C" {
 
     pub fn LLVMRustCoverageCreatePGOFuncNameVar(F: &'a Value, FuncName: *const c_char)
     -> &'a Value;
-    pub fn LLVMRustCoverageComputeHash(Name: *const c_char) -> u64;
+    pub fn LLVMRustCoverageHashCString(StrVal: *const c_char) -> u64;
+    pub fn LLVMRustCoverageHashByteArray(Bytes: *const c_char, NumBytes: size_t) -> u64;
 
     #[allow(improper_ctypes)]
-    pub fn LLVMRustCoverageWriteSectionNameToString(M: &Module, Str: &RustString);
+    pub fn LLVMRustCoverageWriteMapSectionNameToString(M: &Module, Str: &RustString);
+
+    #[allow(improper_ctypes)]
+    pub fn LLVMRustCoverageWriteFuncSectionNameToString(M: &Module, Str: &RustString);
 
     #[allow(improper_ctypes)]
     pub fn LLVMRustCoverageWriteMappingVarNameToString(Str: &RustString);
@@ -1800,6 +1811,7 @@ extern "C" {
     pub fn LLVMRustDebugMetadataVersion() -> u32;
     pub fn LLVMRustVersionMajor() -> u32;
     pub fn LLVMRustVersionMinor() -> u32;
+    pub fn LLVMRustVersionPatch() -> u32;
 
     pub fn LLVMRustAddModuleFlag(M: &Module, name: *const c_char, value: u32);
 
@@ -1823,6 +1835,8 @@ extern "C" {
         SplitName: *const c_char,
         SplitNameLen: size_t,
         kind: DebugEmissionKind,
+        DWOId: u64,
+        SplitDebugInlining: bool,
     ) -> &'a DIDescriptor;
 
     pub fn LLVMRustDIBuilderCreateFile(
@@ -1854,7 +1868,7 @@ extern "C" {
         ScopeLine: c_uint,
         Flags: DIFlags,
         SPFlags: DISPFlags,
-        Fn: &'a Value,
+        MaybeFn: Option<&'a Value>,
         TParam: &'a DIArray,
         Decl: Option<&'a DIDescriptor>,
     ) -> &'a DISubprogram;
@@ -2005,7 +2019,7 @@ extern "C" {
         VarInfo: &'a DIVariable,
         AddrOps: *const i64,
         AddrOpsCount: c_uint,
-        DL: &'a Value,
+        DL: &'a DILocation,
         InsertAtEnd: &'a BasicBlock,
     ) -> &'a Value;
 
@@ -2089,12 +2103,11 @@ extern "C" {
     );
 
     pub fn LLVMRustDIBuilderCreateDebugLocation(
-        Context: &'a Context,
         Line: c_uint,
         Column: c_uint,
         Scope: &'a DIScope,
-        InlinedAt: Option<&'a Metadata>,
-    ) -> &'a Value;
+        InlinedAt: Option<&'a DILocation>,
+    ) -> &'a DILocation;
     pub fn LLVMRustDIBuilderCreateOpDeref() -> i64;
     pub fn LLVMRustDIBuilderCreateOpPlusUconst() -> i64;
 
@@ -2144,6 +2157,7 @@ extern "C" {
         EmitStackSizeSection: bool,
         RelaxELFRelocations: bool,
         UseInitArray: bool,
+        SplitDwarfFile: *const c_char,
     ) -> Option<&'static mut TargetMachine>;
     pub fn LLVMRustDisposeTargetMachine(T: &'static mut TargetMachine);
     pub fn LLVMRustAddBuilderLibraryInfo(
@@ -2172,6 +2186,7 @@ extern "C" {
         PM: &PassManager<'a>,
         M: &'a Module,
         Output: *const c_char,
+        DwoOutput: *const c_char,
         FileType: FileType,
     ) -> LLVMRustResult;
     pub fn LLVMRustOptimizeWithNewPassManager(
@@ -2362,4 +2377,10 @@ extern "C" {
         bytecode_len: usize,
     ) -> bool;
     pub fn LLVMRustLinkerFree(linker: &'a mut Linker<'a>);
+    #[allow(improper_ctypes)]
+    pub fn LLVMRustComputeLTOCacheKey(
+        key_out: &RustString,
+        mod_id: *const c_char,
+        data: &ThinLTOData,
+    );
 }

@@ -19,7 +19,6 @@ use std::process::Command;
 use build_helper::{output, t};
 
 use crate::builder::{Builder, RunConfig, ShouldRun, Step};
-use crate::channel;
 use crate::config::TargetSelection;
 use crate::util::{self, exe};
 use crate::GitRepo;
@@ -129,8 +128,10 @@ impl Step for Llvm {
                 Err(m) => m,
             };
 
-        if builder.config.llvm_link_shared && target.contains("windows") {
-            panic!("shared linking to LLVM is not currently supported on Windows");
+        if builder.config.llvm_link_shared
+            && (target.contains("windows") || target.contains("apple-darwin"))
+        {
+            panic!("shared linking to LLVM is not currently supported on {}", target.triple);
         }
 
         builder.info(&format!("Building LLVM for {}", target));
@@ -170,7 +171,6 @@ impl Step for Llvm {
             .define("LLVM_TARGETS_TO_BUILD", llvm_targets)
             .define("LLVM_EXPERIMENTAL_TARGETS_TO_BUILD", llvm_exp_targets)
             .define("LLVM_INCLUDE_EXAMPLES", "OFF")
-            .define("LLVM_INCLUDE_TESTS", "OFF")
             .define("LLVM_INCLUDE_DOCS", "OFF")
             .define("LLVM_INCLUDE_BENCHMARKS", "OFF")
             .define("LLVM_ENABLE_TERMINFO", "OFF")
@@ -209,7 +209,10 @@ impl Step for Llvm {
         // which saves both memory during parallel links and overall disk space
         // for the tools. We don't do this on every platform as it doesn't work
         // equally well everywhere.
-        if builder.llvm_link_tools_dynamically(target) {
+        //
+        // If we're not linking rustc to a dynamic LLVM, though, then don't link
+        // tools to it.
+        if builder.llvm_link_tools_dynamically(target) && builder.config.llvm_link_shared {
             cfg.define("LLVM_LINK_LLVM_DYLIB", "ON");
         }
 
@@ -251,6 +254,10 @@ impl Step for Llvm {
         if util::forcing_clang_based_tests() {
             enabled_llvm_projects.push("clang");
             enabled_llvm_projects.push("compiler-rt");
+        }
+
+        if let Some(true) = builder.config.llvm_polly {
+            enabled_llvm_projects.push("polly");
         }
 
         // We want libxml to be disabled.
@@ -296,7 +303,7 @@ impl Step for Llvm {
             // release number on the dev channel.
             cfg.define("LLVM_VERSION_SUFFIX", "-rust-dev");
         } else {
-            let suffix = format!("-rust-{}-{}", channel::CFG_RELEASE_NUM, builder.config.channel);
+            let suffix = format!("-rust-{}-{}", builder.version, builder.config.channel);
             cfg.define("LLVM_VERSION_SUFFIX", suffix);
         }
 
@@ -340,11 +347,11 @@ fn check_llvm_version(builder: &Builder<'_>, llvm_config: &Path) {
     let version = output(cmd.arg("--version"));
     let mut parts = version.split('.').take(2).filter_map(|s| s.parse::<u32>().ok());
     if let (Some(major), Some(_minor)) = (parts.next(), parts.next()) {
-        if major >= 8 {
+        if major >= 9 {
             return;
         }
     }
-    panic!("\n\nbad LLVM version: {}, need >=8.0\n\n", version)
+    panic!("\n\nbad LLVM version: {}, need >=9.0\n\n", version)
 }
 
 fn configure_cmake(
@@ -374,6 +381,8 @@ fn configure_cmake(
             cfg.define("CMAKE_SYSTEM_NAME", "FreeBSD");
         } else if target.contains("windows") {
             cfg.define("CMAKE_SYSTEM_NAME", "Windows");
+        } else if target.contains("haiku") {
+            cfg.define("CMAKE_SYSTEM_NAME", "Haiku");
         }
         // When cross-compiling we should also set CMAKE_SYSTEM_VERSION, but in
         // that case like CMake we cannot easily determine system version either.
@@ -626,7 +635,14 @@ impl Step for TestHelpers {
         if builder.config.dry_run {
             return;
         }
-        let target = self.target;
+        // The x86_64-fortanix-unknown-sgx target doesn't have a working C
+        // toolchain. However, some x86_64 ELF objects can be linked
+        // without issues. Use this hack to compile the test helpers.
+        let target = if self.target == "x86_64-fortanix-unknown-sgx" {
+            TargetSelection::from_user("x86_64-unknown-linux-gnu")
+        } else {
+            self.target
+        };
         let dst = builder.test_helpers_out(target);
         let src = builder.src.join("src/test/auxiliary/rust_test_helpers.c");
         if up_to_date(&src, &dst.join("librust_test_helpers.a")) {
@@ -650,7 +666,6 @@ impl Step for TestHelpers {
             }
             cfg.compiler(builder.cc(target));
         }
-
         cfg.cargo_metadata(false)
             .out_dir(&dst)
             .target(&target.triple)
@@ -786,6 +801,7 @@ fn supported_sanitizers(
     };
 
     match &*target.triple {
+        "aarch64-apple-darwin" => darwin_libs("osx", &["asan", "lsan", "tsan"]),
         "aarch64-fuchsia" => common_libs("fuchsia", "aarch64", &["asan"]),
         "aarch64-unknown-linux-gnu" => {
             common_libs("linux", "aarch64", &["asan", "lsan", "msan", "tsan"])

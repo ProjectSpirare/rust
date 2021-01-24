@@ -12,8 +12,8 @@ use rustc_codegen_ssa::mir::place::PlaceRef;
 use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
-use rustc_middle::span_bug;
 use rustc_middle::ty::layout::TyAndLayout;
+use rustc_middle::{bug, span_bug};
 use rustc_span::{Pos, Span};
 use rustc_target::abi::*;
 use rustc_target::asm::*;
@@ -60,7 +60,7 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
 
         // Default per-arch clobbers
         // Basically what clang does
-        let arch_clobbers = match &self.sess().target.target.arch[..] {
+        let arch_clobbers = match &self.sess().target.arch[..] {
             "x86" | "x86_64" => vec!["~{dirflag}", "~{fpsr}", "~{flags}"],
             "mips" | "mips64" => vec!["~{$1}"],
             _ => Vec::new(),
@@ -259,6 +259,9 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
                 InlineAsmArch::RiscV32 | InlineAsmArch::RiscV64 => {}
                 InlineAsmArch::Nvptx64 => {}
                 InlineAsmArch::Hexagon => {}
+                InlineAsmArch::Mips | InlineAsmArch::Mips64 => {}
+                InlineAsmArch::SpirV => {}
+                InlineAsmArch::Wasm32 => {}
             }
         }
         if !options.contains(InlineAsmOptions::NOMEM) {
@@ -301,13 +304,11 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
             } else if options.contains(InlineAsmOptions::READONLY) {
                 llvm::Attribute::ReadOnly.apply_callsite(llvm::AttributePlace::Function, result);
             }
+        } else if options.contains(InlineAsmOptions::NOMEM) {
+            llvm::Attribute::InaccessibleMemOnly
+                .apply_callsite(llvm::AttributePlace::Function, result);
         } else {
-            if options.contains(InlineAsmOptions::NOMEM) {
-                llvm::Attribute::InaccessibleMemOnly
-                    .apply_callsite(llvm::AttributePlace::Function, result);
-            } else {
-                // LLVM doesn't have an attribute to represent ReadOnly + SideEffect
-            }
+            // LLVM doesn't have an attribute to represent ReadOnly + SideEffect
         }
 
         // Write results to outputs
@@ -505,6 +506,8 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
             InlineAsmRegClass::Arm(ArmInlineAsmRegClass::dreg)
             | InlineAsmRegClass::Arm(ArmInlineAsmRegClass::qreg) => "w",
             InlineAsmRegClass::Hexagon(HexagonInlineAsmRegClass::reg) => "r",
+            InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg) => "r",
+            InlineAsmRegClass::Mips(MipsInlineAsmRegClass::freg) => "f",
             InlineAsmRegClass::Nvptx(NvptxInlineAsmRegClass::reg16) => "h",
             InlineAsmRegClass::Nvptx(NvptxInlineAsmRegClass::reg32) => "r",
             InlineAsmRegClass::Nvptx(NvptxInlineAsmRegClass::reg64) => "l",
@@ -517,6 +520,10 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
             | InlineAsmRegClass::X86(X86InlineAsmRegClass::ymm_reg) => "x",
             InlineAsmRegClass::X86(X86InlineAsmRegClass::zmm_reg) => "v",
             InlineAsmRegClass::X86(X86InlineAsmRegClass::kreg) => "^Yk",
+            InlineAsmRegClass::Wasm(WasmInlineAsmRegClass::local) => "r",
+            InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
+                bug!("LLVM backend does not support SPIR-V")
+            }
         }
         .to_string(),
     }
@@ -551,6 +558,7 @@ fn modifier_to_llvm(
             }
         }
         InlineAsmRegClass::Hexagon(_) => None,
+        InlineAsmRegClass::Mips(_) => None,
         InlineAsmRegClass::Nvptx(_) => None,
         InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::reg)
         | InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::freg) => None,
@@ -578,6 +586,10 @@ fn modifier_to_llvm(
             _ => unreachable!(),
         },
         InlineAsmRegClass::X86(X86InlineAsmRegClass::kreg) => None,
+        InlineAsmRegClass::Wasm(WasmInlineAsmRegClass::local) => None,
+        InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
+            bug!("LLVM backend does not support SPIR-V")
+        }
     }
 }
 
@@ -603,6 +615,8 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
             cx.type_vector(cx.type_i64(), 2)
         }
         InlineAsmRegClass::Hexagon(HexagonInlineAsmRegClass::reg) => cx.type_i32(),
+        InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg) => cx.type_i32(),
+        InlineAsmRegClass::Mips(MipsInlineAsmRegClass::freg) => cx.type_f32(),
         InlineAsmRegClass::Nvptx(NvptxInlineAsmRegClass::reg16) => cx.type_i16(),
         InlineAsmRegClass::Nvptx(NvptxInlineAsmRegClass::reg32) => cx.type_i32(),
         InlineAsmRegClass::Nvptx(NvptxInlineAsmRegClass::reg64) => cx.type_i64(),
@@ -615,6 +629,10 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
         | InlineAsmRegClass::X86(X86InlineAsmRegClass::ymm_reg)
         | InlineAsmRegClass::X86(X86InlineAsmRegClass::zmm_reg) => cx.type_f32(),
         InlineAsmRegClass::X86(X86InlineAsmRegClass::kreg) => cx.type_i16(),
+        InlineAsmRegClass::Wasm(WasmInlineAsmRegClass::local) => cx.type_i32(),
+        InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
+            bug!("LLVM backend does not support SPIR-V")
+        }
     }
 }
 
@@ -700,6 +718,13 @@ fn llvm_fixup_input(
                 value
             }
         }
+        (InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg), Abi::Scalar(s)) => match s.value {
+            // MIPS only supports register-length arithmetics.
+            Primitive::Int(Integer::I8 | Integer::I16, _) => bx.zext(value, bx.cx.type_i32()),
+            Primitive::F32 => bx.bitcast(value, bx.cx.type_i32()),
+            Primitive::F64 => bx.bitcast(value, bx.cx.type_i64()),
+            _ => value,
+        },
         _ => value,
     }
 }
@@ -768,6 +793,14 @@ fn llvm_fixup_output(
                 value
             }
         }
+        (InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg), Abi::Scalar(s)) => match s.value {
+            // MIPS only supports register-length arithmetics.
+            Primitive::Int(Integer::I8, _) => bx.trunc(value, bx.cx.type_i8()),
+            Primitive::Int(Integer::I16, _) => bx.trunc(value, bx.cx.type_i16()),
+            Primitive::F32 => bx.bitcast(value, bx.cx.type_f32()),
+            Primitive::F64 => bx.bitcast(value, bx.cx.type_f64()),
+            _ => value,
+        },
         _ => value,
     }
 }
@@ -831,6 +864,13 @@ fn llvm_fixup_output_type(
                 layout.llvm_type(cx)
             }
         }
+        (InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg), Abi::Scalar(s)) => match s.value {
+            // MIPS only supports register-length arithmetics.
+            Primitive::Int(Integer::I8 | Integer::I16, _) => cx.type_i32(),
+            Primitive::F32 => cx.type_i32(),
+            Primitive::F64 => cx.type_i64(),
+            _ => layout.llvm_type(cx),
+        },
         _ => layout.llvm_type(cx),
     }
 }

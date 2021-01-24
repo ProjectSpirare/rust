@@ -112,6 +112,7 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
                 items: _,
                 trait_items: _,
                 impl_items: _,
+                foreign_items: _,
                 bodies: _,
                 trait_impls: _,
                 body_ids: _,
@@ -244,7 +245,7 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
         if cfg!(debug_assertions) {
             if hir_id.owner != self.current_dep_node_owner {
                 let node_str = match self.definitions.opt_hir_id_to_local_def_id(hir_id) {
-                    Some(def_id) => self.definitions.def_path(def_id).to_string_no_crate(),
+                    Some(def_id) => self.definitions.def_path(def_id).to_string_no_crate_verbose(),
                     None => format!("{:?}", node),
                 };
 
@@ -254,9 +255,11 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
                      current_dep_node_owner={} ({:?}), hir_id.owner={} ({:?})",
                     self.source_map.span_to_string(span),
                     node_str,
-                    self.definitions.def_path(self.current_dep_node_owner).to_string_no_crate(),
+                    self.definitions
+                        .def_path(self.current_dep_node_owner)
+                        .to_string_no_crate_verbose(),
                     self.current_dep_node_owner,
-                    self.definitions.def_path(hir_id.owner).to_string_no_crate(),
+                    self.definitions.def_path(hir_id.owner).to_string_no_crate_verbose(),
                     hir_id.owner,
                 )
             }
@@ -317,6 +320,10 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         self.visit_impl_item(self.krate.impl_item(item_id));
     }
 
+    fn visit_nested_foreign_item(&mut self, foreign_id: ForeignItemId) {
+        self.visit_foreign_item(self.krate.foreign_item(foreign_id));
+    }
+
     fn visit_nested_body(&mut self, id: BodyId) {
         self.visit_body(self.krate.body(id));
     }
@@ -349,17 +356,41 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         });
     }
 
-    fn visit_foreign_item(&mut self, foreign_item: &'hir ForeignItem<'hir>) {
-        self.insert(foreign_item.span, foreign_item.hir_id, Node::ForeignItem(foreign_item));
+    fn visit_foreign_item(&mut self, fi: &'hir ForeignItem<'hir>) {
+        debug_assert_eq!(
+            fi.hir_id.owner,
+            self.definitions.opt_hir_id_to_local_def_id(fi.hir_id).unwrap()
+        );
+        self.with_dep_node_owner(fi.hir_id.owner, fi, |this, hash| {
+            this.insert_with_hash(fi.span, fi.hir_id, Node::ForeignItem(fi), hash);
 
-        self.with_parent(foreign_item.hir_id, |this| {
-            intravisit::walk_foreign_item(this, foreign_item);
+            this.with_parent(fi.hir_id, |this| {
+                intravisit::walk_foreign_item(this, fi);
+            });
         });
     }
 
     fn visit_generic_param(&mut self, param: &'hir GenericParam<'hir>) {
-        self.insert(param.span, param.hir_id, Node::GenericParam(param));
-        intravisit::walk_generic_param(self, param);
+        if let hir::GenericParamKind::Type {
+            synthetic: Some(hir::SyntheticTyParamKind::ImplTrait),
+            ..
+        } = param.kind
+        {
+            debug_assert_eq!(
+                param.hir_id.owner,
+                self.definitions.opt_hir_id_to_local_def_id(param.hir_id).unwrap()
+            );
+            self.with_dep_node_owner(param.hir_id.owner, param, |this, hash| {
+                this.insert_with_hash(param.span, param.hir_id, Node::GenericParam(param), hash);
+
+                this.with_parent(param.hir_id, |this| {
+                    intravisit::walk_generic_param(this, param);
+                });
+            });
+        } else {
+            self.insert(param.span, param.hir_id, Node::GenericParam(param));
+            intravisit::walk_generic_param(self, param);
+        }
     }
 
     fn visit_trait_item(&mut self, ti: &'hir TraitItem<'hir>) {
@@ -498,13 +529,22 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
     }
 
     fn visit_macro_def(&mut self, macro_def: &'hir MacroDef<'hir>) {
-        self.with_dep_node_owner(macro_def.hir_id.owner, macro_def, |this, hash| {
-            this.insert_with_hash(
-                macro_def.span,
-                macro_def.hir_id,
-                Node::MacroDef(macro_def),
-                hash,
-            );
+        // Exported macros are visited directly from the crate root,
+        // so they do not have `parent_node` set.
+        // Find the correct enclosing module from their DefKey.
+        let def_key = self.definitions.def_key(macro_def.hir_id.owner);
+        let parent = def_key.parent.map_or(hir::CRATE_HIR_ID, |local_def_index| {
+            self.definitions.local_def_id_to_hir_id(LocalDefId { local_def_index })
+        });
+        self.with_parent(parent, |this| {
+            this.with_dep_node_owner(macro_def.hir_id.owner, macro_def, |this, hash| {
+                this.insert_with_hash(
+                    macro_def.span,
+                    macro_def.hir_id,
+                    Node::MacroDef(macro_def),
+                    hash,
+                );
+            })
         });
     }
 
@@ -540,6 +580,14 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         let ImplItemRef { id, ident: _, kind: _, span: _, vis: _, defaultness: _ } = *ii;
 
         self.visit_nested_impl_item(id);
+    }
+
+    fn visit_foreign_item_ref(&mut self, fi: &'hir ForeignItemRef<'hir>) {
+        // Do not visit the duplicate information in ForeignItemRef. We want to
+        // map the actual nodes, not the duplicate ones in the *Ref.
+        let ForeignItemRef { id, ident: _, span: _, vis: _ } = *fi;
+
+        self.visit_nested_foreign_item(id);
     }
 }
 

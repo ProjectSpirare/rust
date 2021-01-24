@@ -39,6 +39,7 @@ use crate::astconv::AstConv;
 use crate::check::FnCtxt;
 use rustc_errors::{struct_span_err, Applicability, DiagnosticBuilder};
 use rustc_hir as hir;
+use rustc_hir::def_id::DefId;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use rustc_infer::infer::{Coercion, InferOk, InferResult};
 use rustc_middle::ty::adjustment::{
@@ -221,11 +222,11 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
                 // unsafe qualifier.
                 self.coerce_from_fn_pointer(a, a_f, b)
             }
-            ty::Closure(_, substs_a) => {
+            ty::Closure(closure_def_id_a, substs_a) => {
                 // Non-capturing closures are coercible to
                 // function pointers or unsafe function pointers.
                 // It cannot convert closures that require unsafe.
-                self.coerce_closure_to_fn(a, substs_a, b)
+                self.coerce_closure_to_fn(a, closure_def_id_a, substs_a, b)
             }
             _ => {
                 // Otherwise, just use unification rules.
@@ -582,8 +583,9 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
         while !queue.is_empty() {
             let obligation = queue.remove(0);
             debug!("coerce_unsized resolve step: {:?}", obligation);
-            let trait_pred = match obligation.predicate.skip_binders() {
-                ty::PredicateAtom::Trait(trait_pred, _)
+            let bound_predicate = obligation.predicate.kind();
+            let trait_pred = match bound_predicate.skip_binder() {
+                ty::PredicateKind::Trait(trait_pred, _)
                     if traits.contains(&trait_pred.def_id()) =>
                 {
                     if unsize_did == trait_pred.def_id() {
@@ -593,7 +595,7 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
                             has_unsized_tuple_coercion = true;
                         }
                     }
-                    ty::Binder::bind(trait_pred)
+                    bound_predicate.rebind(trait_pred)
                 }
                 _ => {
                     coercion.obligations.push(obligation);
@@ -604,7 +606,7 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
                 // Uncertain or unimplemented.
                 Ok(None) => {
                     if trait_pred.def_id() == unsize_did {
-                        let trait_pred = self.resolve_vars_if_possible(&trait_pred);
+                        let trait_pred = self.resolve_vars_if_possible(trait_pred);
                         let self_ty = trait_pred.skip_binder().self_ty();
                         let unsize_ty = trait_pred.skip_binder().trait_ref.substs[1].expect_ty();
                         debug!("coerce_unsized: ambiguous unsize case for {:?}", trait_pred);
@@ -730,7 +732,7 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
                 }
 
                 let InferOk { value: a_sig, mut obligations } =
-                    self.normalize_associated_types_in_as_infer_ok(self.cause.span, &a_sig);
+                    self.normalize_associated_types_in_as_infer_ok(self.cause.span, a_sig);
 
                 let a_fn_pointer = self.tcx.mk_fn_ptr(a_sig);
                 let InferOk { value, obligations: o2 } = self.coerce_from_safe_fn(
@@ -762,6 +764,7 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
     fn coerce_closure_to_fn(
         &self,
         a: Ty<'tcx>,
+        closure_def_id_a: DefId,
         substs_a: SubstsRef<'tcx>,
         b: Ty<'tcx>,
     ) -> CoerceResult<'tcx> {
@@ -772,7 +775,18 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
         let b = self.shallow_resolve(b);
 
         match b.kind() {
-            ty::FnPtr(fn_ty) if substs_a.as_closure().upvar_tys().next().is_none() => {
+            // At this point we haven't done capture analysis, which means
+            // that the ClosureSubsts just contains an inference variable instead
+            // of tuple of captured types.
+            //
+            // All we care here is if any variable is being captured and not the exact paths,
+            // so we check `upvars_mentioned` for root variables being captured.
+            ty::FnPtr(fn_ty)
+                if self
+                    .tcx
+                    .upvars_mentioned(closure_def_id_a.expect_local())
+                    .map_or(true, |u| u.is_empty()) =>
+            {
                 // We coerce the closure, which has fn type
                 //     `extern "rust-call" fn((arg0,arg1,...)) -> _`
                 // to
@@ -906,17 +920,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Function items or non-capturing closures of differing IDs or InternalSubsts.
         let (a_sig, b_sig) = {
             let is_capturing_closure = |ty| {
-                if let &ty::Closure(_, substs) = ty {
-                    substs.as_closure().upvar_tys().next().is_some()
+                if let &ty::Closure(closure_def_id, _substs) = ty {
+                    self.tcx.upvars_mentioned(closure_def_id.expect_local()).is_some()
                 } else {
                     false
                 }
             };
-            if is_capturing_closure(&prev_ty.kind()) || is_capturing_closure(&new_ty.kind()) {
+            if is_capturing_closure(prev_ty.kind()) || is_capturing_closure(new_ty.kind()) {
                 (None, None)
             } else {
-                match (&prev_ty.kind(), &new_ty.kind()) {
-                    (&ty::FnDef(..), &ty::FnDef(..)) => {
+                match (prev_ty.kind(), new_ty.kind()) {
+                    (ty::FnDef(..), ty::FnDef(..)) => {
                         // Don't reify if the function types have a LUB, i.e., they
                         // are the same function and their parameters have a LUB.
                         match self
@@ -929,21 +943,21 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             }
                         }
                     }
-                    (&ty::Closure(_, substs), &ty::FnDef(..)) => {
+                    (ty::Closure(_, substs), ty::FnDef(..)) => {
                         let b_sig = new_ty.fn_sig(self.tcx);
                         let a_sig = self
                             .tcx
                             .signature_unclosure(substs.as_closure().sig(), b_sig.unsafety());
                         (Some(a_sig), Some(b_sig))
                     }
-                    (&ty::FnDef(..), &ty::Closure(_, substs)) => {
+                    (ty::FnDef(..), ty::Closure(_, substs)) => {
                         let a_sig = prev_ty.fn_sig(self.tcx);
                         let b_sig = self
                             .tcx
                             .signature_unclosure(substs.as_closure().sig(), a_sig.unsafety());
                         (Some(a_sig), Some(b_sig))
                     }
-                    (&ty::Closure(_, substs_a), &ty::Closure(_, substs_b)) => (
+                    (ty::Closure(_, substs_a), ty::Closure(_, substs_b)) => (
                         Some(self.tcx.signature_unclosure(
                             substs_a.as_closure().sig(),
                             hir::Unsafety::Normal,
@@ -959,8 +973,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         };
         if let (Some(a_sig), Some(b_sig)) = (a_sig, b_sig) {
             // The signature must match.
-            let a_sig = self.normalize_associated_types_in(new.span, &a_sig);
-            let b_sig = self.normalize_associated_types_in(new.span, &b_sig);
+            let a_sig = self.normalize_associated_types_in(new.span, a_sig);
+            let b_sig = self.normalize_associated_types_in(new.span, b_sig);
             let sig = self
                 .at(cause, self.param_env)
                 .trace(prev_ty, new_ty)
@@ -1429,14 +1443,14 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
                 &mut err, expr, expected, found, cause.span, blk_id,
             );
             let parent = fcx.tcx.hir().get(parent_id);
-            if let (Some(match_expr), true, false) = (
-                fcx.tcx.hir().get_match_if_cause(expr.hir_id),
+            if let (Some(cond_expr), true, false) = (
+                fcx.tcx.hir().get_if_cause(expr.hir_id),
                 expected.is_unit(),
                 pointing_at_return_type,
             ) {
-                if match_expr.span.desugaring_kind().is_none() {
-                    err.span_label(match_expr.span, "expected this to be `()`");
-                    fcx.suggest_semicolon_at_end(match_expr.span, &mut err);
+                if cond_expr.span.desugaring_kind().is_none() {
+                    err.span_label(cond_expr.span, "expected this to be `()`");
+                    fcx.suggest_semicolon_at_end(cond_expr.span, &mut err);
                 }
             }
             fcx.get_node_fn_decl(parent).map(|(fn_decl, _, is_main)| (fn_decl, is_main))
@@ -1458,9 +1472,31 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
                 fn_output = Some(&fn_decl.output); // `impl Trait` return type
             }
         }
-        if let (Some(sp), Some(fn_output)) = (fcx.ret_coercion_span.borrow().as_ref(), fn_output) {
-            self.add_impl_trait_explanation(&mut err, cause, fcx, expected, *sp, fn_output);
+        if let (Some(sp), Some(fn_output)) = (fcx.ret_coercion_span.get(), fn_output) {
+            self.add_impl_trait_explanation(&mut err, cause, fcx, expected, sp, fn_output);
         }
+
+        if let Some(sp) = fcx.ret_coercion_span.get() {
+            // If the closure has an explicit return type annotation,
+            // then a type error may occur at the first return expression we
+            // see in the closure (if it conflicts with the declared
+            // return type). Skip adding a note in this case, since it
+            // would be incorrect.
+            if !err.span.primary_spans().iter().any(|&span| span == sp) {
+                let hir = fcx.tcx.hir();
+                let body_owner = hir.body_owned_by(hir.enclosing_body_owner(fcx.body_id));
+                if fcx.tcx.is_closure(hir.body_owner_def_id(body_owner).to_def_id()) {
+                    err.span_note(
+                        sp,
+                        &format!(
+                            "return type inferred to be `{}` here",
+                            fcx.resolve_vars_if_possible(expected)
+                        ),
+                    );
+                }
+            }
+        }
+
         err
     }
 

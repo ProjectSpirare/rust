@@ -546,19 +546,19 @@ fn read_link(fd: &WasiFd, file: &Path) -> io::Result<PathBuf> {
     }
 }
 
-pub fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-    let (dst, dst_file) = open_parent(dst)?;
-    dst.symlink(osstr2str(src.as_ref())?, osstr2str(dst_file.as_ref())?)
+pub fn symlink(original: &Path, link: &Path) -> io::Result<()> {
+    let (link, link_file) = open_parent(link)?;
+    link.symlink(osstr2str(original.as_ref())?, osstr2str(link_file.as_ref())?)
 }
 
-pub fn link(src: &Path, dst: &Path) -> io::Result<()> {
-    let (src, src_file) = open_parent(src)?;
-    let (dst, dst_file) = open_parent(dst)?;
-    src.link(
+pub fn link(original: &Path, link: &Path) -> io::Result<()> {
+    let (original, original_file) = open_parent(original)?;
+    let (link, link_file) = open_parent(link)?;
+    original.link(
         wasi::LOOKUPFLAGS_SYMLINK_FOLLOW,
-        osstr2str(src_file.as_ref())?,
-        &dst,
-        osstr2str(dst_file.as_ref())?,
+        osstr2str(original_file.as_ref())?,
+        &link,
+        osstr2str(link_file.as_ref())?,
     )
 }
 
@@ -624,33 +624,50 @@ fn open_at(fd: &WasiFd, path: &Path, opts: &OpenOptions) -> io::Result<File> {
 /// to any preopened file descriptor.
 fn open_parent(p: &Path) -> io::Result<(ManuallyDrop<WasiFd>, PathBuf)> {
     let p = CString::new(p.as_os_str().as_bytes())?;
-    unsafe {
-        let mut ret = ptr::null();
-        let fd = __wasilibc_find_relpath(p.as_ptr(), &mut ret);
-        if fd == -1 {
-            let msg = format!(
-                "failed to find a preopened file descriptor \
-                 through which {:?} could be opened",
-                p
+    let mut buf = Vec::<u8>::with_capacity(512);
+    loop {
+        unsafe {
+            let mut relative_path = buf.as_ptr().cast();
+            let mut abs_prefix = ptr::null();
+            let fd = __wasilibc_find_relpath(
+                p.as_ptr(),
+                &mut abs_prefix,
+                &mut relative_path,
+                buf.capacity(),
             );
-            return Err(io::Error::new(io::ErrorKind::Other, msg));
+            if fd == -1 {
+                if io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM) {
+                    // Trigger the internal buffer resizing logic of `Vec` by requiring
+                    // more space than the current capacity.
+                    let cap = buf.capacity();
+                    buf.set_len(cap);
+                    buf.reserve(1);
+                    continue;
+                }
+                let msg = format!(
+                    "failed to find a pre-opened file descriptor \
+                     through which {:?} could be opened",
+                    p
+                );
+                return Err(io::Error::new(io::ErrorKind::Other, msg));
+            }
+            let len = CStr::from_ptr(buf.as_ptr().cast()).to_bytes().len();
+            buf.set_len(len);
+            buf.shrink_to_fit();
+
+            return Ok((
+                ManuallyDrop::new(WasiFd::from_raw(fd as u32)),
+                PathBuf::from(OsString::from_vec(buf)),
+            ));
         }
-        let path = Path::new(OsStr::from_bytes(CStr::from_ptr(ret).to_bytes()));
-
-        // FIXME: right now `path` is a pointer into `p`, the `CString` above.
-        // When we return `p` is deallocated and we can't use it, so we need to
-        // currently separately allocate `path`. If this becomes an issue though
-        // we should probably turn this into a closure-taking interface or take
-        // `&CString` and then pass off `&Path` tied to the same lifetime.
-        let path = path.to_path_buf();
-
-        return Ok((ManuallyDrop::new(WasiFd::from_raw(fd as u32)), path));
     }
 
     extern "C" {
         pub fn __wasilibc_find_relpath(
             path: *const libc::c_char,
+            abs_prefix: *mut *const libc::c_char,
             relative_path: *mut *const libc::c_char,
+            relative_path_len: libc::size_t,
         ) -> libc::c_int;
     }
 }

@@ -262,10 +262,8 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             self.lower_angle_bracketed_parameter_data(&Default::default(), param_mode, itctx)
         };
 
-        let has_lifetimes = generic_args.args.iter().any(|arg| match arg {
-            GenericArg::Lifetime(_) => true,
-            _ => false,
-        });
+        let has_lifetimes =
+            generic_args.args.iter().any(|arg| matches!(arg, GenericArg::Lifetime(_)));
         let first_generic_span = generic_args
             .args
             .iter()
@@ -275,7 +273,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         if !generic_args.parenthesized && !has_lifetimes {
             generic_args.args = self
                 .elided_path_lifetimes(
-                    first_generic_span.map(|s| s.shrink_to_lo()).unwrap_or(segment.ident.span),
+                    first_generic_span.map_or(segment.ident.span, |s| s.shrink_to_lo()),
                     expected_lifetimes,
                 )
                 .map(GenericArg::Lifetime)
@@ -310,8 +308,8 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                             E0726,
                             "implicit elided lifetime not allowed here"
                         );
-                        rustc_session::lint::add_elided_lifetime_in_path_suggestion(
-                            &self.sess,
+                        rustc_errors::add_elided_lifetime_in_path_suggestion(
+                            &self.sess.source_map(),
                             &mut err,
                             expected_lifetimes,
                             path_span,
@@ -403,15 +401,15 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         // compatibility, even in contexts like an impl header where
         // we generally don't permit such things (see #51008).
         self.with_anonymous_lifetime_mode(AnonymousLifetimeMode::PassThrough, |this| {
-            let &ParenthesizedArgs { ref inputs, ref output, span } = data;
+            let ParenthesizedArgs { span, inputs, inputs_span, output } = data;
             let inputs = this.arena.alloc_from_iter(
                 inputs.iter().map(|ty| this.lower_ty_direct(ty, ImplTraitContext::disallowed())),
             );
             let output_ty = match output {
                 FnRetTy::Ty(ty) => this.lower_ty(&ty, ImplTraitContext::disallowed()),
-                FnRetTy::Default(_) => this.arena.alloc(this.ty_tup(span, &[])),
+                FnRetTy::Default(_) => this.arena.alloc(this.ty_tup(*span, &[])),
             };
-            let args = smallvec![GenericArg::Type(this.ty_tup(span, inputs))];
+            let args = smallvec![GenericArg::Type(this.ty_tup(*inputs_span, inputs))];
             let binding = this.output_ty_binding(output_ty.span, output_ty);
             (
                 GenericArgsCtor { args, bindings: arena_vec![this; binding], parenthesized: true },

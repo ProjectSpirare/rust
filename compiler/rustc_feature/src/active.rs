@@ -1,6 +1,6 @@
 //! List of the active feature gates.
 
-use super::{Feature, State};
+use super::{to_nonzero, Feature, State};
 
 use rustc_span::edition::Edition;
 use rustc_span::symbol::{sym, Symbol};
@@ -29,7 +29,7 @@ macro_rules! declare_features {
                     state: State::Active { set: set!($feature) },
                     name: sym::$feature,
                     since: $ver,
-                    issue: $issue,
+                    issue: to_nonzero($issue),
                     edition: $edition,
                     description: concat!($($doc,)*),
                 }
@@ -149,9 +149,6 @@ declare_features! (
     /// Allows using the `#[linkage = ".."]` attribute.
     (active, linkage, "1.0.0", Some(29603), None),
 
-    /// Allows features specific to OIBIT (auto traits).
-    (active, optin_builtin_traits, "1.0.0", Some(13231), None),
-
     /// Allows using `box` in patterns (RFC 469).
     (active, box_patterns, "1.0.0", Some(29641), None),
 
@@ -210,6 +207,15 @@ declare_features! (
     /// it is not on path for eventual stabilization).
     (active, no_niche, "1.42.0", None, None),
 
+    /// Allows using `#[rustc_allow_const_fn_unstable]`.
+    /// This is an attribute on `const fn` for the same
+    /// purpose as `#[allow_internal_unstable]`.
+    (active, rustc_allow_const_fn_unstable, "1.49.0", Some(69399), None),
+
+    /// Allows features specific to auto traits.
+    /// Renamed from `optin_builtin_traits`.
+    (active, auto_traits, "1.50.0", Some(13231), None),
+
     // no-tracking-issue-end
 
     // -------------------------------------------------------------------------
@@ -229,7 +235,6 @@ declare_features! (
     (active, powerpc_target_feature, "1.27.0", Some(44839), None),
     (active, mips_target_feature, "1.27.0", Some(44839), None),
     (active, avx512_target_feature, "1.27.0", Some(44839), None),
-    (active, mmx_target_feature, "1.27.0", Some(44839), None),
     (active, sse4a_target_feature, "1.27.0", Some(44839), None),
     (active, tbm_target_feature, "1.27.0", Some(44839), None),
     (active, wasm_target_feature, "1.30.0", Some(44839), None),
@@ -239,6 +244,7 @@ declare_features! (
     (active, rtm_target_feature, "1.35.0", Some(44839), None),
     (active, f16c_target_feature, "1.36.0", Some(44839), None),
     (active, riscv_target_feature, "1.45.0", Some(44839), None),
+    (active, ermsb_target_feature, "1.49.0", Some(44839), None),
 
     // -------------------------------------------------------------------------
     // feature-group-end: actual feature gates (target features)
@@ -527,10 +533,6 @@ declare_features! (
     /// For example, you can write `x @ Some(y)`.
     (active, bindings_after_at, "1.41.0", Some(65490), None),
 
-    /// Allows patterns with concurrent by-move and by-ref bindings.
-    /// For example, you can write `Foo(a, ref b)` where `a` is by-move and `b` is by-ref.
-    (active, move_ref_pattern, "1.42.0", Some(68354), None),
-
     /// Allows `impl const Trait for T` syntax.
     (active, const_trait_impl, "1.42.0", Some(67792), None),
 
@@ -576,15 +578,59 @@ declare_features! (
     /// Allows calling `transmute` in const fn
     (active, const_fn_transmute, "1.46.0", Some(53605), None),
 
-    /// The smallest useful subset of `const_generics`.
-    (active, min_const_generics, "1.47.0", Some(74878), None),
-
     /// Allows `if let` guard in match arms.
     (active, if_let_guard, "1.47.0", Some(51114), None),
 
-    /// Allows non trivial generic constants which have to be manually propageted upwards.
+    /// Allows non-trivial generic constants which have to be manually propagated upwards.
     (active, const_evaluatable_checked, "1.48.0", Some(76560), None),
 
+    /// Allows basic arithmetic on floating point types in a `const fn`.
+    (active, const_fn_floating_point_arithmetic, "1.48.0", Some(57241), None),
+
+    /// Allows using and casting function pointers in a `const fn`.
+    (active, const_fn_fn_ptr_basics, "1.48.0", Some(57563), None),
+
+    /// Allows to use the `#[cmse_nonsecure_entry]` attribute.
+    (active, cmse_nonsecure_entry, "1.48.0", Some(75835), None),
+
+    /// Allows rustc to inject a default alloc_error_handler
+    (active, default_alloc_error_handler, "1.48.0", Some(66741), None),
+
+    /// Allows argument and return position `impl Trait` in a `const fn`.
+    (active, const_impl_trait, "1.48.0", Some(77463), None),
+
+    /// Allows `#[instruction_set(_)]` attribute
+    (active, isa_attribute, "1.48.0", Some(74727), None),
+
+    /// Allow anonymous constants from an inline `const` block
+    (active, inline_const, "1.49.0", Some(76001), None),
+
+    /// Allows unsized fn parameters.
+    (active, unsized_fn_params, "1.49.0", Some(48055), None),
+
+    /// Allows the use of destructuring assignments.
+    (active, destructuring_assignment, "1.49.0", Some(71126), None),
+
+    /// Enables `#[cfg(panic = "...")]` config key.
+    (active, cfg_panic, "1.49.0", Some(77443), None),
+
+    /// Allows capturing disjoint fields in a closure/generator (RFC 2229).
+    (active, capture_disjoint_fields, "1.49.0", Some(53488), None),
+
+    /// Allows arbitrary expressions in key-value attributes at parse time.
+    (active, extended_key_value_attributes, "1.50.0", Some(78835), None),
+
+    /// `:pat2018` and `:pat2021` macro matchers.
+    (active, edition_macro_pats, "1.51.0", Some(54883), None),
+
+    /// Allows const generics to have default values (e.g. `struct Foo<const N: usize = 3>(...);`).
+    (active, const_generics_defaults, "1.51.0", Some(44580), None),
+
+    /// Allows references to types with interior mutability within constants
+    (active, const_refs_to_cell, "1.51.0", Some(80384), None),
+
+    /// Allows using `pointer` and `reference` in intra-doc links
+    (active, intra_doc_pointers, "1.51.0", Some(80896), None),
     // -------------------------------------------------------------------------
     // feature-group-end: actual feature gates
     // -------------------------------------------------------------------------
@@ -605,9 +651,16 @@ pub const INCOMPLETE_FEATURES: &[Symbol] = &[
     sym::const_trait_bound_opt_out,
     sym::lazy_normalization_consts,
     sym::specialization,
+    sym::inline_const,
+    sym::repr128,
+    sym::unsized_locals,
+    sym::capture_disjoint_fields,
+    sym::const_generics_defaults,
 ];
 
 /// Some features are not allowed to be used together at the same time, if
 /// the two are present, produce an error.
-pub const INCOMPATIBLE_FEATURES: &[(Symbol, Symbol)] =
-    &[(sym::const_generics, sym::min_const_generics)];
+///
+/// Currently empty, but we will probably need this again in the future,
+/// so let's keep it in for now.
+pub const INCOMPATIBLE_FEATURES: &[(Symbol, Symbol)] = &[];

@@ -247,8 +247,7 @@ where
             for (mono_item, linkage) in cgu.items() {
                 let symbol_name = mono_item.symbol_name(tcx).name;
                 let symbol_hash_start = symbol_name.rfind('h');
-                let symbol_hash =
-                    symbol_hash_start.map(|i| &symbol_name[i..]).unwrap_or("<no hash>");
+                let symbol_hash = symbol_hash_start.map_or("<no hash>", |i| &symbol_name[i..]);
 
                 debug!(
                     " - {} [{:?}] [{}] estimated size {}",
@@ -277,14 +276,8 @@ where
 
     symbols.sort_by_key(|sym| sym.1);
 
-    for pair in symbols.windows(2) {
-        let sym1 = &pair[0].1;
-        let sym2 = &pair[1].1;
-
+    for &[(mono_item1, ref sym1), (mono_item2, ref sym2)] in symbols.array_windows() {
         if sym1 == sym2 {
-            let mono_item1 = pair[0].0;
-            let mono_item2 = pair[1].0;
-
             let span1 = mono_item1.local_span(tcx);
             let span2 = mono_item2.local_span(tcx);
 

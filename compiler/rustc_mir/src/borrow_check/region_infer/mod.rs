@@ -548,10 +548,10 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         &mut self,
         infcx: &InferCtxt<'_, 'tcx>,
         body: &Body<'tcx>,
-        mir_def_id: DefId,
         polonius_output: Option<Rc<PoloniusOutput>>,
     ) -> (Option<ClosureRegionRequirements<'tcx>>, RegionErrors<'tcx>) {
-        self.propagate_constraints(body);
+        let mir_def_id = body.source.def_id();
+        self.propagate_constraints(body, infcx.tcx);
 
         let mut errors_buffer = RegionErrors::new();
 
@@ -582,7 +582,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
             self.check_member_constraints(infcx, &mut errors_buffer);
         }
 
-        let outlives_requirements = outlives_requirements.unwrap_or(vec![]);
+        let outlives_requirements = outlives_requirements.unwrap_or_default();
 
         if outlives_requirements.is_empty() {
             (None, errors_buffer)
@@ -599,7 +599,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
     /// for each region variable until all the constraints are
     /// satisfied. Note that some values may grow **too** large to be
     /// feasible, but we check this later.
-    fn propagate_constraints(&mut self, _body: &Body<'tcx>) {
+    fn propagate_constraints(&mut self, _body: &Body<'tcx>, tcx: TyCtxt<'tcx>) {
         debug!("propagate_constraints()");
 
         debug!("propagate_constraints: constraints={:#?}", {
@@ -617,7 +617,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         // own.
         let constraint_sccs = self.constraint_sccs.clone();
         for scc in constraint_sccs.all_sccs() {
-            self.compute_value_for_scc(scc);
+            self.compute_value_for_scc(scc, tcx);
         }
 
         // Sort the applied member constraints so we can binary search
@@ -629,7 +629,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
     /// computed, by unioning the values of its successors.
     /// Assumes that all successors have been computed already
     /// (which is assured by iterating over SCCs in dependency order).
-    fn compute_value_for_scc(&mut self, scc_a: ConstraintSccIndex) {
+    fn compute_value_for_scc(&mut self, scc_a: ConstraintSccIndex, tcx: TyCtxt<'tcx>) {
         let constraint_sccs = self.constraint_sccs.clone();
 
         // Walk each SCC `B` such that `A: B`...
@@ -652,7 +652,12 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         // Now take member constraints into account.
         let member_constraints = self.member_constraints.clone();
         for m_c_i in member_constraints.indices(scc_a) {
-            self.apply_member_constraint(scc_a, m_c_i, member_constraints.choice_regions(m_c_i));
+            self.apply_member_constraint(
+                tcx,
+                scc_a,
+                m_c_i,
+                member_constraints.choice_regions(m_c_i),
+            );
         }
 
         debug!(
@@ -675,6 +680,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
     /// If we make any changes, returns true, else false.
     fn apply_member_constraint(
         &mut self,
+        tcx: TyCtxt<'tcx>,
         scc: ConstraintSccIndex,
         member_constraint_index: NllMemberConstraintIndex,
         choice_regions: &[ty::RegionVid],
@@ -688,12 +694,15 @@ impl<'tcx> RegionInferenceContext<'tcx> {
             // `impl_trait_in_bindings`, I believe, and we are just
             // opting not to handle it for now. See #61773 for
             // details.
-            bug!(
-                "member constraint for `{:?}` has an option region `{:?}` \
-                 that is not a universal region",
-                self.member_constraints[member_constraint_index].opaque_type_def_id,
-                uh_oh,
+            tcx.sess.delay_span_bug(
+                self.member_constraints[member_constraint_index].definition_span,
+                &format!(
+                    "member constraint for `{:?}` has an option region `{:?}` \
+                     that is not a universal region",
+                    self.member_constraints[member_constraint_index].opaque_type_def_id, uh_oh,
+                ),
             );
+            return false;
         }
 
         // Create a mutable vector of the options. We'll try to winnow
@@ -867,7 +876,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
             }
 
             // Type-test failed. Report the error.
-            let erased_generic_kind = infcx.tcx.erase_regions(&type_test.generic_kind);
+            let erased_generic_kind = infcx.tcx.erase_regions(type_test.generic_kind);
 
             // Skip duplicate-ish errors.
             if deduplicate_errors.insert((
@@ -997,7 +1006,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
 
         debug!("try_promote_type_test_subject(ty = {:?})", ty);
 
-        let ty = tcx.fold_regions(&ty, &mut false, |r, _depth| {
+        let ty = tcx.fold_regions(ty, &mut false, |r, _depth| {
             let region_vid = self.to_region_vid(r);
 
             // The challenge if this. We have some region variable `r`
@@ -1136,8 +1145,24 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         for ur in self.scc_values.universal_regions_outlived_by(r_scc) {
             let new_lub = self.universal_region_relations.postdom_upper_bound(lub, ur);
             debug!("approx_universal_upper_bound: ur={:?} lub={:?} new_lub={:?}", ur, lub, new_lub);
+            // The upper bound of two non-static regions is static: this
+            // means we know nothing about the relationship between these
+            // two regions. Pick a 'better' one to use when constructing
+            // a diagnostic
             if ur != static_r && lub != static_r && new_lub == static_r {
-                lub = std::cmp::min(ur, lub);
+                // Prefer the region with an `external_name` - this
+                // indicates that the region is early-bound, so working with
+                // it can produce a nicer error.
+                if self.region_definition(ur).external_name.is_some() {
+                    lub = ur;
+                } else if self.region_definition(lub).external_name.is_some() {
+                    // Leave lub unchanged
+                } else {
+                    // If we get here, we don't have any reason to prefer
+                    // one region over the other. Just pick the
+                    // one with the lower index for now.
+                    lub = std::cmp::min(ur, lub);
+                }
             } else {
                 lub = new_lub;
             }
@@ -1216,7 +1241,9 @@ impl<'tcx> RegionInferenceContext<'tcx> {
     /// it. However, it works pretty well in practice. In particular,
     /// this is needed to deal with projection outlives bounds like
     ///
-    ///     <T as Foo<'0>>::Item: '1
+    /// ```ignore (internal compiler representation so lifetime syntax is invalid)
+    /// <T as Foo<'0>>::Item: '1
+    /// ```
     ///
     /// In particular, this routine winds up being important when
     /// there are bounds like `where <T as Foo<'a>>::Item: 'b` in the
@@ -1237,7 +1264,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
     where
         T: TypeFoldable<'tcx>,
     {
-        tcx.fold_regions(&value, &mut false, |r, _db| {
+        tcx.fold_regions(value, &mut false, |r, _db| {
             let vid = self.to_region_vid(r);
             let scc = self.constraint_sccs.scc(vid);
             let repr = self.scc_representatives[scc];
@@ -1353,7 +1380,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
     /// terms that the "longer free region" `'a` outlived the "shorter free region" `'b`.
     ///
     /// More details can be found in this blog post by Niko:
-    /// http://smallcultfollowing.com/babysteps/blog/2019/01/17/polonius-and-region-errors/
+    /// <http://smallcultfollowing.com/babysteps/blog/2019/01/17/polonius-and-region-errors/>
     ///
     /// In the canonical example
     ///

@@ -1,6 +1,6 @@
 use super::{Parser, PathStyle};
 use crate::{maybe_recover_from_interpolated_ty_qpath, maybe_whole};
-use rustc_ast::mut_visit::{noop_visit_mac, noop_visit_pat, MutVisitor};
+use rustc_ast::mut_visit::{noop_visit_pat, MutVisitor};
 use rustc_ast::ptr::P;
 use rustc_ast::token;
 use rustc_ast::{self as ast, AttrVec, Attribute, FieldPat, MacCall, Pat, PatKind, RangeEnd};
@@ -18,7 +18,7 @@ pub(super) const PARAM_EXPECTED: Expected = Some("parameter name");
 const WHILE_PARSING_OR_MSG: &str = "while parsing this or-pattern starting here";
 
 /// Whether or not an or-pattern should be gated when occurring in the current context.
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 pub(super) enum GateOr {
     Yes,
     No,
@@ -26,7 +26,7 @@ pub(super) enum GateOr {
 
 /// Whether or not to recover a `,` when parsing or-patterns.
 #[derive(PartialEq, Copy, Clone)]
-enum RecoverComma {
+pub(super) enum RecoverComma {
     Yes,
     No,
 }
@@ -43,13 +43,17 @@ impl<'a> Parser<'a> {
 
     /// Entry point to the main pattern parser.
     /// Corresponds to `top_pat` in RFC 2535 and allows or-pattern at the top level.
-    pub(super) fn parse_top_pat(&mut self, gate_or: GateOr) -> PResult<'a, P<Pat>> {
+    pub(super) fn parse_top_pat(
+        &mut self,
+        gate_or: GateOr,
+        rc: RecoverComma,
+    ) -> PResult<'a, P<Pat>> {
         // Allow a '|' before the pats (RFCs 1925, 2530, and 2535).
         let gated_leading_vert = self.eat_or_separator(None) && gate_or == GateOr::Yes;
         let leading_vert_span = self.prev_token.span;
 
         // Parse the possibly-or-pattern.
-        let pat = self.parse_pat_with_or(None, gate_or, RecoverComma::Yes)?;
+        let pat = self.parse_pat_with_or(None, gate_or, rc)?;
 
         // If we parsed a leading `|` which should be gated,
         // and no other gated or-pattern has been parsed thus far,
@@ -94,7 +98,7 @@ impl<'a> Parser<'a> {
     ) -> PResult<'a, P<Pat>> {
         // Parse the first pattern (`p_0`).
         let first_pat = self.parse_pat(expected)?;
-        self.maybe_recover_unexpected_comma(first_pat.span, rc)?;
+        self.maybe_recover_unexpected_comma(first_pat.span, rc, gate_or)?;
 
         // If the next token is not a `|`,
         // this is not an or-pattern and we should exit here.
@@ -110,7 +114,7 @@ impl<'a> Parser<'a> {
                 err.span_label(lo, WHILE_PARSING_OR_MSG);
                 err
             })?;
-            self.maybe_recover_unexpected_comma(pat.span, rc)?;
+            self.maybe_recover_unexpected_comma(pat.span, rc, gate_or)?;
             pats.push(pat);
         }
         let or_pattern_span = lo.to(self.prev_token.span);
@@ -149,8 +153,10 @@ impl<'a> Parser<'a> {
     /// Note that there are more tokens such as `@` for which we know that the `|`
     /// is an illegal parse. However, the user's intent is less clear in that case.
     fn recover_trailing_vert(&mut self, lo: Option<Span>) -> bool {
-        let is_end_ahead = self.look_ahead(1, |token| match &token.uninterpolate().kind {
-            token::FatArrow // e.g. `a | => 0,`.
+        let is_end_ahead = self.look_ahead(1, |token| {
+            matches!(
+                &token.uninterpolate().kind,
+                token::FatArrow // e.g. `a | => 0,`.
             | token::Ident(kw::If, false) // e.g. `a | if expr`.
             | token::Eq // e.g. `let a | = 0`.
             | token::Semi // e.g. `let a |;`.
@@ -158,8 +164,8 @@ impl<'a> Parser<'a> {
             | token::Comma // e.g. `let (a |,)`.
             | token::CloseDelim(token::Bracket) // e.g. `let [a | ]`.
             | token::CloseDelim(token::Paren) // e.g. `let (a | )`.
-            | token::CloseDelim(token::Brace) => true, // e.g. `let A { f: a | }`.
-            _ => false,
+            | token::CloseDelim(token::Brace) // e.g. `let A { f: a | }`.
+            )
         });
         match (is_end_ahead, &self.token.kind) {
             (true, token::BinOp(token::Or) | token::OrOr) => {
@@ -188,7 +194,12 @@ impl<'a> Parser<'a> {
 
     /// Some special error handling for the "top-level" patterns in a match arm,
     /// `for` loop, `let`, &c. (in contrast to subpatterns within such).
-    fn maybe_recover_unexpected_comma(&mut self, lo: Span, rc: RecoverComma) -> PResult<'a, ()> {
+    fn maybe_recover_unexpected_comma(
+        &mut self,
+        lo: Span,
+        rc: RecoverComma,
+        gate_or: GateOr,
+    ) -> PResult<'a, ()> {
         if rc == RecoverComma::No || self.token != token::Comma {
             return Ok(());
         }
@@ -207,18 +218,24 @@ impl<'a> Parser<'a> {
         let seq_span = lo.to(self.prev_token.span);
         let mut err = self.struct_span_err(comma_span, "unexpected `,` in pattern");
         if let Ok(seq_snippet) = self.span_to_snippet(seq_span) {
+            const MSG: &str = "try adding parentheses to match on a tuple...";
+
+            let or_suggestion =
+                gate_or == GateOr::No || !self.sess.gated_spans.is_ungated(sym::or_patterns);
             err.span_suggestion(
                 seq_span,
-                "try adding parentheses to match on a tuple...",
+                if or_suggestion { MSG } else { MSG.trim_end_matches('.') },
                 format!("({})", seq_snippet),
                 Applicability::MachineApplicable,
-            )
-            .span_suggestion(
-                seq_span,
-                "...or a vertical bar to match on multiple alternatives",
-                seq_snippet.replace(",", " |"),
-                Applicability::MachineApplicable,
             );
+            if or_suggestion {
+                err.span_suggestion(
+                    seq_span,
+                    "...or a vertical bar to match on multiple alternatives",
+                    seq_snippet.replace(",", " |"),
+                    Applicability::MachineApplicable,
+                );
+            }
         }
         Err(err)
     }
@@ -313,6 +330,15 @@ impl<'a> Parser<'a> {
             let pat = self.parse_pat_with_range_pat(false, None)?;
             self.sess.gated_spans.gate(sym::box_patterns, lo.to(self.prev_token.span));
             PatKind::Box(pat)
+        } else if self.check_inline_const(0) {
+            // Parse `const pat`
+            let const_expr = self.parse_const_block(lo.to(self.token.span))?;
+
+            if let Some(re) = self.parse_range_end() {
+                self.parse_pat_range_begin_with(const_expr, re)?
+            } else {
+                PatKind::Lit(const_expr)
+            }
         } else if self.can_be_ident_pat() {
             // Parse `ident @ pat`
             // This can give false positives and parse nullary enums,
@@ -559,10 +585,6 @@ impl<'a> Parser<'a> {
     fn make_all_value_bindings_mutable(pat: &mut P<Pat>) -> bool {
         struct AddMut(bool);
         impl MutVisitor for AddMut {
-            fn visit_mac(&mut self, mac: &mut MacCall) {
-                noop_visit_mac(mac, self);
-            }
-
             fn visit_pat(&mut self, pat: &mut P<Pat>) {
                 if let PatKind::Ident(BindingMode::ByValue(m @ Mutability::Not), ..) = &mut pat.kind
                 {
@@ -714,16 +736,19 @@ impl<'a> Parser<'a> {
 
     /// Is the token `dist` away from the current suitable as the start of a range patterns end?
     fn is_pat_range_end_start(&self, dist: usize) -> bool {
-        self.look_ahead(dist, |t| {
-            t.is_path_start() // e.g. `MY_CONST`;
+        self.check_inline_const(dist)
+            || self.look_ahead(dist, |t| {
+                t.is_path_start() // e.g. `MY_CONST`;
                 || t.kind == token::Dot // e.g. `.5` for recovery;
                 || t.can_begin_literal_maybe_minus() // e.g. `42`.
                 || t.is_whole_expr()
-        })
+            })
     }
 
     fn parse_pat_range_end(&mut self) -> PResult<'a, P<Expr>> {
-        if self.check_path() {
+        if self.check_inline_const(0) {
+            self.parse_const_block(self.token.span)
+        } else if self.check_path() {
             let lo = self.token.span;
             let (qself, path) = if self.eat_lt() {
                 // Parse a qualified path
@@ -754,14 +779,12 @@ impl<'a> Parser<'a> {
         && !self.token.is_path_segment_keyword() // Avoid e.g. `Self` as it is a path.
         // Avoid `in`. Due to recovery in the list parser this messes with `for ( $pat in $expr )`.
         && !self.token.is_keyword(kw::In)
-        && self.look_ahead(1, |t| match t.kind { // Try to do something more complex?
-            token::OpenDelim(token::Paren) // A tuple struct pattern.
+        // Try to do something more complex?
+        && self.look_ahead(1, |t| !matches!(t.kind, token::OpenDelim(token::Paren) // A tuple struct pattern.
             | token::OpenDelim(token::Brace) // A struct pattern.
             | token::DotDotDot | token::DotDotEq | token::DotDot // A range pattern.
             | token::ModSep // A tuple / struct variant pattern.
-            | token::Not => false, // A macro expanding to a pattern.
-            _ => true,
-        })
+            | token::Not)) // A macro expanding to a pattern.
     }
 
     /// Parses `ident` or `ident @ pat`.
@@ -795,6 +818,7 @@ impl<'a> Parser<'a> {
         }
         self.bump();
         let (fields, etc) = self.parse_pat_fields().unwrap_or_else(|mut e| {
+            e.span_label(path.span, "while parsing the fields for this pattern");
             e.emit();
             self.recover_stmt();
             (vec![], true)
@@ -844,7 +868,7 @@ impl<'a> Parser<'a> {
 
             // check that a comma comes after every field
             if !ate_comma {
-                let err = self.struct_span_err(self.prev_token.span, "expected `,`");
+                let err = self.struct_span_err(self.token.span, "expected `,`");
                 if let Some(mut delayed) = delayed_err {
                     delayed.emit();
                 }

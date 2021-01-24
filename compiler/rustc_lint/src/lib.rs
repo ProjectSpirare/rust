@@ -25,8 +25,9 @@
 //!
 //! This API is completely unstable and subject to change.
 
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
+#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![cfg_attr(test, feature(test))]
+#![feature(array_windows)]
 #![feature(bool_to_option)]
 #![feature(box_syntax)]
 #![feature(crate_visibility_modifier)]
@@ -34,6 +35,9 @@
 #![feature(never_type)]
 #![feature(nll)]
 #![feature(or_patterns)]
+#![feature(half_open_range_patterns)]
+#![feature(exclusive_range_pattern)]
+#![feature(control_flow_enum)]
 #![recursion_limit = "256"]
 
 #[macro_use]
@@ -48,10 +52,13 @@ mod early;
 mod internal;
 mod late;
 mod levels;
+mod methods;
 mod non_ascii_idents;
 mod nonstandard_style;
+mod panic_fmt;
 mod passes;
 mod redundant_semicolon;
+mod traits;
 mod types;
 mod unused;
 
@@ -62,8 +69,8 @@ use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::lint::builtin::{
     BARE_TRAIT_OBJECTS, BROKEN_INTRA_DOC_LINKS, ELIDED_LIFETIMES_IN_PATHS,
-    EXPLICIT_OUTLIVES_REQUIREMENTS, INVALID_CODEBLOCK_ATTRIBUTES, MISSING_DOC_CODE_EXAMPLES,
-    PRIVATE_DOC_TESTS,
+    EXPLICIT_OUTLIVES_REQUIREMENTS, INVALID_CODEBLOCK_ATTRIBUTES, INVALID_HTML_TAGS,
+    MISSING_DOC_CODE_EXAMPLES, NON_AUTOLINKS, PRIVATE_DOC_TESTS,
 };
 use rustc_span::symbol::{Ident, Symbol};
 use rustc_span::Span;
@@ -71,9 +78,12 @@ use rustc_span::Span;
 use array_into_iter::ArrayIntoIter;
 use builtin::*;
 use internal::*;
+use methods::*;
 use non_ascii_idents::*;
 use nonstandard_style::*;
+use panic_fmt::PanicFmt;
 use redundant_semicolon::*;
+use traits::*;
 use types::*;
 use unused::*;
 
@@ -156,6 +166,9 @@ macro_rules! late_lint_passes {
                 MissingDebugImplementations: MissingDebugImplementations::default(),
                 ArrayIntoIter: ArrayIntoIter,
                 ClashingExternDeclarations: ClashingExternDeclarations::new(),
+                DropTraitConstraints: DropTraitConstraints,
+                TemporaryCStringAsPtr: TemporaryCStringAsPtr,
+                PanicFmt: PanicFmt,
             ]
         );
     };
@@ -270,7 +283,6 @@ fn register_builtins(store: &mut LintStore, no_interleave_lints: bool) {
         UNUSED_MUT,
         UNREACHABLE_CODE,
         UNREACHABLE_PATTERNS,
-        OVERLAPPING_PATTERNS,
         UNUSED_MUST_USE,
         UNUSED_UNSAFE,
         PATH_STATEMENTS,
@@ -303,10 +315,13 @@ fn register_builtins(store: &mut LintStore, no_interleave_lints: bool) {
 
     add_lint_group!(
         "rustdoc",
+        NON_AUTOLINKS,
         BROKEN_INTRA_DOC_LINKS,
+        PRIVATE_INTRA_DOC_LINKS,
         INVALID_CODEBLOCK_ATTRIBUTES,
         MISSING_DOC_CODE_EXAMPLES,
-        PRIVATE_DOC_TESTS
+        PRIVATE_DOC_TESTS,
+        INVALID_HTML_TAGS
     );
 
     // Register renamed and removed lints.
@@ -319,6 +334,7 @@ fn register_builtins(store: &mut LintStore, no_interleave_lints: bool) {
     store.register_renamed("exceeding_bitshifts", "arithmetic_overflow");
     store.register_renamed("redundant_semicolon", "redundant_semicolons");
     store.register_renamed("intra_doc_link_resolution_failure", "broken_intra_doc_links");
+    store.register_renamed("overlapping_patterns", "overlapping_range_endpoints");
     store.register_removed("unknown_features", "replaced by an error");
     store.register_removed("unsigned_negation", "replaced by negate_unsigned feature gate");
     store.register_removed("negate_unsigned", "cast a signed value instead");
@@ -447,6 +463,8 @@ fn register_internals(store: &mut LintStore) {
     store.register_early_pass(|| box DefaultHashTypes::new());
     store.register_lints(&LintPassImpl::get_lints());
     store.register_early_pass(|| box LintPassImpl);
+    store.register_lints(&ExistingDocKeyword::get_lints());
+    store.register_late_pass(|| box ExistingDocKeyword);
     store.register_lints(&TyTyKind::get_lints());
     store.register_late_pass(|| box TyTyKind);
     store.register_group(
@@ -459,6 +477,7 @@ fn register_internals(store: &mut LintStore) {
             LintId::of(LINT_PASS_IMPL_WITHOUT_MACRO),
             LintId::of(TY_PASS_BY_REFERENCE),
             LintId::of(USAGE_OF_QUALIFIED_TY),
+            LintId::of(EXISTING_DOC_KEYWORD),
         ],
     );
 }

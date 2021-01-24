@@ -433,7 +433,7 @@ impl Step for Std {
                 .arg("-Z")
                 .arg("unstable-options")
                 .arg("--resource-suffix")
-                .arg(crate::channel::CFG_RELEASE_NUM)
+                .arg(&builder.version)
                 .arg("--index-page")
                 .arg(&builder.src.join("src/doc/index.md"));
 
@@ -500,18 +500,17 @@ impl Step for Rustc {
         let target = self.target;
         builder.info(&format!("Documenting stage{} compiler ({})", stage, target));
 
-        // This is the intended out directory for compiler documentation.
-        let out = builder.compiler_doc_out(target);
-        t!(fs::create_dir_all(&out));
-
-        let compiler = builder.compiler(stage, builder.config.build);
-
         if !builder.config.compiler_docs {
             builder.info("\tskipping - compiler/librustdoc docs disabled");
             return;
         }
 
+        // This is the intended out directory for compiler documentation.
+        let out = builder.compiler_doc_out(target);
+        t!(fs::create_dir_all(&out));
+
         // Build rustc.
+        let compiler = builder.compiler(stage, builder.config.build);
         builder.ensure(compile::Rustc { compiler, target });
 
         // This uses a shared directory so that librustdoc documentation gets
@@ -521,12 +520,17 @@ impl Step for Rustc {
         // merging the search index, or generating local (relative) links.
         let out_dir = builder.stage_out(compiler, Mode::Rustc).join(target.triple).join("doc");
         t!(symlink_dir_force(&builder.config, &out, &out_dir));
+        // Cargo puts proc macros in `target/doc` even if you pass `--target`
+        // explicitly (https://github.com/rust-lang/cargo/issues/7677).
+        let proc_macro_out_dir = builder.stage_out(compiler, Mode::Rustc).join("doc");
+        t!(symlink_dir_force(&builder.config, &out, &proc_macro_out_dir));
 
         // Build cargo command.
         let mut cargo = builder.cargo(compiler, Mode::Rustc, SourceType::InTree, target, "doc");
         cargo.rustdocflag("--document-private-items");
         cargo.rustdocflag("--enable-index-page");
         cargo.rustdocflag("-Zunstable-options");
+        cargo.rustdocflag("-Znormalize-docs");
         compile::rustc_cargo(builder, &mut cargo, target);
 
         // Only include compiler crates, no dependencies of those, such as `libc`.
@@ -535,8 +539,12 @@ impl Step for Rustc {
         // Find dependencies for top level crates.
         let mut compiler_crates = HashSet::new();
         for root_crate in &["rustc_driver", "rustc_codegen_llvm", "rustc_codegen_ssa"] {
-            compiler_crates
-                .extend(builder.in_tree_crates(root_crate).into_iter().map(|krate| krate.name));
+            compiler_crates.extend(
+                builder
+                    .in_tree_crates(root_crate, Some(target))
+                    .into_iter()
+                    .map(|krate| krate.name),
+            );
         }
 
         for krate in &compiler_crates {
@@ -620,6 +628,8 @@ impl Step for Rustdoc {
         cargo.arg("-p").arg("rustdoc");
 
         cargo.rustdocflag("--document-private-items");
+        cargo.rustdocflag("--enable-index-page");
+        cargo.rustdocflag("-Zunstable-options");
         builder.run(&mut cargo.into());
     }
 }
@@ -659,7 +669,7 @@ impl Step for ErrorIndex {
         let mut index = tool::ErrorIndex::command(builder, self.compiler);
         index.arg("html");
         index.arg(out.join("error-index.html"));
-        index.arg(crate::channel::CFG_RELEASE_NUM);
+        index.arg(&builder.version);
 
         builder.run(&mut index);
     }
@@ -722,6 +732,7 @@ fn symlink_dir_force(config: &Config, src: &Path, dst: &Path) -> io::Result<()> 
 pub struct RustcBook {
     pub compiler: Compiler,
     pub target: TargetSelection,
+    pub validate: bool,
 }
 
 impl Step for RustcBook {
@@ -738,6 +749,7 @@ impl Step for RustcBook {
         run.builder.ensure(RustcBook {
             compiler: run.builder.compiler(run.builder.top_stage, run.builder.config.build),
             target: run.target,
+            validate: false,
         });
     }
 
@@ -752,6 +764,7 @@ impl Step for RustcBook {
         let out_listing = out_base.join("src/lints");
         builder.cp_r(&builder.src.join("src/doc/rustc"), &out_base);
         builder.info(&format!("Generating lint docs ({})", self.target));
+
         let rustc = builder.rustc(self.compiler);
         // The tool runs `rustc` for extracting output examples, so it needs a
         // functional sysroot.
@@ -762,9 +775,13 @@ impl Step for RustcBook {
         cmd.arg("--out");
         cmd.arg(&out_listing);
         cmd.arg("--rustc");
-        cmd.arg(rustc);
+        cmd.arg(&rustc);
+        cmd.arg("--rustc-target").arg(&self.target.rustc_target_arg());
         if builder.config.verbose() {
             cmd.arg("--verbose");
+        }
+        if self.validate {
+            cmd.arg("--validate");
         }
         // If the lib directories are in an unusual location (changed in
         // config.toml), then this needs to explicitly update the dylib search

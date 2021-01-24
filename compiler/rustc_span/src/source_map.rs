@@ -1,9 +1,11 @@
-//! The `SourceMap` tracks all the source code used within a single crate, mapping
+//! Types for tracking pieces of source code within a crate.
+//!
+//! The [`SourceMap`] tracks all the source code used within a single crate, mapping
 //! from integer byte positions to the original source code location. Each bit
 //! of source parsed during crate parsing (typically files, in-memory strings,
 //! or various bits of macro expansion) cover a continuous range of bytes in the
-//! `SourceMap` and are represented by `SourceFile`s. Byte positions are stored in
-//! `Span` and used pervasively in the compiler. They are absolute positions
+//! `SourceMap` and are represented by [`SourceFile`]s. Byte positions are stored in
+//! [`Span`] and used pervasively in the compiler. They are absolute positions
 //! within the `SourceMap`, which upon request can be converted to line and column
 //! information, source code snippets, etc.
 
@@ -12,7 +14,7 @@ pub use crate::*;
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::stable_hasher::StableHasher;
-use rustc_data_structures::sync::{AtomicU32, Lock, LockGuard, Lrc, MappedLockGuard};
+use rustc_data_structures::sync::{AtomicU32, Lrc, MappedReadGuard, ReadGuard, RwLock};
 use std::cmp;
 use std::convert::TryFrom;
 use std::hash::Hash;
@@ -168,7 +170,7 @@ pub struct SourceMap {
     /// The address space below this value is currently used by the files in the source map.
     used_address_space: AtomicU32,
 
-    files: Lock<SourceMapFiles>,
+    files: RwLock<SourceMapFiles>,
     file_loader: Box<dyn FileLoader + Sync + Send>,
     // This is used to apply the file path remapping as specified via
     // `--remap-path-prefix` to all `SourceFile`s allocated within this `SourceMap`.
@@ -236,8 +238,8 @@ impl SourceMap {
 
     // By returning a `MonotonicVec`, we ensure that consumers cannot invalidate
     // any existing indices pointing into `files`.
-    pub fn files(&self) -> MappedLockGuard<'_, monotonic::MonotonicVec<Lrc<SourceFile>>> {
-        LockGuard::map(self.files.borrow(), |files| &mut files.source_files)
+    pub fn files(&self) -> MappedReadGuard<'_, monotonic::MonotonicVec<Lrc<SourceFile>>> {
+        ReadGuard::map(self.files.borrow(), |files| &files.source_files)
     }
 
     pub fn source_file_by_stable_id(
@@ -428,72 +430,27 @@ impl SourceMap {
         }
     }
 
+    /// Return the SourceFile that contains the given `BytePos`
+    pub fn lookup_source_file(&self, pos: BytePos) -> Lrc<SourceFile> {
+        let idx = self.lookup_source_file_idx(pos);
+        (*self.files.borrow().source_files)[idx].clone()
+    }
+
     /// Looks up source information about a `BytePos`.
     pub fn lookup_char_pos(&self, pos: BytePos) -> Loc {
-        let chpos = self.bytepos_to_file_charpos(pos);
-        match self.lookup_line(pos) {
-            Ok(SourceFileAndLine { sf: f, line: a }) => {
-                let line = a + 1; // Line numbers start at 1
-                let linebpos = f.lines[a];
-                let linechpos = self.bytepos_to_file_charpos(linebpos);
-                let col = chpos - linechpos;
-
-                let col_display = {
-                    let start_width_idx = f
-                        .non_narrow_chars
-                        .binary_search_by_key(&linebpos, |x| x.pos())
-                        .unwrap_or_else(|x| x);
-                    let end_width_idx = f
-                        .non_narrow_chars
-                        .binary_search_by_key(&pos, |x| x.pos())
-                        .unwrap_or_else(|x| x);
-                    let special_chars = end_width_idx - start_width_idx;
-                    let non_narrow: usize = f.non_narrow_chars[start_width_idx..end_width_idx]
-                        .iter()
-                        .map(|x| x.width())
-                        .sum();
-                    col.0 - special_chars + non_narrow
-                };
-                debug!("byte pos {:?} is on the line at byte pos {:?}", pos, linebpos);
-                debug!("char pos {:?} is on the line at char pos {:?}", chpos, linechpos);
-                debug!("byte is on line: {}", line);
-                assert!(chpos >= linechpos);
-                Loc { file: f, line, col, col_display }
-            }
-            Err(f) => {
-                let col_display = {
-                    let end_width_idx = f
-                        .non_narrow_chars
-                        .binary_search_by_key(&pos, |x| x.pos())
-                        .unwrap_or_else(|x| x);
-                    let non_narrow: usize =
-                        f.non_narrow_chars[0..end_width_idx].iter().map(|x| x.width()).sum();
-                    chpos.0 - end_width_idx + non_narrow
-                };
-                Loc { file: f, line: 0, col: chpos, col_display }
-            }
-        }
+        let sf = self.lookup_source_file(pos);
+        let (line, col, col_display) = sf.lookup_file_pos_with_col_display(pos);
+        Loc { file: sf, line, col, col_display }
     }
 
     // If the corresponding `SourceFile` is empty, does not return a line number.
     pub fn lookup_line(&self, pos: BytePos) -> Result<SourceFileAndLine, Lrc<SourceFile>> {
-        let idx = self.lookup_source_file_idx(pos);
-
-        let f = (*self.files.borrow().source_files)[idx].clone();
+        let f = self.lookup_source_file(pos);
 
         match f.lookup_line(pos) {
             Some(line) => Ok(SourceFileAndLine { sf: f, line }),
             None => Err(f),
         }
-    }
-
-    /// Returns a new `Span` covering the start and end `BytePos`s of the file containing the given
-    /// `pos`. This can be used to quickly determine if another `BytePos` or `Span` is from the same
-    /// file.
-    pub fn lookup_file_span(&self, pos: BytePos) -> Span {
-        let idx = self.lookup_source_file_idx(pos);
-        let SourceFile { start_pos, end_pos, .. } = *(*self.files.borrow().source_files)[idx];
-        Span::with_root_ctxt(start_pos, end_pos)
     }
 
     /// Returns `Some(span)`, a union of the LHS and RHS span. The LHS must precede the RHS. If
@@ -582,7 +539,7 @@ impl SourceMap {
 
     pub fn is_line_before_span_empty(&self, sp: Span) -> bool {
         match self.span_to_prev_source(sp) {
-            Ok(s) => s.split('\n').last().map(|l| l.trim_start().is_empty()).unwrap_or(false),
+            Ok(s) => s.split('\n').last().map_or(false, |l| l.trim_start().is_empty()),
             Err(_) => false,
         }
     }
@@ -611,7 +568,7 @@ impl SourceMap {
         // asserting that the line numbers here are all indeed 1-based.
         let hi_line = hi.line.saturating_sub(1);
         for line_index in lo.line.saturating_sub(1)..hi_line {
-            let line_len = lo.file.get_line(line_index).map(|s| s.chars().count()).unwrap_or(0);
+            let line_len = lo.file.get_line(line_index).map_or(0, |s| s.chars().count());
             lines.push(LineInfo { line_index, start_col, end_col: CharPos::from_usize(line_len) });
             start_col = CharPos::from_usize(0);
         }
@@ -625,9 +582,9 @@ impl SourceMap {
     /// Extracts the source surrounding the given `Span` using the `extract_source` function. The
     /// extract function takes three arguments: a string slice containing the source, an index in
     /// the slice for the beginning of the span and an index in the slice for the end of the span.
-    fn span_to_source<F>(&self, sp: Span, extract_source: F) -> Result<String, SpanSnippetError>
+    fn span_to_source<F, T>(&self, sp: Span, extract_source: F) -> Result<T, SpanSnippetError>
     where
-        F: Fn(&str, usize, usize) -> Result<String, SpanSnippetError>,
+        F: Fn(&str, usize, usize) -> Result<T, SpanSnippetError>,
     {
         let local_begin = self.lookup_byte_offset(sp.lo());
         let local_end = self.lookup_byte_offset(sp.hi());
@@ -668,7 +625,7 @@ impl SourceMap {
         self.span_to_source(sp, |src, start_index, end_index| {
             src.get(start_index..end_index)
                 .map(|s| s.to_string())
-                .ok_or_else(|| SpanSnippetError::IllFormedSpan(sp))
+                .ok_or(SpanSnippetError::IllFormedSpan(sp))
         })
     }
 
@@ -685,18 +642,16 @@ impl SourceMap {
     /// Returns the source snippet as `String` before the given `Span`.
     pub fn span_to_prev_source(&self, sp: Span) -> Result<String, SpanSnippetError> {
         self.span_to_source(sp, |src, start_index, _| {
-            src.get(..start_index)
-                .map(|s| s.to_string())
-                .ok_or_else(|| SpanSnippetError::IllFormedSpan(sp))
+            src.get(..start_index).map(|s| s.to_string()).ok_or(SpanSnippetError::IllFormedSpan(sp))
         })
     }
 
     /// Extends the given `Span` to just after the previous occurrence of `c`. Return the same span
     /// if no character could be found or if an error occurred while retrieving the code snippet.
-    pub fn span_extend_to_prev_char(&self, sp: Span, c: char) -> Span {
+    pub fn span_extend_to_prev_char(&self, sp: Span, c: char, accept_newlines: bool) -> Span {
         if let Ok(prev_source) = self.span_to_prev_source(sp) {
-            let prev_source = prev_source.rsplit(c).next().unwrap_or("").trim_start();
-            if !prev_source.is_empty() && !prev_source.contains('\n') {
+            let prev_source = prev_source.rsplit(c).next().unwrap_or("");
+            if !prev_source.is_empty() && (!prev_source.contains('\n') || accept_newlines) {
                 return sp.with_lo(BytePos(sp.lo().0 - prev_source.len() as u32));
             }
         }
@@ -716,9 +671,30 @@ impl SourceMap {
             let pat = pat.to_owned() + ws;
             if let Ok(prev_source) = self.span_to_prev_source(sp) {
                 let prev_source = prev_source.rsplit(&pat).next().unwrap_or("").trim_start();
-                if !prev_source.is_empty() && (!prev_source.contains('\n') || accept_newlines) {
+                if prev_source.is_empty() && sp.lo().0 != 0 {
+                    return sp.with_lo(BytePos(sp.lo().0 - 1));
+                } else if !prev_source.contains('\n') || accept_newlines {
                     return sp.with_lo(BytePos(sp.lo().0 - prev_source.len() as u32));
                 }
+            }
+        }
+
+        sp
+    }
+
+    /// Returns the source snippet as `String` after the given `Span`.
+    pub fn span_to_next_source(&self, sp: Span) -> Result<String, SpanSnippetError> {
+        self.span_to_source(sp, |src, _, end_index| {
+            src.get(end_index..).map(|s| s.to_string()).ok_or(SpanSnippetError::IllFormedSpan(sp))
+        })
+    }
+
+    /// Extends the given `Span` to just after the next occurrence of `c`.
+    pub fn span_extend_to_next_char(&self, sp: Span, c: char, accept_newlines: bool) -> Span {
+        if let Ok(next_source) = self.span_to_next_source(sp) {
+            let next_source = next_source.split(c).next().unwrap_or("");
+            if !next_source.is_empty() && (!next_source.contains('\n') || accept_newlines) {
+                return sp.with_hi(BytePos(sp.hi().0 + next_source.len() as u32));
             }
         }
 
@@ -915,8 +891,10 @@ impl SourceMap {
     }
 
     pub fn get_source_file(&self, filename: &FileName) -> Option<Lrc<SourceFile>> {
+        // Remap filename before lookup
+        let filename = self.path_mapping().map_filename_prefix(filename).0;
         for sf in self.files.borrow().source_files.iter() {
-            if *filename == sf.name {
+            if filename == sf.name {
                 return Some(sf.clone());
             }
         }
@@ -934,27 +912,8 @@ impl SourceMap {
     /// Converts an absolute `BytePos` to a `CharPos` relative to the `SourceFile`.
     pub fn bytepos_to_file_charpos(&self, bpos: BytePos) -> CharPos {
         let idx = self.lookup_source_file_idx(bpos);
-        let map = &(*self.files.borrow().source_files)[idx];
-
-        // The number of extra bytes due to multibyte chars in the `SourceFile`.
-        let mut total_extra_bytes = 0;
-
-        for mbc in map.multibyte_chars.iter() {
-            debug!("{}-byte char at {:?}", mbc.bytes, mbc.pos);
-            if mbc.pos < bpos {
-                // Every character is at least one byte, so we only
-                // count the actual extra bytes.
-                total_extra_bytes += mbc.bytes as u32 - 1;
-                // We should never see a byte position in the middle of a
-                // character.
-                assert!(bpos.to_u32() >= mbc.pos.to_u32() + mbc.bytes as u32);
-            } else {
-                break;
-            }
-        }
-
-        assert!(map.start_pos.to_u32() + total_extra_bytes <= bpos.to_u32());
-        CharPos(bpos.to_usize() - map.start_pos.to_usize() - total_extra_bytes as usize)
+        let sf = &(*self.files.borrow().source_files)[idx];
+        sf.bytepos_to_file_charpos(bpos)
     }
 
     // Returns the index of the `SourceFile` (in `self.files`) that contains `pos`.
@@ -1102,5 +1061,16 @@ impl FilePathMapping {
         }
 
         (path, false)
+    }
+
+    fn map_filename_prefix(&self, file: &FileName) -> (FileName, bool) {
+        match file {
+            FileName::Real(realfile) => {
+                let path = realfile.local_path();
+                let (path, mapped) = self.map_prefix(path.to_path_buf());
+                (FileName::Real(RealFileName::Named(path)), mapped)
+            }
+            other => (other.clone(), false),
+        }
     }
 }

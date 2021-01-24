@@ -7,7 +7,7 @@ use rustc_session::config::{build_configuration, build_session_options, to_crate
 use rustc_session::config::{rustc_optgroups, ErrorOutputType, ExternLocation, Options, Passes};
 use rustc_session::config::{CFGuard, ExternEntry, LinkerPluginLto, LtoCli, SwitchWithOptPath};
 use rustc_session::config::{
-    Externs, OutputType, OutputTypes, SanitizerSet, SymbolManglingVersion,
+    Externs, OutputType, OutputTypes, SanitizerSet, SymbolManglingVersion, WasiExecModel,
 };
 use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
@@ -39,6 +39,7 @@ fn mk_session(matches: getopts::Matches) -> (Session, CfgSpecs) {
         registry,
         DiagnosticOutput::Default,
         Default::default(),
+        None,
         None,
     );
     (sess, cfg)
@@ -476,6 +477,7 @@ fn test_debugging_options_tracking_hash() {
     untracked!(dump_mir_dir, String::from("abc"));
     untracked!(dump_mir_exclude_pass_number, true);
     untracked!(dump_mir_graphviz, true);
+    untracked!(emit_future_incompat_report, true);
     untracked!(emit_stack_sizes, true);
     untracked!(hir_stats, true);
     untracked!(identify_regions, true);
@@ -496,7 +498,6 @@ fn test_debugging_options_tracking_hash() {
     untracked!(no_parallel_llvm, true);
     untracked!(parse_only, true);
     untracked!(perf_stats, true);
-    untracked!(polonius, true);
     // `pre_link_arg` is omitted because it just forwards to `pre_link_args`.
     untracked!(pre_link_args, vec![String::from("abc"), String::from("def")]);
     untracked!(print_link_args, true);
@@ -545,12 +546,15 @@ fn test_debugging_options_tracking_hash() {
     tracked!(debug_macros, true);
     tracked!(dep_info_omit_d_target, true);
     tracked!(dual_proc_macros, true);
-    tracked!(fewer_names, true);
+    tracked!(fewer_names, Some(true));
     tracked!(force_overflow_checks, Some(true));
     tracked!(force_unstable_if_unmarked, true);
     tracked!(fuel, Some(("abc".to_string(), 99)));
+    tracked!(function_sections, Some(false));
     tracked!(human_readable_cgu_names, true);
     tracked!(inline_in_all_cgus, Some(true));
+    tracked!(inline_mir_threshold, 123);
+    tracked!(inline_mir_hint_threshold, 123);
     tracked!(insert_sideeffect, true);
     tracked!(instrument_coverage, true);
     tracked!(instrument_mcount, true);
@@ -567,9 +571,12 @@ fn test_debugging_options_tracking_hash() {
     tracked!(osx_rpath_install_name, true);
     tracked!(panic_abort_tests, true);
     tracked!(plt, Some(true));
+    tracked!(polonius, true);
+    tracked!(precise_enum_drop_elaboration, false);
     tracked!(print_fuel, Some("abc".to_string()));
     tracked!(profile, true);
     tracked!(profile_emit, Some(PathBuf::from("abc")));
+    tracked!(relax_elf_relocations, Some(true));
     tracked!(relro_level, Some(RelroLevel::Full));
     tracked!(report_delayed_bugs, true);
     tracked!(run_dsymutil, false);
@@ -580,14 +587,17 @@ fn test_debugging_options_tracking_hash() {
     tracked!(share_generics, Some(true));
     tracked!(show_span, Some(String::from("abc")));
     tracked!(src_hash_algorithm, Some(SourceFileHashAlgorithm::Sha1));
-    tracked!(symbol_mangling_version, SymbolManglingVersion::V0);
+    tracked!(symbol_mangling_version, Some(SymbolManglingVersion::V0));
     tracked!(teach, true);
     tracked!(thinlto, Some(true));
+    tracked!(tune_cpu, Some(String::from("abc")));
     tracked!(tls_model, Some(TlsModel::GeneralDynamic));
+    tracked!(trap_unreachable, Some(false));
     tracked!(treat_err_as_bug, Some(1));
     tracked!(unleash_the_miri_inside_of_you, true);
     tracked!(use_ctors_section, Some(true));
     tracked!(verify_llvm_ir, true);
+    tracked!(wasi_exec_model, Some(WasiExecModel::Reactor));
 }
 
 #[test]

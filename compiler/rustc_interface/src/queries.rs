@@ -3,6 +3,8 @@ use crate::passes::{self, BoxedResolver, QueryContext};
 
 use rustc_ast as ast;
 use rustc_codegen_ssa::traits::CodegenBackend;
+use rustc_data_structures::steal::Steal;
+use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::{Lrc, OnceCell, WorkerLocal};
 use rustc_errors::ErrorReported;
 use rustc_hir::def_id::LOCAL_CRATE;
@@ -11,9 +13,9 @@ use rustc_incremental::DepGraphFuture;
 use rustc_lint::LintStore;
 use rustc_middle::arena::Arena;
 use rustc_middle::dep_graph::DepGraph;
-use rustc_middle::ty::steal::Steal;
 use rustc_middle::ty::{GlobalCtxt, ResolverOutputs, TyCtxt};
-use rustc_session::config::{OutputFilenames, OutputType};
+use rustc_serialize::json;
+use rustc_session::config::{self, OutputFilenames, OutputType};
 use rustc_session::{output::find_crate_name, Session};
 use rustc_span::symbol::sym;
 use std::any::Any;
@@ -21,7 +23,11 @@ use std::cell::{Ref, RefCell, RefMut};
 use std::rc::Rc;
 
 /// Represent the result of a query.
-/// This result can be stolen with the `take` method and generated with the `compute` method.
+///
+/// This result can be stolen with the [`take`] method and generated with the [`compute`] method.
+///
+/// [`take`]: Self::take
+/// [`compute`]: Self::compute
 pub struct Query<T> {
     result: RefCell<Option<Result<T>>>,
 }
@@ -154,13 +160,11 @@ impl<'tcx> Queries<'tcx> {
 
     pub fn crate_name(&self) -> Result<&Query<String>> {
         self.crate_name.compute(|| {
-            Ok(match self.compiler.crate_name {
-                Some(ref crate_name) => crate_name.clone(),
-                None => {
-                    let parse_result = self.parse()?;
-                    let krate = parse_result.peek();
-                    find_crate_name(self.session(), &krate.attrs, &self.compiler.input)
-                }
+            Ok({
+                let parse_result = self.parse()?;
+                let krate = parse_result.peek();
+                // parse `#[crate_name]` even if `--crate-name` was passed, to make sure it matches.
+                find_crate_name(self.session(), &krate.attrs, &self.compiler.input)
             })
         })
     }
@@ -276,7 +280,7 @@ impl<'tcx> Queries<'tcx> {
                 // Don't do code generation if there were any errors
                 self.session().compile_status()?;
 
-                // Hook for compile-fail tests.
+                // Hook for UI tests.
                 Self::check_for_rustc_errors_attr(tcx);
 
                 Ok(passes::start_codegen(&***self.codegen_backend(), tcx, &*outputs.peek()))
@@ -285,7 +289,7 @@ impl<'tcx> Queries<'tcx> {
     }
 
     /// Check for the `#[rustc_error]` annotation, which forces an error in codegen. This is used
-    /// to write compile-fail tests that actually test that compilation succeeds without reporting
+    /// to write UI tests that actually test that compilation succeeds without reporting
     /// an error.
     fn check_for_rustc_errors_attr(tcx: TyCtxt<'_>) {
         let def_id = match tcx.entry_fn(LOCAL_CRATE) {
@@ -331,6 +335,7 @@ impl<'tcx> Queries<'tcx> {
     pub fn linker(&'tcx self) -> Result<Linker> {
         let dep_graph = self.dep_graph()?;
         let prepare_outputs = self.prepare_outputs()?;
+        let crate_hash = self.global_ctxt()?.peek_mut().enter(|tcx| tcx.crate_hash(LOCAL_CRATE));
         let ongoing_codegen = self.ongoing_codegen()?;
 
         let sess = self.session().clone();
@@ -340,6 +345,7 @@ impl<'tcx> Queries<'tcx> {
             sess,
             dep_graph: dep_graph.peek().clone(),
             prepare_outputs: prepare_outputs.take(),
+            crate_hash,
             ongoing_codegen: ongoing_codegen.take(),
             codegen_backend,
         })
@@ -350,17 +356,30 @@ pub struct Linker {
     sess: Lrc<Session>,
     dep_graph: DepGraph,
     prepare_outputs: OutputFilenames,
+    crate_hash: Svh,
     ongoing_codegen: Box<dyn Any>,
     codegen_backend: Lrc<Box<dyn CodegenBackend>>,
 }
 
 impl Linker {
     pub fn link(self) -> Result<()> {
-        let codegen_results =
-            self.codegen_backend.join_codegen(self.ongoing_codegen, &self.sess, &self.dep_graph)?;
-        let prof = self.sess.prof.clone();
+        let (codegen_results, work_products) =
+            self.codegen_backend.join_codegen(self.ongoing_codegen, &self.sess)?;
+
+        self.sess.compile_status()?;
+
+        let sess = &self.sess;
         let dep_graph = self.dep_graph;
+        sess.time("serialize_work_products", || {
+            rustc_incremental::save_work_product_index(&sess, &dep_graph, work_products)
+        });
+
+        let prof = self.sess.prof.clone();
         prof.generic_activity("drop_dep_graph").run(move || drop(dep_graph));
+
+        // Now that we won't touch anything in the incremental compilation directory
+        // any more, we can finalize it (which involves renaming it)
+        rustc_incremental::finalize_session_directory(&self.sess, self.crate_hash);
 
         if !self
             .sess
@@ -371,6 +390,20 @@ impl Linker {
         {
             return Ok(());
         }
+
+        if sess.opts.debugging_opts.no_link {
+            // FIXME: use a binary format to encode the `.rlink` file
+            let rlink_data = json::encode(&codegen_results).map_err(|err| {
+                sess.fatal(&format!("failed to encode rlink: {}", err));
+            })?;
+            let rlink_file = self.prepare_outputs.with_extension(config::RLINK_EXT);
+            std::fs::write(&rlink_file, rlink_data).map_err(|err| {
+                sess.fatal(&format!("failed to write file {}: {}", rlink_file.display(), err));
+            })?;
+            return Ok(());
+        }
+
+        let _timer = sess.prof.verbose_generic_activity("link_crate");
         self.codegen_backend.link(&self.sess, codegen_results, &self.prepare_outputs)
     }
 }
@@ -384,9 +417,19 @@ impl Compiler {
         let queries = Queries::new(&self);
         let ret = f(&queries);
 
-        if self.session().opts.debugging_opts.query_stats {
-            if let Ok(gcx) = queries.global_ctxt() {
-                gcx.peek_mut().print_stats();
+        // NOTE: intentionally does not compute the global context if it hasn't been built yet,
+        // since that likely means there was a parse error.
+        if let Some(Ok(gcx)) = &mut *queries.global_ctxt.result.borrow_mut() {
+            // We assume that no queries are run past here. If there are new queries
+            // after this point, they'll show up as "<unknown>" in self-profiling data.
+            {
+                let _prof_timer =
+                    queries.session().prof.generic_activity("self_profile_alloc_query_strings");
+                gcx.enter(|tcx| tcx.alloc_self_profile_query_strings());
+            }
+
+            if self.session().opts.debugging_opts.query_stats {
+                gcx.print_stats();
             }
         }
 

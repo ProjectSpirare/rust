@@ -20,7 +20,7 @@ use crate::error::Error;
 use crate::fmt;
 use crate::ops::{Add, AddAssign, Sub, SubAssign};
 use crate::sys::time;
-use crate::sys_common::mutex::Mutex;
+use crate::sys_common::mutex::StaticMutex;
 use crate::sys_common::FromInner;
 
 #[stable(feature = "time", since = "1.3.0")]
@@ -83,7 +83,6 @@ pub use core::time::Duration;
 ///
 /// |  Platform |               System call                                            |
 /// |:---------:|:--------------------------------------------------------------------:|
-/// | CloudABI  | [clock_time_get (Monotonic Clock)]                                   |
 /// | SGX       | [`insecure_time` usercall]. More information on [timekeeping in SGX] |
 /// | UNIX      | [clock_gettime (Monotonic Clock)]                                    |
 /// | Darwin    | [mach_absolute_time]                                                 |
@@ -97,9 +96,13 @@ pub use core::time::Duration;
 /// [__wasi_clock_time_get (Monotonic Clock)]: https://github.com/WebAssembly/WASI/blob/master/phases/snapshot/docs.md#clock_time_get
 /// [clock_gettime (Monotonic Clock)]: https://linux.die.net/man/3/clock_gettime
 /// [mach_absolute_time]: https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/services/services.html
-/// [clock_time_get (Monotonic Clock)]: https://nuxi.nl/cloudabi/#clock_time_get
 ///
 /// **Disclaimer:** These system calls might change over time.
+///
+/// > Note: mathematical operations like [`add`] may panic if the underlying
+/// > structure cannot represent the new point in time.
+///
+/// [`add`]: Instant::add
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[stable(feature = "time2", since = "1.8.0")]
 pub struct Instant(time::Instant);
@@ -156,7 +159,6 @@ pub struct Instant(time::Instant);
 ///
 /// |  Platform |               System call                                            |
 /// |:---------:|:--------------------------------------------------------------------:|
-/// | CloudABI  | [clock_time_get (Realtime Clock)]                                    |
 /// | SGX       | [`insecure_time` usercall]. More information on [timekeeping in SGX] |
 /// | UNIX      | [clock_gettime (Realtime Clock)]                                     |
 /// | Darwin    | [gettimeofday]                                                       |
@@ -164,7 +166,6 @@ pub struct Instant(time::Instant);
 /// | WASI      | [__wasi_clock_time_get (Realtime Clock)]                             |
 /// | Windows   | [GetSystemTimePreciseAsFileTime] / [GetSystemTimeAsFileTime]         |
 ///
-/// [clock_time_get (Realtime Clock)]: https://nuxi.nl/cloudabi/#clock_time_get
 /// [`insecure_time` usercall]: https://edp.fortanix.com/docs/api/fortanix_sgx_abi/struct.Usercalls.html#method.insecure_time
 /// [timekeeping in SGX]: https://edp.fortanix.com/docs/concepts/rust-std/#codestdtimecode
 /// [gettimeofday]: http://man7.org/linux/man-pages/man2/gettimeofday.2.html
@@ -174,6 +175,11 @@ pub struct Instant(time::Instant);
 /// [GetSystemTimeAsFileTime]: https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimeasfiletime
 ///
 /// **Disclaimer:** These system calls might change over time.
+///
+/// > Note: mathematical operations like [`add`] may panic if the underlying
+/// > structure cannot represent the new point in time.
+///
+/// [`add`]: SystemTime::add
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[stable(feature = "time2", since = "1.8.0")]
 pub struct SystemTime(time::SystemTime);
@@ -243,7 +249,7 @@ impl Instant {
             return Instant(os_now);
         }
 
-        static LOCK: Mutex = Mutex::new();
+        static LOCK: StaticMutex = StaticMutex::new();
         static mut LAST_NOW: time::Instant = time::Instant::zero();
         unsafe {
             let _lock = LOCK.lock();
@@ -312,7 +318,7 @@ impl Instant {
     /// ```
     #[stable(feature = "checked_duration_since", since = "1.39.0")]
     pub fn saturating_duration_since(&self, earlier: Instant) -> Duration {
-        self.checked_duration_since(earlier).unwrap_or(Duration::new(0, 0))
+        self.checked_duration_since(earlier).unwrap_or_default()
     }
 
     /// Returns the amount of time elapsed since this instant was created.

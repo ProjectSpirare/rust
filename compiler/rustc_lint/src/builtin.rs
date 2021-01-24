@@ -21,7 +21,8 @@
 //! `late_lint_methods!` invocation in `lib.rs`.
 
 use crate::{
-    types::CItemKind, EarlyContext, EarlyLintPass, LateContext, LateLintPass, LintContext,
+    types::{transparent_newtype_field, CItemKind},
+    EarlyContext, EarlyLintPass, LateContext, LateLintPass, LintContext,
 };
 use rustc_ast::attr::{self, HasAttrs};
 use rustc_ast::tokenstream::{TokenStream, TokenTree};
@@ -42,8 +43,8 @@ use rustc_index::vec::Idx;
 use rustc_middle::lint::LintDiagnosticBuilder;
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::subst::{GenericArgKind, Subst};
+use rustc_middle::ty::Instance;
 use rustc_middle::ty::{self, layout::LayoutError, Ty, TyCtxt};
-use rustc_session::lint::FutureIncompatibleInfo;
 use rustc_session::Session;
 use rustc_span::edition::Edition;
 use rustc_span::source_map::Spanned;
@@ -95,18 +96,24 @@ fn pierce_parens(mut expr: &ast::Expr) -> &ast::Expr {
 
 impl EarlyLintPass for WhileTrue {
     fn check_expr(&mut self, cx: &EarlyContext<'_>, e: &ast::Expr) {
-        if let ast::ExprKind::While(cond, ..) = &e.kind {
+        if let ast::ExprKind::While(cond, _, label) = &e.kind {
             if let ast::ExprKind::Lit(ref lit) = pierce_parens(cond).kind {
                 if let ast::LitKind::Bool(true) = lit.kind {
                     if !lit.span.from_expansion() {
                         let msg = "denote infinite loops with `loop { ... }`";
-                        let condition_span = cx.sess.source_map().guess_head_span(e.span);
+                        let condition_span = e.span.with_hi(cond.span.hi());
                         cx.struct_span_lint(WHILE_TRUE, condition_span, |lint| {
                             lint.build(msg)
                                 .span_suggestion_short(
                                     condition_span,
                                     "use `loop`",
-                                    "loop".to_owned(),
+                                    format!(
+                                        "{}loop",
+                                        label.map_or_else(String::new, |label| format!(
+                                            "{}: ",
+                                            label.ident,
+                                        ))
+                                    ),
                                     Applicability::MachineApplicable,
                                 )
                                 .emit();
@@ -541,7 +548,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingDoc {
                     return;
                 }
             }
-            hir::ItemKind::Impl { of_trait: Some(ref trait_ref), items, .. } => {
+            hir::ItemKind::Impl(hir::Impl { of_trait: Some(ref trait_ref), items, .. }) => {
                 // If the trait is private, add the impl items to `private_traits` so they don't get
                 // reported for missing docs.
                 let real_trait = trait_ref.path.res.def_id();
@@ -607,6 +614,19 @@ impl<'tcx> LateLintPass<'tcx> for MissingDoc {
             Some(impl_item.hir_id),
             &impl_item.attrs,
             impl_item.span,
+            article,
+            desc,
+        );
+    }
+
+    fn check_foreign_item(&mut self, cx: &LateContext<'_>, foreign_item: &hir::ForeignItem<'_>) {
+        let def_id = cx.tcx.hir().local_def_id(foreign_item.hir_id);
+        let (article, desc) = cx.tcx.article_and_description(def_id.to_def_id());
+        self.check_missing_docs_attrs(
+            cx,
+            Some(foreign_item.hir_id),
+            &foreign_item.attrs,
+            foreign_item.span,
             article,
             desc,
         );
@@ -855,7 +875,7 @@ impl EarlyLintPass for AnonymousParameters {
         if let ast::AssocItemKind::Fn(_, ref sig, _, _) = it.kind {
             for arg in sig.decl.inputs.iter() {
                 if let ast::PatKind::Ident(_, ident, None) = arg.pat.kind {
-                    if ident.name == kw::Invalid {
+                    if ident.name == kw::Empty {
                         cx.struct_span_lint(ANONYMOUS_PARAMETERS, arg.pat.span, |lint| {
                             let ty_snip = cx.sess.source_map().span_to_snippet(arg.ty.span);
 
@@ -925,8 +945,8 @@ impl EarlyLintPass for DeprecatedAttr {
             if attr.ident().map(|ident| ident.name) == Some(n) {
                 if let &AttributeGate::Gated(
                     Stability::Deprecated(link, suggestion),
-                    ref name,
-                    ref reason,
+                    name,
+                    reason,
                     _,
                 ) = g
                 {
@@ -954,7 +974,7 @@ fn warn_if_doc(cx: &EarlyContext<'_>, node_span: Span, node_kind: &str, attrs: &
     while let Some(attr) = attrs.next() {
         if attr.is_doc_comment() {
             sugared_span =
-                Some(sugared_span.map_or_else(|| attr.span, |span| span.with_hi(attr.span.hi())));
+                Some(sugared_span.map_or(attr.span, |span| span.with_hi(attr.span.hi())));
         }
 
         if attrs.peek().map(|next_attr| next_attr.is_doc_comment()).unwrap_or_default() {
@@ -980,7 +1000,8 @@ impl EarlyLintPass for UnusedDocComment {
     fn check_stmt(&mut self, cx: &EarlyContext<'_>, stmt: &ast::Stmt) {
         let kind = match stmt.kind {
             ast::StmtKind::Local(..) => "statements",
-            ast::StmtKind::Item(..) => "inner items",
+            // Disabled pending discussion in #78306
+            ast::StmtKind::Item(..) => return,
             // expressions will be reported by `check_expr`.
             ast::StmtKind::Empty
             | ast::StmtKind::Semi(_)
@@ -1354,10 +1375,9 @@ impl TypeAliasBounds {
             hir::QPath::TypeRelative(ref ty, _) => {
                 // If this is a type variable, we found a `T::Assoc`.
                 match ty.kind {
-                    hir::TyKind::Path(hir::QPath::Resolved(None, ref path)) => match path.res {
-                        Res::Def(DefKind::TyParam, _) => true,
-                        _ => false,
-                    },
+                    hir::TyKind::Path(hir::QPath::Resolved(None, ref path)) => {
+                        matches!(path.res, Res::Def(DefKind::TyParam, _))
+                    }
                     _ => false,
                 }
             }
@@ -1473,21 +1493,19 @@ declare_lint_pass!(
     UnusedBrokenConst => []
 );
 
-fn check_const(cx: &LateContext<'_>, body_id: hir::BodyId) {
-    let def_id = cx.tcx.hir().body_owner_def_id(body_id).to_def_id();
-    // trigger the query once for all constants since that will already report the errors
-    // FIXME: Use ensure here
-    let _ = cx.tcx.const_eval_poly(def_id);
-}
-
 impl<'tcx> LateLintPass<'tcx> for UnusedBrokenConst {
     fn check_item(&mut self, cx: &LateContext<'_>, it: &hir::Item<'_>) {
         match it.kind {
             hir::ItemKind::Const(_, body_id) => {
-                check_const(cx, body_id);
+                let def_id = cx.tcx.hir().body_owner_def_id(body_id).to_def_id();
+                // trigger the query once for all constants since that will already report the errors
+                // FIXME: Use ensure here
+                let _ = cx.tcx.const_eval_poly(def_id);
             }
             hir::ItemKind::Static(_, _, body_id) => {
-                check_const(cx, body_id);
+                let def_id = cx.tcx.hir().body_owner_def_id(body_id).to_def_id();
+                // FIXME: Use ensure here
+                let _ = cx.tcx.eval_static_initializer(def_id);
             }
             _ => {}
         }
@@ -1538,13 +1556,13 @@ declare_lint_pass!(
 impl<'tcx> LateLintPass<'tcx> for TrivialConstraints {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::Item<'tcx>) {
         use rustc_middle::ty::fold::TypeFoldable;
-        use rustc_middle::ty::PredicateAtom::*;
+        use rustc_middle::ty::PredicateKind::*;
 
         if cx.tcx.features().trivial_bounds {
             let def_id = cx.tcx.hir().local_def_id(item.hir_id);
             let predicates = cx.tcx.predicates_of(def_id);
             for &(predicate, span) in predicates.predicates {
-                let predicate_kind_name = match predicate.skip_binders() {
+                let predicate_kind_name = match predicate.kind().skip_binder() {
                     Trait(..) => "Trait",
                     TypeOutlives(..) |
                     RegionOutlives(..) => "Lifetime",
@@ -1924,8 +1942,8 @@ impl ExplicitOutlivesRequirements {
     ) -> Vec<ty::Region<'tcx>> {
         inferred_outlives
             .iter()
-            .filter_map(|(pred, _)| match pred.skip_binders() {
-                ty::PredicateAtom::RegionOutlives(ty::OutlivesPredicate(a, b)) => match a {
+            .filter_map(|(pred, _)| match pred.kind().skip_binder() {
+                ty::PredicateKind::RegionOutlives(ty::OutlivesPredicate(a, b)) => match a {
                     ty::ReEarlyBound(ebr) if ebr.index == index => Some(b),
                     _ => None,
                 },
@@ -1940,8 +1958,8 @@ impl ExplicitOutlivesRequirements {
     ) -> Vec<ty::Region<'tcx>> {
         inferred_outlives
             .iter()
-            .filter_map(|(pred, _)| match pred.skip_binders() {
-                ty::PredicateAtom::TypeOutlives(ty::OutlivesPredicate(a, b)) => {
+            .filter_map(|(pred, _)| match pred.kind().skip_binder() {
+                ty::PredicateKind::TypeOutlives(ty::OutlivesPredicate(a, b)) => {
                     a.is_param(index).then_some(b)
                 }
                 _ => None,
@@ -1985,9 +2003,9 @@ impl ExplicitOutlivesRequirements {
             .filter_map(|(i, bound)| {
                 if let hir::GenericBound::Outlives(lifetime) = bound {
                     let is_inferred = match tcx.named_region(lifetime.hir_id) {
-                        Some(Region::Static) if infer_static => inferred_outlives
-                            .iter()
-                            .any(|r| if let ty::ReStatic = r { true } else { false }),
+                        Some(Region::Static) if infer_static => {
+                            inferred_outlives.iter().any(|r| matches!(r, ty::ReStatic))
+                        }
                         Some(Region::EarlyBound(index, ..)) => inferred_outlives.iter().any(|r| {
                             if let ty::ReEarlyBound(ebr) = r { ebr.index == index } else { false }
                         }),
@@ -2079,9 +2097,10 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitOutlivesRequirements {
             let mut lint_spans = Vec::new();
 
             for param in hir_generics.params {
-                let has_lifetime_bounds = param.bounds.iter().any(|bound| {
-                    if let hir::GenericBound::Outlives(_) = bound { true } else { false }
-                });
+                let has_lifetime_bounds = param
+                    .bounds
+                    .iter()
+                    .any(|bound| matches!(bound, hir::GenericBound::Outlives(_)));
                 if !has_lifetime_bounds {
                     continue;
                 }
@@ -2275,11 +2294,19 @@ impl EarlyLintPass for IncompleteFeatures {
                             n, n,
                         ));
                     }
+                    if HAS_MIN_FEATURES.contains(&name) {
+                        builder.help(&format!(
+                            "consider using `min_{}` instead, which is more stable and complete",
+                            name,
+                        ));
+                    }
                     builder.emit();
                 })
             });
     }
 }
+
+const HAS_MIN_FEATURES: &[Symbol] = &[sym::specialization];
 
 declare_lint! {
     /// The `invalid_value` lint detects creating a value that is not valid,
@@ -2325,7 +2352,7 @@ impl<'tcx> LateLintPass<'tcx> for InvalidValue {
         enum InitKind {
             Zeroed,
             Uninit,
-        };
+        }
 
         /// Information about why a type cannot be initialized this way.
         /// Contains an error message and optionally a span to point at.
@@ -2350,13 +2377,6 @@ impl<'tcx> LateLintPass<'tcx> for InvalidValue {
 
         /// Determine if this expression is a "dangerous initialization".
         fn is_dangerous_init(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<InitKind> {
-            // `transmute` is inside an anonymous module (the `extern` block?);
-            // `Invalid` represents the empty string and matches that.
-            // FIXME(#66075): use diagnostic items.  Somehow, that does not seem to work
-            // on intrinsics right now.
-            const TRANSMUTE_PATH: &[Symbol] =
-                &[sym::core, sym::intrinsics, kw::Invalid, sym::transmute];
-
             if let hir::ExprKind::Call(ref path_expr, ref args) = expr.kind {
                 // Find calls to `mem::{uninitialized,zeroed}` methods.
                 if let hir::ExprKind::Path(ref qpath) = path_expr.kind {
@@ -2366,10 +2386,9 @@ impl<'tcx> LateLintPass<'tcx> for InvalidValue {
                         return Some(InitKind::Zeroed);
                     } else if cx.tcx.is_diagnostic_item(sym::mem_uninitialized, def_id) {
                         return Some(InitKind::Uninit);
-                    } else if cx.match_def_path(def_id, TRANSMUTE_PATH) {
-                        if is_zero(&args[0]) {
-                            return Some(InitKind::Zeroed);
-                        }
+                    } else if cx.tcx.is_diagnostic_item(sym::transmute, def_id) && is_zero(&args[0])
+                    {
+                        return Some(InitKind::Zeroed);
                     }
                 }
             } else if let hir::ExprKind::MethodCall(_, _, ref args, _) = expr.kind {
@@ -2583,7 +2602,12 @@ declare_lint! {
 }
 
 pub struct ClashingExternDeclarations {
-    seen_decls: FxHashMap<Symbol, HirId>,
+    /// Map of function symbol name to the first-seen hir id for that symbol name.. If seen_decls
+    /// contains an entry for key K, it means a symbol with name K has been seen by this lint and
+    /// the symbol should be reported as a clashing declaration.
+    // FIXME: Technically, we could just store a &'tcx str here without issue; however, the
+    // `impl_lint_pass` macro doesn't currently support lints parametric over a lifetime.
+    seen_decls: FxHashMap<String, HirId>,
 }
 
 /// Differentiate between whether the name for an extern decl came from the link_name attribute or
@@ -2614,16 +2638,17 @@ impl ClashingExternDeclarations {
     fn insert(&mut self, tcx: TyCtxt<'_>, fi: &hir::ForeignItem<'_>) -> Option<HirId> {
         let hid = fi.hir_id;
 
-        let name =
-            &tcx.codegen_fn_attrs(tcx.hir().local_def_id(hid)).link_name.unwrap_or(fi.ident.name);
-
-        if self.seen_decls.contains_key(name) {
+        let local_did = tcx.hir().local_def_id(fi.hir_id);
+        let did = local_did.to_def_id();
+        let instance = Instance::new(did, ty::List::identity_for_item(tcx, did));
+        let name = tcx.symbol_name(instance).name;
+        if let Some(&hir_id) = self.seen_decls.get(name) {
             // Avoid updating the map with the new entry when we do find a collision. We want to
             // make sure we're always pointing to the first definition as the previous declaration.
             // This lets us avoid emitting "knock-on" diagnostics.
-            Some(*self.seen_decls.get(name).unwrap())
+            Some(hir_id)
         } else {
-            self.seen_decls.insert(*name, hid)
+            self.seen_decls.insert(name.to_owned(), hid)
         }
     }
 
@@ -2688,8 +2713,7 @@ impl ClashingExternDeclarations {
                         if is_transparent && !is_non_null {
                             debug_assert!(def.variants.len() == 1);
                             let v = &def.variants[VariantIdx::new(0)];
-                            ty = v
-                                .transparent_newtype_field(tcx)
+                            ty = transparent_newtype_field(tcx, v)
                                 .expect(
                                     "single-variant transparent structure with zero-sized field",
                                 )
@@ -2866,7 +2890,7 @@ impl<'tcx> LateLintPass<'tcx> for ClashingExternDeclarations {
     fn check_foreign_item(&mut self, cx: &LateContext<'tcx>, this_fi: &hir::ForeignItem<'_>) {
         trace!("ClashingExternDeclarations: check_foreign_item: {:?}", this_fi);
         if let ForeignItemKind::Fn(..) = this_fi.kind {
-            let tcx = *&cx.tcx;
+            let tcx = cx.tcx;
             if let Some(existing_hid) = self.insert(tcx, this_fi) {
                 let existing_decl_ty = tcx.type_of(tcx.hir().local_def_id(existing_hid));
                 let this_decl_ty = tcx.type_of(tcx.hir().local_def_id(this_fi.hir_id));

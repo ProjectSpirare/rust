@@ -3,6 +3,7 @@ use std::collections::hash_map::Entry;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, CRATE_DEF_INDEX, LOCAL_CRATE};
+use rustc_hir::definitions::DefPathDataName;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::exported_symbols::SymbolExportLevel;
 use rustc_middle::mir::mono::{CodegenUnit, CodegenUnitNameBuilder, Linkage, Visibility};
@@ -303,7 +304,7 @@ fn characteristic_def_id_of_mono_item<'tcx>(
                 let impl_self_ty = tcx.subst_and_normalize_erasing_regions(
                     instance.substs,
                     ty::ParamEnv::reveal_all(),
-                    &tcx.type_of(impl_def_id),
+                    tcx.type_of(impl_def_id),
                 );
                 if let Some(def_id) = characteristic_def_id_of_type(impl_self_ty) {
                     return Some(def_id);
@@ -354,7 +355,10 @@ fn compute_codegen_unit_name(
     *cache.entry((cgu_def_id, volatile)).or_insert_with(|| {
         let def_path = tcx.def_path(cgu_def_id);
 
-        let components = def_path.data.iter().map(|part| part.data.as_symbol());
+        let components = def_path.data.iter().map(|part| match part.data.name() {
+            DefPathDataName::Named(name) => name,
+            DefPathDataName::Anon { .. } => unreachable!(),
+        });
 
         let volatile_suffix = volatile.then_some("volatile");
 
@@ -528,7 +532,7 @@ fn mono_item_visibility(
 }
 
 fn default_visibility(tcx: TyCtxt<'_>, id: DefId, is_generic: bool) -> Visibility {
-    if !tcx.sess.target.target.options.default_hidden_visibility {
+    if !tcx.sess.target.default_hidden_visibility {
         return Visibility::Default;
     }
 

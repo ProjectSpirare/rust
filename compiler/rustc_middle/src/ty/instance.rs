@@ -1,6 +1,6 @@
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::ty::print::{FmtPrinter, Printer};
-use crate::ty::subst::InternalSubsts;
+use crate::ty::subst::{InternalSubsts, Subst};
 use crate::ty::{self, SubstsRef, Ty, TyCtxt, TypeFoldable};
 use rustc_errors::ErrorReported;
 use rustc_hir::def::Namespace;
@@ -22,7 +22,8 @@ pub struct Instance<'tcx> {
     pub substs: SubstsRef<'tcx>,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, TyEncodable, TyDecodable, HashStable)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(TyEncodable, TyDecodable, HashStable, TypeFoldable)]
 pub enum InstanceDef<'tcx> {
     /// A user-defined callable item.
     ///
@@ -62,10 +63,6 @@ pub enum InstanceDef<'tcx> {
     /// `<fn() as FnTrait>::call_*` (generated `FnTrait` implementation for `fn()` pointers).
     ///
     /// `DefId` is `FnTrait::call_*`.
-    ///
-    /// NB: the (`fn` pointer) type must currently be monomorphic to avoid double substitution
-    /// problems with the MIR shim bodies. `Instance::resolve` enforces this.
-    // FIXME(#69925) support polymorphic MIR shim bodies properly instead.
     FnPtrShim(DefId, Ty<'tcx>),
 
     /// Dynamic dispatch to `<dyn Trait as Trait>::fn`.
@@ -87,10 +84,6 @@ pub enum InstanceDef<'tcx> {
     /// The `DefId` is for `core::ptr::drop_in_place`.
     /// The `Option<Ty<'tcx>>` is either `Some(T)`, or `None` for empty drop
     /// glue.
-    ///
-    /// NB: the type must currently be monomorphic to avoid double substitution
-    /// problems with the MIR shim bodies. `Instance::resolve` enforces this.
-    // FIXME(#69925) support polymorphic MIR shim bodies properly instead.
     DropGlue(DefId, Option<Ty<'tcx>>),
 
     /// Compiler-generated `<T as Clone>::clone` implementation.
@@ -99,10 +92,6 @@ pub enum InstanceDef<'tcx> {
     /// Additionally, arrays, tuples, and closures get a `Clone` shim even if they aren't `Copy`.
     ///
     /// The `DefId` is for `Clone::clone`, the `Ty` is the type `T` with the builtin `Clone` impl.
-    ///
-    /// NB: the type must currently be monomorphic to avoid double substitution
-    /// problems with the MIR shim bodies. `Instance::resolve` enforces this.
-    // FIXME(#69925) support polymorphic MIR shim bodies properly instead.
     CloneShim(DefId, Ty<'tcx>),
 }
 
@@ -195,10 +184,10 @@ impl<'tcx> InstanceDef<'tcx> {
             ty::InstanceDef::DropGlue(_, Some(_)) => return false,
             _ => return true,
         };
-        match tcx.def_key(def_id).disambiguated_data.data {
-            DefPathData::Ctor | DefPathData::ClosureExpr => true,
-            _ => false,
-        }
+        matches!(
+            tcx.def_key(def_id).disambiguated_data.data,
+            DefPathData::Ctor | DefPathData::ClosureExpr
+        )
     }
 
     /// Returns `true` if the machine code for this instance is instantiated in
@@ -243,12 +232,33 @@ impl<'tcx> InstanceDef<'tcx> {
             _ => false,
         }
     }
+
+    /// Returns `true` when the MIR body associated with this instance should be monomorphized
+    /// by its users (e.g. codegen or miri) by substituting the `substs` from `Instance` (see
+    /// `Instance::substs_for_mir_body`).
+    ///
+    /// Otherwise, returns `false` only for some kinds of shims where the construction of the MIR
+    /// body should perform necessary substitutions.
+    pub fn has_polymorphic_mir_body(&self) -> bool {
+        match *self {
+            InstanceDef::CloneShim(..)
+            | InstanceDef::FnPtrShim(..)
+            | InstanceDef::DropGlue(_, Some(_)) => false,
+            InstanceDef::ClosureOnceShim { .. }
+            | InstanceDef::DropGlue(..)
+            | InstanceDef::Item(_)
+            | InstanceDef::Intrinsic(..)
+            | InstanceDef::ReifyShim(..)
+            | InstanceDef::Virtual(..)
+            | InstanceDef::VtableShim(..) => true,
+        }
+    }
 }
 
 impl<'tcx> fmt::Display for Instance<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         ty::tls::with(|tcx| {
-            let substs = tcx.lift(&self.substs).expect("could not lift for printing");
+            let substs = tcx.lift(self.substs).expect("could not lift for printing");
             FmtPrinter::new(tcx, &mut *f, Namespace::ValueNS)
                 .print_def_path(self.def_id(), substs)?;
             Ok(())
@@ -281,7 +291,17 @@ impl<'tcx> Instance<'tcx> {
     }
 
     pub fn mono(tcx: TyCtxt<'tcx>, def_id: DefId) -> Instance<'tcx> {
-        Instance::new(def_id, tcx.empty_substs_for_def_id(def_id))
+        let substs = InternalSubsts::for_item(tcx, def_id, |param, _| match param.kind {
+            ty::GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
+            ty::GenericParamDefKind::Type { .. } => {
+                bug!("Instance::mono: {:?} has type parameters", def_id)
+            }
+            ty::GenericParamDefKind::Const { .. } => {
+                bug!("Instance::mono: {:?} has const parameters", def_id)
+            }
+        });
+
+        Instance::new(def_id, substs)
     }
 
     #[inline]
@@ -339,15 +359,15 @@ impl<'tcx> Instance<'tcx> {
         // HACK(eddyb) erase regions in `substs` first, so that `param_env.and(...)`
         // below is more likely to ignore the bounds in scope (e.g. if the only
         // generic parameters mentioned by `substs` were lifetime ones).
-        let substs = tcx.erase_regions(&substs);
+        let substs = tcx.erase_regions(substs);
 
         // FIXME(eddyb) should this always use `param_env.with_reveal_all()`?
         if let Some((did, param_did)) = def.as_const_arg() {
             tcx.resolve_instance_of_const_arg(
-                tcx.erase_regions(&param_env.and((did, param_did, substs))),
+                tcx.erase_regions(param_env.and((did, param_did, substs))),
             )
         } else {
-            tcx.resolve_instance(tcx.erase_regions(&param_env.and((def.did, substs))))
+            tcx.resolve_instance(tcx.erase_regions(param_env.and((def.did, substs))))
         }
     }
 
@@ -432,7 +452,7 @@ impl<'tcx> Instance<'tcx> {
         let self_ty = tcx.mk_closure(closure_did, substs);
 
         let sig = substs.as_closure().sig();
-        let sig = tcx.normalize_erasing_late_bound_regions(ty::ParamEnv::reveal_all(), &sig);
+        let sig = tcx.normalize_erasing_late_bound_regions(ty::ParamEnv::reveal_all(), sig);
         assert_eq!(sig.inputs().len(), 1);
         let substs = tcx.mk_substs_trait(self_ty, &[sig.inputs()[0].into()]);
 
@@ -440,29 +460,40 @@ impl<'tcx> Instance<'tcx> {
         Instance { def, substs }
     }
 
-    /// FIXME(#69925) Depending on the kind of `InstanceDef`, the MIR body associated with an
+    /// Depending on the kind of `InstanceDef`, the MIR body associated with an
     /// instance is expressed in terms of the generic parameters of `self.def_id()`, and in other
     /// cases the MIR body is expressed in terms of the types found in the substitution array.
     /// In the former case, we want to substitute those generic types and replace them with the
     /// values from the substs when monomorphizing the function body. But in the latter case, we
     /// don't want to do that substitution, since it has already been done effectively.
     ///
-    /// This function returns `Some(substs)` in the former case and None otherwise -- i.e., if
+    /// This function returns `Some(substs)` in the former case and `None` otherwise -- i.e., if
     /// this function returns `None`, then the MIR body does not require substitution during
-    /// monomorphization.
-    pub fn substs_for_mir_body(&self) -> Option<SubstsRef<'tcx>> {
-        match self.def {
-            InstanceDef::CloneShim(..)
-            | InstanceDef::DropGlue(_, Some(_)) => None,
-            InstanceDef::ClosureOnceShim { .. }
-            | InstanceDef::DropGlue(..)
-            // FIXME(#69925): `FnPtrShim` should be in the other branch.
-            | InstanceDef::FnPtrShim(..)
-            | InstanceDef::Item(_)
-            | InstanceDef::Intrinsic(..)
-            | InstanceDef::ReifyShim(..)
-            | InstanceDef::Virtual(..)
-            | InstanceDef::VtableShim(..) => Some(self.substs),
+    /// codegen.
+    fn substs_for_mir_body(&self) -> Option<SubstsRef<'tcx>> {
+        if self.def.has_polymorphic_mir_body() { Some(self.substs) } else { None }
+    }
+
+    pub fn subst_mir<T>(&self, tcx: TyCtxt<'tcx>, v: &T) -> T
+    where
+        T: TypeFoldable<'tcx> + Copy,
+    {
+        if let Some(substs) = self.substs_for_mir_body() { v.subst(tcx, substs) } else { *v }
+    }
+
+    pub fn subst_mir_and_normalize_erasing_regions<T>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+        v: T,
+    ) -> T
+    where
+        T: TypeFoldable<'tcx> + Clone,
+    {
+        if let Some(substs) = self.substs_for_mir_body() {
+            tcx.subst_and_normalize_erasing_regions(substs, param_env, v)
+        } else {
+            tcx.normalize_erasing_regions(param_env, v)
         }
     }
 
@@ -504,12 +535,12 @@ fn polymorphize<'tcx>(
     } else {
         None
     };
-    let has_upvars = upvars_ty.map(|ty| ty.tuple_fields().count() > 0).unwrap_or(false);
+    let has_upvars = upvars_ty.map_or(false, |ty| ty.tuple_fields().count() > 0);
     debug!("polymorphize: upvars_ty={:?} has_upvars={:?}", upvars_ty, has_upvars);
 
     struct PolymorphizationFolder<'tcx> {
         tcx: TyCtxt<'tcx>,
-    };
+    }
 
     impl ty::TypeFolder<'tcx> for PolymorphizationFolder<'tcx> {
         fn tcx<'a>(&'a self) -> TyCtxt<'tcx> {

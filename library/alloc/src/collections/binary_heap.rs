@@ -15,7 +15,6 @@
 //! [dijkstra]: https://en.wikipedia.org/wiki/Dijkstra%27s_algorithm
 //! [sssp]: https://en.wikipedia.org/wiki/Shortest_path_problem
 //! [dir_graph]: https://en.wikipedia.org/wiki/Directed_graph
-//! [`BinaryHeap`]: struct.BinaryHeap.html
 //!
 //! ```
 //! use std::cmp::Ordering;
@@ -31,7 +30,7 @@
 //! // Explicitly implement the trait so the queue becomes a min-heap
 //! // instead of a max-heap.
 //! impl Ord for State {
-//!     fn cmp(&self, other: &State) -> Ordering {
+//!     fn cmp(&self, other: &Self) -> Ordering {
 //!         // Notice that the we flip the ordering on costs.
 //!         // In case of a tie we compare positions - this step is necessary
 //!         // to make implementations of `PartialEq` and `Ord` consistent.
@@ -42,7 +41,7 @@
 //!
 //! // `PartialOrd` needs to be implemented as well.
 //! impl PartialOrd for State {
-//!     fn partial_cmp(&self, other: &State) -> Option<Ordering> {
+//!     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 //!         Some(self.cmp(other))
 //!     }
 //! }
@@ -146,7 +145,7 @@
 
 use core::fmt;
 use core::iter::{FromIterator, FusedIterator, InPlaceIterable, SourceIter, TrustedLen};
-use core::mem::{self, size_of, swap, ManuallyDrop};
+use core::mem::{self, swap, ManuallyDrop};
 use core::ops::{Deref, DerefMut};
 use core::ptr;
 
@@ -162,7 +161,10 @@ use super::SpecExtend;
 /// It is a logic error for an item to be modified in such a way that the
 /// item's ordering relative to any other item, as determined by the `Ord`
 /// trait, changes while it is in the heap. This is normally only possible
-/// through `Cell`, `RefCell`, global state, I/O, or unsafe code.
+/// through `Cell`, `RefCell`, global state, I/O, or unsafe code. The
+/// behavior resulting from such a logic error is not specified, but will
+/// not result in undefined behavior. This could include panics, incorrect
+/// results, aborts, memory leaks, and non-termination.
 ///
 /// # Examples
 ///
@@ -240,10 +242,10 @@ use super::SpecExtend;
 /// The value for `push` is an expected cost; the method documentation gives a
 /// more detailed analysis.
 ///
-/// [push]: #method.push
-/// [pop]: #method.pop
-/// [peek]: #method.peek
-/// [peek\_mut]: #method.peek_mut
+/// [push]: BinaryHeap::push
+/// [pop]: BinaryHeap::pop
+/// [peek]: BinaryHeap::peek
+/// [peek\_mut]: BinaryHeap::peek_mut
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct BinaryHeap<T> {
     data: Vec<T>,
@@ -255,8 +257,7 @@ pub struct BinaryHeap<T> {
 /// This `struct` is created by the [`peek_mut`] method on [`BinaryHeap`]. See
 /// its documentation for more.
 ///
-/// [`peek_mut`]: struct.BinaryHeap.html#method.peek_mut
-/// [`BinaryHeap`]: struct.BinaryHeap.html
+/// [`peek_mut`]: BinaryHeap::peek_mut
 #[stable(feature = "binary_heap_peek_mut", since = "1.12.0")]
 pub struct PeekMut<'a, T: 'a + Ord> {
     heap: &'a mut BinaryHeap<T>,
@@ -293,6 +294,7 @@ impl<T: Ord> Deref for PeekMut<'_, T> {
 impl<T: Ord> DerefMut for PeekMut<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         debug_assert!(!self.heap.is_empty());
+        self.sift = true;
         // SAFE: PeekMut is only instantiated for non-empty heaps
         unsafe { self.heap.data.get_unchecked_mut(0) }
     }
@@ -398,10 +400,11 @@ impl<T: Ord> BinaryHeap<T> {
     ///
     /// # Time complexity
     ///
-    /// Cost is *O*(1) in the worst case.
+    /// If the item is modified then the worst case time complexity is *O*(log(*n*)),
+    /// otherwise it's *O*(1).
     #[stable(feature = "binary_heap_peek_mut", since = "1.12.0")]
     pub fn peek_mut(&mut self) -> Option<PeekMut<'_, T>> {
-        if self.is_empty() { None } else { Some(PeekMut { heap: self, sift: true }) }
+        if self.is_empty() { None } else { Some(PeekMut { heap: self, sift: false }) }
     }
 
     /// Removes the greatest item from the binary heap and returns it, or `None` if it
@@ -495,7 +498,14 @@ impl<T: Ord> BinaryHeap<T> {
         let mut end = self.len();
         while end > 1 {
             end -= 1;
-            self.data.swap(0, end);
+            // SAFETY: `end` goes from `self.len() - 1` to 1 (both included),
+            //  so it's always a valid index to access.
+            //  It is safe to access index 0 (i.e. `ptr`), because
+            //  1 <= end < self.len(), which means self.len() >= 2.
+            unsafe {
+                let ptr = self.data.as_mut_ptr();
+                ptr::swap(ptr, ptr.add(end));
+            }
             self.sift_down_range(0, end);
         }
         self.into_vec()
@@ -531,18 +541,18 @@ impl<T: Ord> BinaryHeap<T> {
         unsafe {
             let mut hole = Hole::new(&mut self.data, pos);
             let mut child = 2 * pos + 1;
-            while child < end {
-                let right = child + 1;
+            while child < end - 1 {
                 // compare with the greater of the two children
-                if right < end && hole.get(child) <= hole.get(right) {
-                    child = right;
-                }
+                child += (hole.get(child) <= hole.get(child + 1)) as usize;
                 // if we are already in order, stop.
                 if hole.element() >= hole.get(child) {
-                    break;
+                    return;
                 }
                 hole.move_to(child);
                 child = 2 * hole.pos() + 1;
+            }
+            if child == end - 1 && hole.element() < hole.get(child) {
+                hole.move_to(child);
             }
         }
     }
@@ -563,14 +573,13 @@ impl<T: Ord> BinaryHeap<T> {
         unsafe {
             let mut hole = Hole::new(&mut self.data, pos);
             let mut child = 2 * pos + 1;
-            while child < end {
-                let right = child + 1;
-                // compare with the greater of the two children
-                if right < end && hole.get(child) <= hole.get(right) {
-                    child = right;
-                }
+            while child < end - 1 {
+                child += (hole.get(child) <= hole.get(child + 1)) as usize;
                 hole.move_to(child);
                 child = 2 * hole.pos() + 1;
+            }
+            if child == end - 1 {
+                hole.move_to(child);
             }
             pos = hole.pos;
         }
@@ -617,17 +626,23 @@ impl<T: Ord> BinaryHeap<T> {
 
         #[inline(always)]
         fn log2_fast(x: usize) -> usize {
-            8 * size_of::<usize>() - (x.leading_zeros() as usize) - 1
+            (usize::BITS - x.leading_zeros() - 1) as usize
         }
 
         // `rebuild` takes O(len1 + len2) operations
         // and about 2 * (len1 + len2) comparisons in the worst case
         // while `extend` takes O(len2 * log(len1)) operations
         // and about 1 * len2 * log_2(len1) comparisons in the worst case,
-        // assuming len1 >= len2.
+        // assuming len1 >= len2. For larger heaps, the crossover point
+        // no longer follows this reasoning and was determined empirically.
         #[inline]
         fn better_to_rebuild(len1: usize, len2: usize) -> bool {
-            2 * (len1 + len2) < len2 * log2_fast(len1)
+            let tot_len = len1 + len2;
+            if tot_len <= 2048 {
+                2 * tot_len < len2 * log2_fast(len1)
+            } else {
+                2 * tot_len < len2 * 11
+            }
         }
 
         if better_to_rebuild(self.len(), other.len()) {
@@ -802,7 +817,7 @@ impl<T> BinaryHeap<T> {
     /// heap.push(4);
     /// ```
     ///
-    /// [`reserve`]: #method.reserve
+    /// [`reserve`]: BinaryHeap::reserve
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn reserve_exact(&mut self, additional: usize) {
         self.data.reserve_exact(additional);
@@ -909,6 +924,7 @@ impl<T> BinaryHeap<T> {
     ///
     /// assert_eq!(heap.len(), 2);
     /// ```
+    #[doc(alias = "length")]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn len(&self) -> usize {
         self.data.len()
@@ -1036,8 +1052,9 @@ impl<'a, T> Hole<'a, T> {
         debug_assert!(index != self.pos);
         debug_assert!(index < self.data.len());
         unsafe {
-            let index_ptr: *const _ = self.data.get_unchecked(index);
-            let hole_ptr = self.data.get_unchecked_mut(self.pos);
+            let ptr = self.data.as_mut_ptr();
+            let index_ptr: *const _ = ptr.add(index);
+            let hole_ptr = ptr.add(self.pos);
             ptr::copy_nonoverlapping(index_ptr, hole_ptr, 1);
         }
         self.pos = index;
@@ -1057,11 +1074,10 @@ impl<T> Drop for Hole<'_, T> {
 
 /// An iterator over the elements of a `BinaryHeap`.
 ///
-/// This `struct` is created by the [`iter`] method on [`BinaryHeap`]. See its
+/// This `struct` is created by [`BinaryHeap::iter()`]. See its
 /// documentation for more.
 ///
-/// [`iter`]: struct.BinaryHeap.html#method.iter
-/// [`BinaryHeap`]: struct.BinaryHeap.html
+/// [`iter`]: BinaryHeap::iter
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Iter<'a, T: 'a> {
     iter: slice::Iter<'a, T>,
@@ -1122,11 +1138,10 @@ impl<T> FusedIterator for Iter<'_, T> {}
 
 /// An owning iterator over the elements of a `BinaryHeap`.
 ///
-/// This `struct` is created by the [`into_iter`] method on [`BinaryHeap`]
+/// This `struct` is created by [`BinaryHeap::into_iter()`]
 /// (provided by the `IntoIterator` trait). See its documentation for more.
 ///
-/// [`into_iter`]: struct.BinaryHeap.html#method.into_iter
-/// [`BinaryHeap`]: struct.BinaryHeap.html
+/// [`into_iter`]: BinaryHeap::into_iter
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(Clone)]
 pub struct IntoIter<T> {
@@ -1227,11 +1242,10 @@ unsafe impl<T: Ord> TrustedLen for IntoIterSorted<T> {}
 
 /// A draining iterator over the elements of a `BinaryHeap`.
 ///
-/// This `struct` is created by the [`drain`] method on [`BinaryHeap`]. See its
+/// This `struct` is created by [`BinaryHeap::drain()`]. See its
 /// documentation for more.
 ///
-/// [`drain`]: struct.BinaryHeap.html#method.drain
-/// [`BinaryHeap`]: struct.BinaryHeap.html
+/// [`drain`]: BinaryHeap::drain
 #[stable(feature = "drain", since = "1.6.0")]
 #[derive(Debug)]
 pub struct Drain<'a, T: 'a> {
@@ -1273,11 +1287,10 @@ impl<T> FusedIterator for Drain<'_, T> {}
 
 /// A draining iterator over the elements of a `BinaryHeap`.
 ///
-/// This `struct` is created by the [`drain_sorted`] method on [`BinaryHeap`]. See its
+/// This `struct` is created by [`BinaryHeap::drain_sorted()`]. See its
 /// documentation for more.
 ///
-/// [`drain_sorted`]: struct.BinaryHeap.html#method.drain_sorted
-/// [`BinaryHeap`]: struct.BinaryHeap.html
+/// [`drain_sorted`]: BinaryHeap::drain_sorted
 #[unstable(feature = "binary_heap_drain_sorted", issue = "59278")]
 #[derive(Debug)]
 pub struct DrainSorted<'a, T: Ord> {

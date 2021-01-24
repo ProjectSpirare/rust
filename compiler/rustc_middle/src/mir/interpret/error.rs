@@ -1,4 +1,4 @@
-use super::{AllocId, Pointer, RawConst, Scalar};
+use super::{AllocId, ConstAlloc, Pointer, Scalar};
 
 use crate::mir::interpret::ConstValue;
 use crate::ty::{layout, query::TyCtxtAt, tls, FnSig, Ty};
@@ -23,12 +23,18 @@ pub enum ErrorHandled {
     TooGeneric,
 }
 
-CloneTypeFoldableAndLiftImpls! {
+impl From<ErrorReported> for ErrorHandled {
+    fn from(err: ErrorReported) -> ErrorHandled {
+        ErrorHandled::Reported(err)
+    }
+}
+
+TrivialTypeFoldableAndLiftImpls! {
     ErrorHandled,
 }
 
-pub type ConstEvalRawResult<'tcx> = Result<RawConst<'tcx>, ErrorHandled>;
-pub type ConstEvalResult<'tcx> = Result<ConstValue<'tcx>, ErrorHandled>;
+pub type EvalToAllocationRawResult<'tcx> = Result<ConstAlloc<'tcx>, ErrorHandled>;
+pub type EvalToConstValueResult<'tcx> = Result<ConstValue<'tcx>, ErrorHandled>;
 
 pub fn struct_error<'tcx>(tcx: TyCtxtAt<'tcx>, msg: &str) -> DiagnosticBuilder<'tcx> {
     struct_span_err!(tcx.sess, tcx.span, E0080, "{}", msg)
@@ -75,6 +81,12 @@ impl From<ErrorHandled> for InterpErrorInfo<'_> {
     }
 }
 
+impl From<ErrorReported> for InterpErrorInfo<'_> {
+    fn from(err: ErrorReported) -> Self {
+        InterpError::InvalidProgram(InvalidProgramInfo::AlreadyReported(err)).into()
+    }
+}
+
 impl<'tcx> From<InterpError<'tcx>> for InterpErrorInfo<'tcx> {
     fn from(kind: InterpError<'tcx>) -> Self {
         let capture_backtrace = tls::with_opt(|tcx| {
@@ -109,12 +121,14 @@ pub enum InvalidProgramInfo<'tcx> {
     /// Cannot compute this constant because it depends on another one
     /// which already produced an error.
     ReferencedConstant,
-    /// Abort in case type errors are reached.
-    TypeckError(ErrorReported),
+    /// Abort in case errors are already reported.
+    AlreadyReported(ErrorReported),
     /// An error occurred during layout computation.
     Layout(layout::LayoutError<'tcx>),
     /// An invalid transmute happened.
     TransmuteSizeDiff(Ty<'tcx>, Ty<'tcx>),
+    /// SizeOf of unsized type was requested.
+    SizeOfUnsizedType(Ty<'tcx>),
 }
 
 impl fmt::Display for InvalidProgramInfo<'_> {
@@ -123,7 +137,7 @@ impl fmt::Display for InvalidProgramInfo<'_> {
         match self {
             TooGeneric => write!(f, "encountered overly generic constant"),
             ReferencedConstant => write!(f, "referenced constant has errors"),
-            TypeckError(ErrorReported) => {
+            AlreadyReported(ErrorReported) => {
                 write!(f, "encountered constants with type errors, stopping evaluation")
             }
             Layout(ref err) => write!(f, "{}", err),
@@ -132,6 +146,7 @@ impl fmt::Display for InvalidProgramInfo<'_> {
                 "transmuting `{}` to `{}` is not possible, because these types do not have the same size",
                 from_ty, to_ty
             ),
+            SizeOfUnsizedType(ty) => write!(f, "size_of called on unsized type `{}`", ty),
         }
     }
 }

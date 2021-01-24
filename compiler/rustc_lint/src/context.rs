@@ -19,10 +19,9 @@ use self::TargetLint::*;
 use crate::levels::LintLevelsBuilder;
 use crate::passes::{EarlyLintPassObject, LateLintPassObject};
 use rustc_ast as ast;
-use rustc_ast::util::lev_distance::find_best_match_for_name;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync;
-use rustc_errors::{struct_span_err, Applicability};
+use rustc_errors::{add_elided_lifetime_in_path_suggestion, struct_span_err, Applicability};
 use rustc_hir as hir;
 use rustc_hir::def::Res;
 use rustc_hir::def_id::{CrateNum, DefId};
@@ -33,9 +32,11 @@ use rustc_middle::middle::stability;
 use rustc_middle::ty::layout::{LayoutError, TyAndLayout};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, print::Printer, subst::GenericArg, Ty, TyCtxt};
-use rustc_session::lint::{add_elided_lifetime_in_path_suggestion, BuiltinLintDiagnostics};
+use rustc_session::lint::BuiltinLintDiagnostics;
 use rustc_session::lint::{FutureIncompatibleInfo, Level, Lint, LintBuffer, LintId};
 use rustc_session::Session;
+use rustc_session::SessionLintStore;
+use rustc_span::lev_distance::find_best_match_for_name;
 use rustc_span::{symbol::Symbol, MultiSpan, Span, DUMMY_SP};
 use rustc_target::abi::LayoutOf;
 
@@ -67,6 +68,20 @@ pub struct LintStore {
 
     /// Map of registered lint groups to what lints they expand to.
     lint_groups: FxHashMap<&'static str, LintGroup>,
+}
+
+impl SessionLintStore for LintStore {
+    fn name_to_lint(&self, lint_name: &str) -> LintId {
+        let lints = self
+            .find_lints(lint_name)
+            .unwrap_or_else(|_| panic!("Failed to find lint with name `{}`", lint_name));
+
+        if let &[lint] = lints.as_slice() {
+            return lint;
+        } else {
+            panic!("Found mutliple lints with name `{}`: {:?}", lint_name, lints);
+        }
+    }
 }
 
 /// The target of the `by_name` map, which accounts for renaming/deprecation.
@@ -246,6 +261,7 @@ impl LintStore {
         }
     }
 
+    #[track_caller]
     pub fn register_renamed(&mut self, old_name: &str, new_name: &str) {
         let target = match self.by_name.get(new_name) {
             Some(&Id(lint_id)) => lint_id,
@@ -338,10 +354,23 @@ impl LintStore {
             lint_name.to_string()
         };
         // If the lint was scoped with `tool::` check if the tool lint exists
-        if tool_name.is_some() {
+        if let Some(tool_name) = tool_name {
             match self.by_name.get(&complete_name) {
                 None => match self.lint_groups.get(&*complete_name) {
-                    None => return CheckLintNameResult::Tool(Err((None, String::new()))),
+                    // If the lint isn't registered, there are two possibilities:
+                    None => {
+                        // 1. The tool is currently running, so this lint really doesn't exist.
+                        // FIXME: should this handle tools that never register a lint, like rustfmt?
+                        tracing::debug!("lints={:?}", self.by_name.keys().collect::<Vec<_>>());
+                        let tool_prefix = format!("{}::", tool_name);
+                        return if self.by_name.keys().any(|lint| lint.starts_with(&tool_prefix)) {
+                            self.no_lint_suggestion(&complete_name)
+                        } else {
+                            // 2. The tool isn't currently running, so no lints will be registered.
+                            // To avoid giving a false positive, ignore all unknown lints.
+                            CheckLintNameResult::Tool(Err((None, String::new())))
+                        };
+                    }
                     Some(LintGroup { lint_ids, .. }) => {
                         return CheckLintNameResult::Tool(Ok(&lint_ids));
                     }
@@ -358,7 +387,7 @@ impl LintStore {
                 Some(new_name.to_owned()),
             ),
             Some(&Removed(ref reason)) => CheckLintNameResult::Warning(
-                format!("lint `{}` has been removed: `{}`", complete_name, reason),
+                format!("lint `{}` has been removed: {}", complete_name, reason),
                 None,
             ),
             None => match self.lint_groups.get(&*complete_name) {
@@ -382,6 +411,21 @@ impl LintStore {
         }
     }
 
+    fn no_lint_suggestion(&self, lint_name: &str) -> CheckLintNameResult<'_> {
+        let name_lower = lint_name.to_lowercase();
+        let symbols =
+            self.get_lints().iter().map(|l| Symbol::intern(&l.name_lower())).collect::<Vec<_>>();
+
+        if lint_name.chars().any(char::is_uppercase) && self.find_lints(&name_lower).is_ok() {
+            // First check if the lint name is (partly) in upper case instead of lower case...
+            CheckLintNameResult::NoLint(Some(Symbol::intern(&name_lower)))
+        } else {
+            // ...if not, search for lints with a similar name
+            let suggestion = find_best_match_for_name(&symbols, Symbol::intern(&name_lower), None);
+            CheckLintNameResult::NoLint(suggestion)
+        }
+    }
+
     fn check_tool_name_for_backwards_compat(
         &self,
         lint_name: &str,
@@ -391,18 +435,7 @@ impl LintStore {
         match self.by_name.get(&complete_name) {
             None => match self.lint_groups.get(&*complete_name) {
                 // Now we are sure, that this lint exists nowhere
-                None => {
-                    let symbols =
-                        self.by_name.keys().map(|name| Symbol::intern(&name)).collect::<Vec<_>>();
-
-                    let suggestion = find_best_match_for_name(
-                        symbols.iter(),
-                        Symbol::intern(&lint_name.to_lowercase()),
-                        None,
-                    );
-
-                    CheckLintNameResult::NoLint(suggestion)
-                }
+                None => self.no_lint_suggestion(lint_name),
                 Some(LintGroup { lint_ids, depr, .. }) => {
                     // Reaching this would be weird, but let's cover this case anyway
                     if let Some(LintAlias { name, silent }) = depr {
@@ -543,7 +576,7 @@ pub trait LintContext: Sized {
                     anon_lts,
                 ) => {
                     add_elided_lifetime_in_path_suggestion(
-                        sess,
+                        sess.source_map(),
                         &mut db,
                         n,
                         path_span,
@@ -580,6 +613,13 @@ pub trait LintContext: Sized {
                     db.span_label(span, "rustdoc does not generate documentation for macro invocations");
                     db.help("to document an item produced by a macro, \
                                   the macro must produce the documentation as part of its expansion");
+                }
+                BuiltinLintDiagnostics::PatternsInFnsWithoutBody(span, ident) => {
+                    db.span_suggestion(span, "remove `mut` from the parameter", ident.to_string(), Applicability::MachineApplicable);
+                }
+                BuiltinLintDiagnostics::MissingAbi(span, default_abi) => {
+                    db.span_label(span, "ABI should be specified here");
+                    db.help(&format!("the default ABI is {}", default_abi.name()));
                 }
             }
             // Rewrap `db`, and pass control to the user.
@@ -711,14 +751,14 @@ impl<'tcx> LateContext<'tcx> {
         }
     }
 
-    pub fn current_lint_root(&self) -> hir::HirId {
-        self.last_node_with_lint_attrs
-    }
-
     /// Check if a `DefId`'s path matches the given absolute type path usage.
     ///
-    /// Anonymous scopes such as `extern` imports are matched with `kw::Invalid`;
+    /// Anonymous scopes such as `extern` imports are matched with `kw::Empty`;
     /// inherent `impl` blocks are matched with the name of the type.
+    ///
+    /// Instead of using this method, it is often preferable to instead use
+    /// `rustc_diagnostic_item` or a `lang_item`. This is less prone to errors
+    /// as paths get invalidated if the target definition moves.
     ///
     /// # Examples
     ///
@@ -771,7 +811,7 @@ impl<'tcx> LateContext<'tcx> {
 
             fn print_dyn_existential(
                 self,
-                _predicates: &'tcx ty::List<ty::ExistentialPredicate<'tcx>>,
+                _predicates: &'tcx ty::List<ty::Binder<ty::ExistentialPredicate<'tcx>>>,
             ) -> Result<Self::DynExistential, Self::Error> {
                 Ok(())
             }
@@ -842,7 +882,7 @@ impl<'tcx> LateContext<'tcx> {
                     return Ok(path);
                 }
 
-                path.push(disambiguated_data.data.as_symbol());
+                path.push(Symbol::intern(&disambiguated_data.data.to_string()));
                 Ok(path)
             }
 

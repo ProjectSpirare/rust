@@ -226,12 +226,14 @@ fn ensure_drop_predicates_are_implied_by_item_defn<'tcx>(
         // could be extended easily also to the other `Predicate`.
         let predicate_matches_closure = |p: Predicate<'tcx>| {
             let mut relator: SimpleEqRelation<'tcx> = SimpleEqRelation::new(tcx, self_param_env);
-            match (predicate.skip_binders(), p.skip_binders()) {
-                (ty::PredicateAtom::Trait(a, _), ty::PredicateAtom::Trait(b, _)) => {
-                    relator.relate(ty::Binder::bind(a), ty::Binder::bind(b)).is_ok()
+            let predicate = predicate.kind();
+            let p = p.kind();
+            match (predicate.skip_binder(), p.skip_binder()) {
+                (ty::PredicateKind::Trait(a, _), ty::PredicateKind::Trait(b, _)) => {
+                    relator.relate(predicate.rebind(a), p.rebind(b)).is_ok()
                 }
-                (ty::PredicateAtom::Projection(a), ty::PredicateAtom::Projection(b)) => {
-                    relator.relate(ty::Binder::bind(a), ty::Binder::bind(b)).is_ok()
+                (ty::PredicateKind::Projection(a), ty::PredicateKind::Projection(b)) => {
+                    relator.relate(predicate.rebind(a), p.rebind(b)).is_ok()
                 }
                 _ => predicate == p,
             }
@@ -265,15 +267,13 @@ crate fn check_drop_obligations<'a, 'tcx>(
     ty: Ty<'tcx>,
     span: Span,
     body_id: hir::HirId,
-) -> Result<(), ErrorReported> {
+) {
     debug!("check_drop_obligations typ: {:?}", ty);
 
     let cause = &ObligationCause::misc(span, body_id);
     let infer_ok = rcx.infcx.at(cause, rcx.fcx.param_env).dropck_outlives(ty);
     debug!("dropck_outlives = {:#?}", infer_ok);
     rcx.fcx.register_infer_ok_obligations(infer_ok);
-
-    Ok(())
 }
 
 // This is an implementation of the TypeRelation trait with the
@@ -364,8 +364,8 @@ impl TypeRelation<'tcx> for SimpleEqRelation<'tcx> {
 
         // Anonymizing the LBRs is necessary to solve (Issue #59497).
         // After we do so, it should be totally fine to skip the binders.
-        let anon_a = self.tcx.anonymize_late_bound_regions(&a);
-        let anon_b = self.tcx.anonymize_late_bound_regions(&b);
+        let anon_a = self.tcx.anonymize_late_bound_regions(a);
+        let anon_b = self.tcx.anonymize_late_bound_regions(b);
         self.relate(anon_a.skip_binder(), anon_b.skip_binder())?;
 
         Ok(a)

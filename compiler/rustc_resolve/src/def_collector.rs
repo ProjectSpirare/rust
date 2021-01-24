@@ -1,5 +1,4 @@
 use crate::Resolver;
-use rustc_ast::token::{self, Token};
 use rustc_ast::visit::{self, FnKind};
 use rustc_ast::walk_list;
 use rustc_ast::*;
@@ -75,7 +74,8 @@ impl<'a, 'b> visit::Visitor<'a> for DefCollector<'a, 'b> {
         // information we encapsulate into, the better
         let def_data = match &i.kind {
             ItemKind::Impl { .. } => DefPathData::Impl,
-            ItemKind::Mod(..) if i.ident.name == kw::Invalid => {
+            ItemKind::Mod(..) if i.ident.name == kw::Empty => {
+                // Fake crate root item from expand.
                 return visit::walk_item(self, i);
             }
             ItemKind::Mod(..)
@@ -91,7 +91,10 @@ impl<'a, 'b> visit::Visitor<'a> for DefCollector<'a, 'b> {
                 DefPathData::ValueNs(i.ident.name)
             }
             ItemKind::MacroDef(..) => DefPathData::MacroNs(i.ident.name),
-            ItemKind::MacCall(..) => return self.visit_macro_invoc(i.id),
+            ItemKind::MacCall(..) => {
+                visit::walk_item(self, i);
+                return self.visit_macro_invoc(i.id);
+            }
             ItemKind::GlobalAsm(..) => DefPathData::Misc,
             ItemKind::Use(..) => {
                 return visit::walk_item(self, i);
@@ -239,29 +242,19 @@ impl<'a, 'b> visit::Visitor<'a> for DefCollector<'a, 'b> {
 
     fn visit_ty(&mut self, ty: &'a Ty) {
         match ty.kind {
-            TyKind::MacCall(..) => return self.visit_macro_invoc(ty.id),
+            TyKind::MacCall(..) => self.visit_macro_invoc(ty.id),
             TyKind::ImplTrait(node_id, _) => {
-                self.create_def(node_id, DefPathData::ImplTrait, ty.span);
+                let parent_def = self.create_def(node_id, DefPathData::ImplTrait, ty.span);
+                self.with_parent(parent_def, |this| visit::walk_ty(this, ty));
             }
-            _ => {}
+            _ => visit::walk_ty(self, ty),
         }
-        visit::walk_ty(self, ty);
     }
 
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         match stmt.kind {
             StmtKind::MacCall(..) => self.visit_macro_invoc(stmt.id),
             _ => visit::walk_stmt(self, stmt),
-        }
-    }
-
-    fn visit_token(&mut self, t: Token) {
-        if let token::Interpolated(nt) = t.kind {
-            if let token::NtExpr(ref expr) = *nt {
-                if let ExprKind::MacCall(..) = expr.kind {
-                    self.visit_macro_invoc(expr.id);
-                }
-            }
         }
     }
 

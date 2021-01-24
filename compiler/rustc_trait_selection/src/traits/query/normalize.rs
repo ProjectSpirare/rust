@@ -7,6 +7,7 @@ use crate::infer::canonical::OriginalQueryValues;
 use crate::infer::{InferCtxt, InferOk};
 use crate::traits::error_reporting::InferCtxtExt;
 use crate::traits::{Obligation, ObligationCause, PredicateObligation, Reveal};
+use rustc_data_structures::sso::SsoHashMap;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_infer::traits::Normalized;
 use rustc_middle::ty::fold::{TypeFoldable, TypeFolder};
@@ -18,7 +19,7 @@ use super::NoSolution;
 pub use rustc_middle::traits::query::NormalizationResult;
 
 pub trait AtExt<'tcx> {
-    fn normalize<T>(&self, value: &T) -> Result<Normalized<'tcx, T>, NoSolution>
+    fn normalize<T>(&self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
     where
         T: TypeFoldable<'tcx>;
 }
@@ -37,18 +38,18 @@ impl<'cx, 'tcx> AtExt<'tcx> for At<'cx, 'tcx> {
     /// normalizing, but for now should be used only when we actually
     /// know that normalization will succeed, since error reporting
     /// and other details are still "under development".
-    fn normalize<T>(&self, value: &T) -> Result<Normalized<'tcx, T>, NoSolution>
+    fn normalize<T>(&self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
     where
         T: TypeFoldable<'tcx>,
     {
         debug!(
             "normalize::<{}>(value={:?}, param_env={:?})",
-            ::std::any::type_name::<T>(),
+            std::any::type_name::<T>(),
             value,
             self.param_env,
         );
         if !value.has_projections() {
-            return Ok(Normalized { value: value.clone(), obligations: vec![] });
+            return Ok(Normalized { value, obligations: vec![] });
         }
 
         let mut normalizer = QueryNormalizer {
@@ -57,19 +58,20 @@ impl<'cx, 'tcx> AtExt<'tcx> for At<'cx, 'tcx> {
             param_env: self.param_env,
             obligations: vec![],
             error: false,
+            cache: SsoHashMap::new(),
             anon_depth: 0,
         };
 
         let result = value.fold_with(&mut normalizer);
         debug!(
             "normalize::<{}>: result={:?} with {} obligations",
-            ::std::any::type_name::<T>(),
+            std::any::type_name::<T>(),
             result,
             normalizer.obligations.len(),
         );
         debug!(
             "normalize::<{}>: obligations={:?}",
-            ::std::any::type_name::<T>(),
+            std::any::type_name::<T>(),
             normalizer.obligations,
         );
         if normalizer.error {
@@ -85,6 +87,7 @@ struct QueryNormalizer<'cx, 'tcx> {
     cause: &'cx ObligationCause<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     obligations: Vec<PredicateObligation<'tcx>>,
+    cache: SsoHashMap<Ty<'tcx>, Ty<'tcx>>,
     error: bool,
     anon_depth: usize,
 }
@@ -94,14 +97,19 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
         self.infcx.tcx
     }
 
+    #[instrument(skip(self))]
     fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
         if !ty.has_projections() {
             return ty;
         }
 
+        if let Some(ty) = self.cache.get(&ty) {
+            return ty;
+        }
+
         let ty = ty.super_fold_with(self);
-        match *ty.kind() {
-            ty::Opaque(def_id, substs) => {
+        let res = (|| match *ty.kind() {
+            ty::Opaque(def_id, substs) if !substs.has_escaping_bound_vars() => {
                 // Only normalize `impl Trait` after type-checking, usually in codegen.
                 match self.param_env.reveal() {
                     Reveal::UserFacing => ty,
@@ -138,7 +146,7 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
                 }
             }
 
-            ty::Projection(ref data) if !data.has_escaping_bound_vars() => {
+            ty::Projection(data) if !data.has_escaping_bound_vars() => {
                 // This is kind of hacky -- we need to be able to
                 // handle normalization within binders because
                 // otherwise we wind up a need to normalize when doing
@@ -158,7 +166,7 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
                 // so we cannot canonicalize it.
                 let c_data = self
                     .infcx
-                    .canonicalize_hr_query_hack(&self.param_env.and(*data), &mut orig_values);
+                    .canonicalize_hr_query_hack(self.param_env.and(data), &mut orig_values);
                 debug!("QueryNormalizer: c_data = {:#?}", c_data);
                 debug!("QueryNormalizer: orig_values = {:#?}", orig_values);
                 match tcx.normalize_projection_ty(c_data) {
@@ -173,7 +181,7 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
                             self.cause,
                             self.param_env,
                             &orig_values,
-                            &result,
+                            result,
                         ) {
                             Ok(InferOk { value: result, obligations }) => {
                                 debug!("QueryNormalizer: result = {:#?}", result);
@@ -197,7 +205,9 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
             }
 
             _ => ty,
-        }
+        })();
+        self.cache.insert(ty, res);
+        res
     }
 
     fn fold_const(&mut self, constant: &'tcx ty::Const<'tcx>) -> &'tcx ty::Const<'tcx> {

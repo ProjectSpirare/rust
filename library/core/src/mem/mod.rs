@@ -4,6 +4,7 @@
 //! types, initializing and manipulating memory.
 
 #![stable(feature = "rust1", since = "1.0.0")]
+#![cfg_attr(bootstrap, allow(unused_unsafe))]
 
 use crate::clone;
 use crate::cmp;
@@ -151,9 +152,14 @@ pub const fn forget<T>(t: T) {
 #[inline]
 #[unstable(feature = "forget_unsized", issue = "none")]
 pub fn forget_unsized<T: ?Sized>(t: T) {
+    #[cfg(bootstrap)]
     // SAFETY: the forget intrinsic could be safe, but there's no point in making it safe since
     // we'll be implementing this function soon via `ManuallyDrop`
-    unsafe { intrinsics::forget(t) }
+    unsafe {
+        intrinsics::forget(t)
+    }
+    #[cfg(not(bootstrap))]
+    intrinsics::forget(t)
 }
 
 /// Returns the size of a type in bytes.
@@ -328,7 +334,8 @@ pub const fn size_of<T>() -> usize {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_size_of_val", issue = "46571")]
 pub const fn size_of_val<T: ?Sized>(val: &T) -> usize {
-    intrinsics::size_of_val(val)
+    // SAFETY: `val` is a reference, so it's a valid raw pointer
+    unsafe { intrinsics::size_of_val(val) }
 }
 
 /// Returns the size of the pointed-to value in bytes.
@@ -374,8 +381,10 @@ pub const fn size_of_val<T: ?Sized>(val: &T) -> usize {
 /// ```
 #[inline]
 #[unstable(feature = "layout_for_ptr", issue = "69835")]
-pub unsafe fn size_of_val_raw<T: ?Sized>(val: *const T) -> usize {
-    intrinsics::size_of_val(val)
+#[rustc_const_unstable(feature = "const_size_of_val_raw", issue = "46571")]
+pub const unsafe fn size_of_val_raw<T: ?Sized>(val: *const T) -> usize {
+    // SAFETY: the caller must provide a valid raw pointer
+    unsafe { intrinsics::size_of_val(val) }
 }
 
 /// Returns the [ABI]-required minimum alignment of a type.
@@ -419,7 +428,8 @@ pub fn min_align_of<T>() -> usize {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_deprecated(reason = "use `align_of_val` instead", since = "1.2.0")]
 pub fn min_align_of_val<T: ?Sized>(val: &T) -> usize {
-    intrinsics::min_align_of_val(val)
+    // SAFETY: val is a reference, so it's a valid raw pointer
+    unsafe { intrinsics::min_align_of_val(val) }
 }
 
 /// Returns the [ABI]-required minimum alignment of a type.
@@ -463,7 +473,8 @@ pub const fn align_of<T>() -> usize {
 #[rustc_const_unstable(feature = "const_align_of_val", issue = "46571")]
 #[allow(deprecated)]
 pub const fn align_of_val<T: ?Sized>(val: &T) -> usize {
-    intrinsics::min_align_of_val(val)
+    // SAFETY: val is a reference, so it's a valid raw pointer
+    unsafe { intrinsics::min_align_of_val(val) }
 }
 
 /// Returns the [ABI]-required minimum alignment of the type of the value that `val` points to.
@@ -505,8 +516,10 @@ pub const fn align_of_val<T: ?Sized>(val: &T) -> usize {
 /// ```
 #[inline]
 #[unstable(feature = "layout_for_ptr", issue = "69835")]
-pub unsafe fn align_of_val_raw<T: ?Sized>(val: *const T) -> usize {
-    intrinsics::min_align_of_val(val)
+#[rustc_const_unstable(feature = "const_align_of_val_raw", issue = "46571")]
+pub const unsafe fn align_of_val_raw<T: ?Sized>(val: *const T) -> usize {
+    // SAFETY: the caller must provide a valid raw pointer
+    unsafe { intrinsics::min_align_of_val(val) }
 }
 
 /// Returns `true` if dropping values of type `T` matters.
@@ -568,6 +581,7 @@ pub unsafe fn align_of_val_raw<T: ?Sized>(val: *const T) -> usize {
 #[inline]
 #[stable(feature = "needs_drop", since = "1.21.0")]
 #[rustc_const_stable(feature = "const_needs_drop", since = "1.36.0")]
+#[rustc_diagnostic_item = "needs_drop"]
 pub const fn needs_drop<T>() -> bool {
     intrinsics::needs_drop::<T>()
 }
@@ -642,7 +656,6 @@ pub unsafe fn zeroed<T>() -> T {
 /// (Notice that the rules around uninitialized integers are not finalized yet, but
 /// until they are, it is advisable to avoid them.)
 ///
-/// [`MaybeUninit<T>`]: MaybeUninit
 /// [uninit]: MaybeUninit::uninit
 /// [assume_init]: MaybeUninit::assume_init
 /// [inv]: MaybeUninit#initialization-invariant
@@ -883,10 +896,10 @@ pub fn drop<T>(_x: T) {}
 /// Interprets `src` as having type `&U`, and then reads `src` without moving
 /// the contained value.
 ///
-/// This function will unsafely assume the pointer `src` is valid for
-/// [`size_of::<U>`][size_of] bytes by transmuting `&T` to `&U` and then reading
-/// the `&U`. It will also unsafely create a copy of the contained value instead of
-/// moving out of `src`.
+/// This function will unsafely assume the pointer `src` is valid for [`size_of::<U>`][size_of]
+/// bytes by transmuting `&T` to `&U` and then reading the `&U` (except that this is done in a way
+/// that is correct even when `&U` makes stricter alignment requirements than `&T`). It will also
+/// unsafely create a copy of the contained value instead of moving out of `src`.
 ///
 /// It is not a compile-time error if `T` and `U` have different sizes, but it
 /// is highly encouraged to only invoke this function where `T` and `U` have the

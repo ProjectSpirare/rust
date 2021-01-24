@@ -14,12 +14,17 @@
 //! A few exceptions are allowed as there's known bugs in rustdoc, but this
 //! should catch the majority of "broken link" cases.
 
+#![feature(str_split_once)]
+
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 use crate::Redirect::*;
 
@@ -32,16 +37,7 @@ const LINKCHECK_EXCEPTIONS: &[(&str, &[&str])] = &[
     // in intra-doc links (primitive impls are weird)
     // https://github.com/rust-lang/rust/issues/62834 is necessary to be
     // able to link to slices
-    (
-        "std/io/struct.IoSlice.html",
-        &[
-            "#method.as_mut_ptr",
-            "#method.sort_by_key",
-            "#method.make_ascii_uppercase",
-            "#method.make_ascii_lowercase",
-            "#method.get_unchecked_mut",
-        ],
-    ),
+    ("std/io/struct.IoSlice.html", &["#method.as_mut_ptr", "#method.sort_by_key"]),
     // These try to link to std::collections, but are defined in alloc
     // https://github.com/rust-lang/rust/issues/74481
     ("std/collections/btree_map/struct.BTreeMap.html", &["#insert-and-complex-keys"]),
@@ -49,6 +45,44 @@ const LINKCHECK_EXCEPTIONS: &[(&str, &[&str])] = &[
     ("alloc/collections/btree_map/struct.BTreeMap.html", &["#insert-and-complex-keys"]),
     ("alloc/collections/btree_set/struct.BTreeSet.html", &["#insert-and-complex-keys"]),
 ];
+
+#[rustfmt::skip]
+const INTRA_DOC_LINK_EXCEPTIONS: &[(&str, &[&str])] = &[
+    // This will never have links that are not in other pages.
+    // To avoid repeating the exceptions twice, an empty list means all broken links are allowed.
+    ("reference/print.html", &[]),
+    // All the reference 'links' are actually ENBF highlighted as code
+    ("reference/comments.html", &[
+         "/</code> <code>!",
+         "*</code> <code>!",
+    ]),
+    ("reference/identifiers.html", &[
+         "a</code>-<code>z</code> <code>A</code>-<code>Z",
+         "a</code>-<code>z</code> <code>A</code>-<code>Z</code> <code>0</code>-<code>9</code> <code>_",
+         "a</code>-<code>z</code> <code>A</code>-<code>Z</code>] [<code>a</code>-<code>z</code> <code>A</code>-<code>Z</code> <code>0</code>-<code>9</code> <code>_",
+    ]),
+    ("reference/tokens.html", &[
+         "0</code>-<code>1",
+         "0</code>-<code>7",
+         "0</code>-<code>9",
+         "0</code>-<code>9",
+         "0</code>-<code>9</code> <code>a</code>-<code>f</code> <code>A</code>-<code>F",
+    ]),
+    ("reference/notation.html", &[
+         "b</code> <code>B",
+         "a</code>-<code>z",
+    ]),
+    // This is being used in the sense of 'inclusive range', not a markdown link
+    ("core/ops/struct.RangeInclusive.html", &["begin</code>, <code>end"]),
+    ("std/ops/struct.RangeInclusive.html", &["begin</code>, <code>end"]),
+    ("core/slice/trait.SliceIndex.html", &["begin</code>, <code>end"]),
+    ("alloc/slice/trait.SliceIndex.html", &["begin</code>, <code>end"]),
+    ("std/slice/trait.SliceIndex.html", &["begin</code>, <code>end"]),
+
+];
+
+static BROKEN_INTRA_DOC_LINK: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"\[<code>(.*)</code>\]"#).unwrap());
 
 macro_rules! t {
     ($e:expr) => {
@@ -138,6 +172,14 @@ fn walk(cache: &mut Cache, root: &Path, dir: &Path, errors: &mut bool) {
     }
 }
 
+fn is_intra_doc_exception(file: &Path, link: &str) -> bool {
+    if let Some(entry) = INTRA_DOC_LINK_EXCEPTIONS.iter().find(|&(f, _)| file.ends_with(f)) {
+        entry.1.is_empty() || entry.1.contains(&link)
+    } else {
+        false
+    }
+}
+
 fn is_exception(file: &Path, link: &str) -> bool {
     if let Some(entry) = LINKCHECK_EXCEPTIONS.iter().find(|&(f, _)| file.ends_with(f)) {
         entry.1.contains(&link)
@@ -183,11 +225,12 @@ fn check(cache: &mut Cache, root: &Path, file: &Path, errors: &mut bool) -> Opti
         {
             return;
         }
-        let mut parts = url.splitn(2, '#');
-        let url = parts.next().unwrap();
-        let fragment = parts.next();
-        let mut parts = url.splitn(2, '?');
-        let url = parts.next().unwrap();
+        let (url, fragment) = match url.split_once('#') {
+            None => (url, None),
+            Some((url, fragment)) => (url, Some(fragment)),
+        };
+        // NB: the `splitn` always succeeds, even if the delimiter is not present.
+        let url = url.splitn(2, '?').next().unwrap();
 
         // Once we've plucked out the URL, parse it using our base url and
         // then try to extract a file path.
@@ -292,6 +335,19 @@ fn check(cache: &mut Cache, root: &Path, file: &Path, errors: &mut bool) -> Opti
             }
         }
     });
+
+    // Search for intra-doc links that rustdoc didn't warn about
+    // FIXME(#77199, 77200) Rustdoc should just warn about these directly.
+    // NOTE: only looks at one line at a time; in practice this should find most links
+    for (i, line) in contents.lines().enumerate() {
+        for broken_link in BROKEN_INTRA_DOC_LINK.captures_iter(line) {
+            if !is_intra_doc_exception(file, &broken_link[1]) {
+                *errors = true;
+                print!("{}:{}: broken intra-doc link - ", pretty_file.display(), i + 1);
+                println!("{}", &broken_link[0]);
+            }
+        }
+    }
     Some(pretty_file)
 }
 

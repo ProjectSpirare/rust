@@ -2,9 +2,7 @@
 
 use crate::ast::{self, Lit, LitKind};
 use crate::token::{self, Token};
-use crate::tokenstream::TokenTree;
 
-use rustc_data_structures::sync::Lrc;
 use rustc_lexer::unescape::{unescape_byte, unescape_char};
 use rustc_lexer::unescape::{unescape_byte_literal, unescape_literal, Mode};
 use rustc_span::symbol::{kw, sym, Symbol};
@@ -89,7 +87,6 @@ impl LitKind {
                             }
                         });
                         error?;
-                        buf.shrink_to_fit();
                         Symbol::intern(&buf)
                     } else {
                         symbol
@@ -107,8 +104,7 @@ impl LitKind {
                     }
                 });
                 error?;
-                buf.shrink_to_fit();
-                LitKind::ByteStr(Lrc::new(buf))
+                LitKind::ByteStr(buf.into())
             }
             token::ByteStrRaw(_) => {
                 let s = symbol.as_str();
@@ -122,13 +118,12 @@ impl LitKind {
                         }
                     });
                     error?;
-                    buf.shrink_to_fit();
                     buf
                 } else {
                     symbol.to_string().into_bytes()
                 };
 
-                LitKind::ByteStr(Lrc::new(bytes))
+                LitKind::ByteStr(bytes.into())
             }
             token::Err => LitKind::Err(symbol),
         })
@@ -226,13 +221,13 @@ impl Lit {
         Lit { token: kind.to_lit_token(), kind, span }
     }
 
-    /// Losslessly convert an AST literal into a token stream.
-    pub fn token_tree(&self) -> TokenTree {
-        let token = match self.token.kind {
+    /// Losslessly convert an AST literal into a token.
+    pub fn to_token(&self) -> Token {
+        let kind = match self.token.kind {
             token::Bool => token::Ident(self.token.symbol, false),
             _ => token::Literal(self.token),
         };
-        TokenTree::token(token, self.span)
+        Token::new(kind, self.span)
     }
 }
 

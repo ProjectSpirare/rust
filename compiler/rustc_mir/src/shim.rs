@@ -33,7 +33,7 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
     let mut result = match instance {
         ty::InstanceDef::Item(..) => bug!("item {:?} passed to make_shim", instance),
         ty::InstanceDef::VtableShim(def_id) => {
-            build_call_shim(tcx, instance, Some(Adjustment::Deref), CallKind::Direct(def_id), None)
+            build_call_shim(tcx, instance, Some(Adjustment::Deref), CallKind::Direct(def_id))
         }
         ty::InstanceDef::FnPtrShim(def_id, ty) => {
             let trait_ = tcx.trait_of_item(def_id).unwrap();
@@ -42,16 +42,8 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
                 Some(ty::ClosureKind::FnMut | ty::ClosureKind::Fn) => Adjustment::Deref,
                 None => bug!("fn pointer {:?} is not an fn", ty),
             };
-            // HACK: we need the "real" argument types for the MIR,
-            // but because our substs are (Self, Args), where Args
-            // is a tuple, we must include the *concrete* argument
-            // types in the MIR. They will be substituted again with
-            // the param-substs, but because they are concrete, this
-            // will not do any harm.
-            let sig = tcx.erase_late_bound_regions(&ty.fn_sig(tcx));
-            let arg_tys = sig.inputs();
 
-            build_call_shim(tcx, instance, Some(adjustment), CallKind::Indirect(ty), Some(arg_tys))
+            build_call_shim(tcx, instance, Some(adjustment), CallKind::Indirect(ty))
         }
         // We are generating a call back to our def-id, which the
         // codegen backend knows to turn to an actual call, be it
@@ -59,7 +51,7 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
         // indirect calls must be codegen'd differently than direct ones
         // (such as `#[track_caller]`).
         ty::InstanceDef::ReifyShim(def_id) => {
-            build_call_shim(tcx, instance, None, CallKind::Direct(def_id), None)
+            build_call_shim(tcx, instance, None, CallKind::Direct(def_id))
         }
         ty::InstanceDef::ClosureOnceShim { call_once: _ } => {
             let fn_mut = tcx.require_lang_item(LangItem::FnMut, None);
@@ -70,13 +62,7 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
                 .unwrap()
                 .def_id;
 
-            build_call_shim(
-                tcx,
-                instance,
-                Some(Adjustment::RefMut),
-                CallKind::Direct(call_mut),
-                None,
-            )
+            build_call_shim(tcx, instance, Some(Adjustment::RefMut), CallKind::Direct(call_mut))
         }
         ty::InstanceDef::DropGlue(def_id, ty) => build_drop_shim(tcx, def_id, ty),
         ty::InstanceDef::CloneShim(def_id, ty) => build_clone_shim(tcx, def_id, ty),
@@ -92,12 +78,10 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
     run_passes(
         tcx,
         &mut result,
-        instance,
-        None,
         MirPhase::Const,
         &[&[
             &add_moves_for_packed_drops::AddMovesForPackedDrops,
-            &no_landing_pads::NoLandingPads::new(tcx),
+            &no_landing_pads::NoLandingPads,
             &remove_noop_landing_pads::RemoveNoopLandingPads,
             &simplify::SimplifyCfg::new("make_shim"),
             &add_call_guards::CriticalCallEdges,
@@ -151,7 +135,7 @@ fn build_drop_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, ty: Option<Ty<'tcx>>)
     // Check if this is a generator, if so, return the drop glue for it
     if let Some(&ty::Generator(gen_def_id, substs, _)) = ty.map(|ty| ty.kind()) {
         let body = &**tcx.optimized_mir(gen_def_id).generator_drop.as_ref().unwrap();
-        return body.subst(tcx, substs);
+        return body.clone().subst(tcx, substs);
     }
 
     let substs = if let Some(ty) = ty {
@@ -160,7 +144,7 @@ fn build_drop_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, ty: Option<Ty<'tcx>>)
         InternalSubsts::identity_for_item(tcx, def_id)
     };
     let sig = tcx.fn_sig(def_id).subst(tcx, substs);
-    let sig = tcx.erase_late_bound_regions(&sig);
+    let sig = tcx.erase_late_bound_regions(sig);
     let span = tcx.def_span(def_id);
 
     let source_info = SourceInfo::outermost(span);
@@ -177,9 +161,11 @@ fn build_drop_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, ty: Option<Ty<'tcx>>)
     block(&mut blocks, TerminatorKind::Goto { target: return_block });
     block(&mut blocks, TerminatorKind::Return);
 
-    let mut body = new_body(blocks, local_decls_for_sig(&sig, span), sig.inputs().len(), span);
+    let source = MirSource::from_instance(ty::InstanceDef::DropGlue(def_id, ty));
+    let mut body =
+        new_body(source, blocks, local_decls_for_sig(&sig, span), sig.inputs().len(), span);
 
-    if let Some(..) = ty {
+    if ty.is_some() {
         // The first argument (index 0), but add 1 for the return value.
         let dropee_ptr = Place::from(Local::new(1 + 0));
         if tcx.sess.opts.debugging_opts.mir_emit_retag {
@@ -216,15 +202,23 @@ fn build_drop_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, ty: Option<Ty<'tcx>>)
 }
 
 fn new_body<'tcx>(
+    source: MirSource<'tcx>,
     basic_blocks: IndexVec<BasicBlock, BasicBlockData<'tcx>>,
     local_decls: IndexVec<Local, LocalDecl<'tcx>>,
     arg_count: usize,
     span: Span,
 ) -> Body<'tcx> {
     Body::new(
+        source,
         basic_blocks,
         IndexVec::from_elem_n(
-            SourceScopeData { span, parent_scope: None, local_data: ClearCrossCrate::Clear },
+            SourceScopeData {
+                span,
+                parent_scope: None,
+                inlined: None,
+                inlined_parent_scope: None,
+                local_data: ClearCrossCrate::Clear,
+            },
             1,
         ),
         local_decls,
@@ -314,10 +308,7 @@ fn build_clone_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, self_ty: Ty<'tcx>) -
 
     match self_ty.kind() {
         _ if is_copy => builder.copy_shim(),
-        ty::Array(ty, len) => {
-            let len = len.eval_usize(tcx, param_env);
-            builder.array_shim(dest, src, ty, len)
-        }
+        ty::Array(ty, len) => builder.array_shim(dest, src, ty, len),
         ty::Closure(_, substs) => {
             builder.tuple_like_shim(dest, src, substs.as_closure().upvar_tys())
         }
@@ -344,7 +335,7 @@ impl CloneShimBuilder<'tcx> {
         // or access fields of a Place of type TySelf.
         let substs = tcx.mk_substs_trait(self_ty, &[]);
         let sig = tcx.fn_sig(def_id).subst(tcx, substs);
-        let sig = tcx.erase_late_bound_regions(&sig);
+        let sig = tcx.erase_late_bound_regions(sig);
         let span = tcx.def_span(def_id);
 
         CloneShimBuilder {
@@ -358,7 +349,11 @@ impl CloneShimBuilder<'tcx> {
     }
 
     fn into_mir(self) -> Body<'tcx> {
-        new_body(self.blocks, self.local_decls, self.sig.inputs().len(), self.span)
+        let source = MirSource::from_instance(ty::InstanceDef::CloneShim(
+            self.def_id,
+            self.sig.inputs_and_output[0],
+        ));
+        new_body(source, self.blocks, self.local_decls, self.sig.inputs().len(), self.span)
     }
 
     fn source_info(&self) -> SourceInfo {
@@ -487,7 +482,13 @@ impl CloneShimBuilder<'tcx> {
         }
     }
 
-    fn array_shim(&mut self, dest: Place<'tcx>, src: Place<'tcx>, ty: Ty<'tcx>, len: u64) {
+    fn array_shim(
+        &mut self,
+        dest: Place<'tcx>,
+        src: Place<'tcx>,
+        ty: Ty<'tcx>,
+        len: &'tcx ty::Const<'tcx>,
+    ) {
         let tcx = self.tcx;
         let span = self.span;
 
@@ -505,7 +506,11 @@ impl CloneShimBuilder<'tcx> {
             ))),
             self.make_statement(StatementKind::Assign(box (
                 end,
-                Rvalue::Use(Operand::Constant(self.make_usize(len))),
+                Rvalue::Use(Operand::Constant(box Constant {
+                    span: self.span,
+                    user_ty: None,
+                    literal: len,
+                })),
             ))),
         ];
         self.block(inits, TerminatorKind::Goto { target: BasicBlock::new(1) }, false);
@@ -641,28 +646,44 @@ impl CloneShimBuilder<'tcx> {
     }
 }
 
-/// Builds a "call" shim for `instance`. The shim calls the
-/// function specified by `call_kind`, first adjusting its first
-/// argument according to `rcvr_adjustment`.
-///
-/// If `untuple_args` is a vec of types, the second argument of the
-/// function will be untupled as these types.
+/// Builds a "call" shim for `instance`. The shim calls the function specified by `call_kind`,
+/// first adjusting its first argument according to `rcvr_adjustment`.
 fn build_call_shim<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: ty::InstanceDef<'tcx>,
     rcvr_adjustment: Option<Adjustment>,
     call_kind: CallKind<'tcx>,
-    untuple_args: Option<&[Ty<'tcx>]>,
 ) -> Body<'tcx> {
     debug!(
-        "build_call_shim(instance={:?}, rcvr_adjustment={:?}, \
-            call_kind={:?}, untuple_args={:?})",
-        instance, rcvr_adjustment, call_kind, untuple_args
+        "build_call_shim(instance={:?}, rcvr_adjustment={:?}, call_kind={:?})",
+        instance, rcvr_adjustment, call_kind
     );
+
+    // `FnPtrShim` contains the fn pointer type that a call shim is being built for - this is used
+    // to substitute into the signature of the shim. It is not necessary for users of this
+    // MIR body to perform further substitutions (see `InstanceDef::has_polymorphic_mir_body`).
+    let (sig_substs, untuple_args) = if let ty::InstanceDef::FnPtrShim(_, ty) = instance {
+        let sig = tcx.erase_late_bound_regions(ty.fn_sig(tcx));
+
+        let untuple_args = sig.inputs();
+
+        // Create substitutions for the `Self` and `Args` generic parameters of the shim body.
+        let arg_tup = tcx.mk_tup(untuple_args.iter());
+        let sig_substs = tcx.mk_substs_trait(ty, &[ty::subst::GenericArg::from(arg_tup)]);
+
+        (Some(sig_substs), Some(untuple_args))
+    } else {
+        (None, None)
+    };
 
     let def_id = instance.def_id();
     let sig = tcx.fn_sig(def_id);
-    let mut sig = tcx.erase_late_bound_regions(&sig);
+    let mut sig = tcx.erase_late_bound_regions(sig);
+
+    assert_eq!(sig_substs.is_some(), !instance.has_polymorphic_mir_body());
+    if let Some(sig_substs) = sig_substs {
+        sig = sig.subst(tcx, sig_substs);
+    }
 
     if let CallKind::Indirect(fnty) = call_kind {
         // `sig` determines our local decls, and thus the callee type in the `Call` terminator. This
@@ -832,7 +853,8 @@ fn build_call_shim<'tcx>(
         block(&mut blocks, vec![], TerminatorKind::Resume, true);
     }
 
-    let mut body = new_body(blocks, local_decls, sig.inputs().len(), span);
+    let mut body =
+        new_body(MirSource::from_instance(instance), blocks, local_decls, sig.inputs().len(), span);
 
     if let Abi::RustCall = sig.abi {
         body.spread_arg = Some(Local::new(sig.inputs().len()));
@@ -895,18 +917,16 @@ pub fn build_adt_ctor(tcx: TyCtxt<'_>, ctor_id: DefId) -> Body<'_> {
         is_cleanup: false,
     };
 
-    let body =
-        new_body(IndexVec::from_elem_n(start_block, 1), local_decls, sig.inputs().len(), span);
-
-    crate::util::dump_mir(
-        tcx,
-        None,
-        "mir_map",
-        &0,
-        crate::transform::MirSource::item(ctor_id),
-        &body,
-        |_, _| Ok(()),
+    let source = MirSource::item(ctor_id);
+    let body = new_body(
+        source,
+        IndexVec::from_elem_n(start_block, 1),
+        local_decls,
+        sig.inputs().len(),
+        span,
     );
+
+    crate::util::dump_mir(tcx, None, "mir_map", &0, &body, |_, _| Ok(()));
 
     body
 }

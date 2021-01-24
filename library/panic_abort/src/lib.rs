@@ -12,14 +12,15 @@
 #![panic_runtime]
 #![allow(unused_features)]
 #![feature(core_intrinsics)]
-#![feature(libc)]
 #![feature(nll)]
 #![feature(panic_runtime)]
+#![feature(std_internals)]
 #![feature(staged_api)]
 #![feature(rustc_attrs)]
 #![feature(asm)]
 
 use core::any::Any;
+use core::panic::BoxMeUp;
 
 #[rustc_std_internal_symbol]
 #[allow(improper_ctypes_definitions)]
@@ -29,11 +30,11 @@ pub unsafe extern "C" fn __rust_panic_cleanup(_: *mut u8) -> *mut (dyn Any + Sen
 
 // "Leak" the payload and shim to the relevant abort on the platform in question.
 #[rustc_std_internal_symbol]
-pub unsafe extern "C" fn __rust_start_panic(_payload: usize) -> u32 {
+pub unsafe extern "C" fn __rust_start_panic(_payload: *mut &mut dyn BoxMeUp) -> u32 {
     abort();
 
     cfg_if::cfg_if! {
-        if #[cfg(any(unix, target_os = "cloudabi"))] {
+        if #[cfg(unix)] {
             unsafe fn abort() -> ! {
                 libc::abort();
             }
@@ -47,7 +48,7 @@ pub unsafe extern "C" fn __rust_start_panic(_payload: usize) -> u32 {
                 }
                 __rust_abort();
             }
-        } else if #[cfg(windows)] {
+        } else if #[cfg(all(windows, not(miri)))] {
             // On Windows, use the processor-specific __fastfail mechanism. In Windows 8
             // and later, this will terminate the process immediately without running any
             // in-process exception handlers. In earlier versions of Windows, this

@@ -37,7 +37,9 @@ use super::map::{map_try_reserve_error, RandomState};
 /// item's hash, as determined by the [`Hash`] trait, or its equality, as
 /// determined by the [`Eq`] trait, changes while it is in the set. This is
 /// normally only possible through [`Cell`], [`RefCell`], global state, I/O, or
-/// unsafe code.
+/// unsafe code. The behavior resulting from such a logic error is not
+/// specified, but will not result in undefined behavior. This could include
+/// panics, incorrect results, aborts, memory leaks, and non-termination.
 ///
 /// # Examples
 ///
@@ -106,7 +108,6 @@ use super::map::{map_try_reserve_error, RandomState};
 /// [`HashMap`]: crate::collections::HashMap
 /// [`RefCell`]: crate::cell::RefCell
 /// [`Cell`]: crate::cell::Cell
-#[derive(Clone)]
 #[cfg_attr(not(test), rustc_diagnostic_item = "hashset_type")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct HashSet<T, S = RandomState> {
@@ -200,6 +201,7 @@ impl<T, S> HashSet<T, S> {
     /// v.insert(1);
     /// assert_eq!(v.len(), 1);
     /// ```
+    #[doc(alias = "length")]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn len(&self) -> usize {
@@ -412,7 +414,7 @@ where
     }
 
     /// Tries to reserve capacity for at least `additional` more elements to be inserted
-    /// in the given `HashSet<K,V>`. The collection may reserve more space to avoid
+    /// in the given `HashSet<K, V>`. The collection may reserve more space to avoid
     /// frequent reallocations.
     ///
     /// # Errors
@@ -918,7 +920,7 @@ where
     /// ```
     /// use std::collections::HashSet;
     ///
-    /// let xs = [1,2,3,4,5,6];
+    /// let xs = [1, 2, 3, 4, 5, 6];
     /// let mut set: HashSet<i32> = xs.iter().cloned().collect();
     /// set.retain(|&k| k % 2 == 0);
     /// assert_eq!(set.len(), 3);
@@ -929,6 +931,23 @@ where
         F: FnMut(&T) -> bool,
     {
         self.base.retain(f)
+    }
+}
+
+#[stable(feature = "rust1", since = "1.0.0")]
+impl<T, S> Clone for HashSet<T, S>
+where
+    T: Clone,
+    S: Clone,
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { base: self.base.clone() }
+    }
+
+    #[inline]
+    fn clone_from(&mut self, other: &Self) {
+        self.base.clone_from(&other.base);
     }
 }
 
@@ -1173,6 +1192,16 @@ where
 /// See its documentation for more.
 ///
 /// [`iter`]: HashSet::iter
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashSet;
+///
+/// let a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
+///
+/// let mut iter = a.iter();
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Iter<'a, K: 'a> {
     base: base::Iter<'a, K>,
@@ -1184,6 +1213,16 @@ pub struct Iter<'a, K: 'a> {
 /// (provided by the `IntoIterator` trait). See its documentation for more.
 ///
 /// [`into_iter`]: IntoIterator::into_iter
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashSet;
+///
+/// let a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
+///
+/// let mut iter = a.into_iter();
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct IntoIter<K> {
     base: base::IntoIter<K>,
@@ -1195,6 +1234,16 @@ pub struct IntoIter<K> {
 /// See its documentation for more.
 ///
 /// [`drain`]: HashSet::drain
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashSet;
+///
+/// let mut a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
+///
+/// let mut drain = a.drain();
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Drain<'a, K: 'a> {
     base: base::Drain<'a, K>,
@@ -1205,6 +1254,18 @@ pub struct Drain<'a, K: 'a> {
 /// This `struct` is created by the [`drain_filter`] method on [`HashSet`].
 ///
 /// [`drain_filter`]: HashSet::drain_filter
+///
+/// # Examples
+///
+/// ```
+/// #![feature(hash_drain_filter)]
+///
+/// use std::collections::HashSet;
+///
+/// let mut a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
+///
+/// let mut drain_filtered = a.drain_filter(|v| v % 2 == 0);
+/// ```
 #[unstable(feature = "hash_drain_filter", issue = "59618")]
 pub struct DrainFilter<'a, K, F>
 where
@@ -1219,6 +1280,17 @@ where
 /// See its documentation for more.
 ///
 /// [`intersection`]: HashSet::intersection
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashSet;
+///
+/// let a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
+/// let b: HashSet<_> = [4, 2, 3, 4].iter().cloned().collect();
+///
+/// let mut intersection = a.intersection(&b);
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Intersection<'a, T: 'a, S: 'a> {
     // iterator of the first set
@@ -1233,6 +1305,17 @@ pub struct Intersection<'a, T: 'a, S: 'a> {
 /// See its documentation for more.
 ///
 /// [`difference`]: HashSet::difference
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashSet;
+///
+/// let a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
+/// let b: HashSet<_> = [4, 2, 3, 4].iter().cloned().collect();
+///
+/// let mut difference = a.difference(&b);
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Difference<'a, T: 'a, S: 'a> {
     // iterator of the first set
@@ -1247,6 +1330,17 @@ pub struct Difference<'a, T: 'a, S: 'a> {
 /// [`HashSet`]. See its documentation for more.
 ///
 /// [`symmetric_difference`]: HashSet::symmetric_difference
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashSet;
+///
+/// let a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
+/// let b: HashSet<_> = [4, 2, 3, 4].iter().cloned().collect();
+///
+/// let mut intersection = a.symmetric_difference(&b);
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct SymmetricDifference<'a, T: 'a, S: 'a> {
     iter: Chain<Difference<'a, T, S>, Difference<'a, T, S>>,
@@ -1258,6 +1352,17 @@ pub struct SymmetricDifference<'a, T: 'a, S: 'a> {
 /// See its documentation for more.
 ///
 /// [`union`]: HashSet::union
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashSet;
+///
+/// let a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
+/// let b: HashSet<_> = [4, 2, 3, 4].iter().cloned().collect();
+///
+/// let mut union_iter = a.union(&b);
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Union<'a, T: 'a, S: 'a> {
     iter: Chain<Iter<'a, T>, Difference<'a, T, S>>,

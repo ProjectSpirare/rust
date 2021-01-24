@@ -1,10 +1,11 @@
 use crate::consts::{constant_context, Constant};
-use crate::utils::{in_macro, is_type_diagnostic_item, snippet, span_lint_and_sugg, walk_ptrs_ty};
+use crate::utils::{in_macro, is_type_diagnostic_item, snippet, span_lint_and_sugg};
 use if_chain::if_chain;
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_span::sym;
 
 declare_clippy_lint! {
     /// **What it does:** Checks for usage of `.repeat(1)` and suggest the following method for each types.
@@ -44,7 +45,7 @@ impl<'tcx> LateLintPass<'tcx> for RepeatOnce {
             if let Some(Constant::Int(1)) = constant_context(cx, cx.typeck_results()).expr(&count);
             if !in_macro(receiver.span);
             then {
-                let ty = walk_ptrs_ty(cx.typeck_results().expr_ty(&receiver));
+                let ty = cx.typeck_results().expr_ty(&receiver).peel_refs();
                 if ty.is_str() {
                     span_lint_and_sugg(
                         cx,
@@ -65,7 +66,7 @@ impl<'tcx> LateLintPass<'tcx> for RepeatOnce {
                         format!("{}.to_vec()", snippet(cx, receiver.span, r#""...""#)),
                         Applicability::MachineApplicable,
                     );
-                } else if is_type_diagnostic_item(cx, ty, sym!(string_type)) {
+                } else if is_type_diagnostic_item(cx, ty, sym::string_type) {
                     span_lint_and_sugg(
                         cx,
                         REPEAT_ONCE,

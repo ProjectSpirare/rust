@@ -1,5 +1,3 @@
-#![allow(non_camel_case_types)]
-
 pub use self::FileMatch::*;
 
 use std::borrow::Cow;
@@ -78,7 +76,7 @@ impl<'a> FileSearch<'a> {
     pub fn new(
         sysroot: &'a Path,
         triple: &'a str,
-        search_paths: &'a Vec<SearchPath>,
+        search_paths: &'a [SearchPath],
         tlib_path: &'a SearchPath,
         kind: PathKind,
     ) -> FileSearch<'a> {
@@ -155,14 +153,14 @@ fn find_libdir(sysroot: &Path) -> Cow<'static, str> {
     const SECONDARY_LIB_DIR: &str = "lib";
 
     match option_env!("CFG_LIBDIR_RELATIVE") {
-        Some(libdir) if libdir != "lib" => libdir.into(),
-        _ => {
+        None | Some("lib") => {
             if sysroot.join(PRIMARY_LIB_DIR).join(RUST_LIB_DIR).exists() {
                 PRIMARY_LIB_DIR.into()
             } else {
                 SECONDARY_LIB_DIR.into()
             }
         }
+        Some(libdir) => libdir.into(),
     }
 }
 

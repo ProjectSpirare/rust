@@ -55,17 +55,19 @@ This API is completely unstable and subject to change.
 
 */
 
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![allow(non_camel_case_types)]
+#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
+#![feature(array_value_iter)]
 #![feature(bool_to_option)]
 #![feature(box_syntax)]
 #![feature(crate_visibility_modifier)]
 #![feature(in_band_lifetimes)]
+#![feature(is_sorted)]
 #![feature(nll)]
 #![feature(or_patterns)]
 #![feature(try_blocks)]
 #![feature(never_type)]
 #![feature(slice_partition_dedup)]
+#![feature(control_flow_enum)]
 #![recursion_limit = "256"]
 
 #[macro_use]
@@ -224,19 +226,21 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: LocalDefId) {
             let expected_return_type = if tcx.lang_items().termination().is_some() {
                 // we take the return type of the given main function, the real check is done
                 // in `check_fn`
-                actual.output().skip_binder()
+                actual.output()
             } else {
                 // standard () main return type
-                tcx.mk_unit()
+                ty::Binder::dummy(tcx.mk_unit())
             };
 
-            let se_ty = tcx.mk_fn_ptr(ty::Binder::bind(tcx.mk_fn_sig(
-                iter::empty(),
-                expected_return_type,
-                false,
-                hir::Unsafety::Normal,
-                Abi::Rust,
-            )));
+            let se_ty = tcx.mk_fn_ptr(expected_return_type.map_bound(|expected_return_type| {
+                tcx.mk_fn_sig(
+                    iter::empty(),
+                    expected_return_type,
+                    false,
+                    hir::Unsafety::Normal,
+                    Abi::Rust,
+                )
+            }));
 
             require_same_types(
                 tcx,
@@ -317,7 +321,7 @@ fn check_start_fn_ty(tcx: TyCtxt<'_>, start_def_id: LocalDefId) {
                 }
             }
 
-            let se_ty = tcx.mk_fn_ptr(ty::Binder::bind(tcx.mk_fn_sig(
+            let se_ty = tcx.mk_fn_ptr(ty::Binder::dummy(tcx.mk_fn_sig(
                 [tcx.types.isize, tcx.mk_imm_ptr(tcx.mk_imm_ptr(tcx.types.u8))].iter().cloned(),
                 tcx.types.isize,
                 false,
@@ -360,7 +364,7 @@ pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorReported> {
 
     // this ensures that later parts of type checking can assume that items
     // have valid types and not error
-    // FIXME(matthewjasper) We shouldn't need to do this.
+    // FIXME(matthewjasper) We shouldn't need to use `track_errors`.
     tcx.sess.track_errors(|| {
         tcx.sess.time("type_collecting", || {
             for &module in tcx.hir().krate().modules.keys() {

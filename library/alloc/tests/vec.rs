@@ -1,8 +1,9 @@
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::TryReserveError::*;
 use std::fmt::Debug;
 use std::iter::InPlaceIterable;
-use std::mem::size_of;
+use std::mem::{size_of, swap};
 use std::ops::Bound::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
@@ -918,7 +919,7 @@ fn test_from_iter_partially_drained_in_place_specialization() {
 
 #[test]
 fn test_from_iter_specialization_with_iterator_adapters() {
-    fn assert_in_place_trait<T: InPlaceIterable>(_: &T) {};
+    fn assert_in_place_trait<T: InPlaceIterable>(_: &T) {}
     let src: Vec<usize> = vec![0usize; 256];
     let srcptr = src.as_ptr();
     let iter = src
@@ -1197,7 +1198,7 @@ fn drain_filter_consumed_panic() {
     struct Check {
         index: usize,
         drop_counts: Rc<Mutex<Vec<usize>>>,
-    };
+    }
 
     impl Drop for Check {
         fn drop(&mut self) {
@@ -1249,7 +1250,7 @@ fn drain_filter_unconsumed_panic() {
     struct Check {
         index: usize,
         drop_counts: Rc<Mutex<Vec<usize>>>,
-    };
+    }
 
     impl Drop for Check {
         fn drop(&mut self) {
@@ -1341,7 +1342,7 @@ fn test_try_reserve() {
     // on 64-bit, we assume the OS will give an OOM for such a ridiculous size.
     // Any platform that succeeds for these requests is technically broken with
     // ptr::offset because LLVM is the worst.
-    let guards_against_isize = size_of::<usize>() < 8;
+    let guards_against_isize = usize::BITS < 64;
 
     {
         // Note: basic stuff is checked by test_reserve
@@ -1798,7 +1799,7 @@ fn partialeq_vec_and_prim() {
 }
 
 macro_rules! assert_partial_eq_valid {
-    ($a2:ident, $a3:ident; $b2:ident, $b3: ident) => {
+    ($a2:expr, $a3:expr; $b2:expr, $b3: expr) => {
         assert!($a2 == $b2);
         assert!($a2 != $b3);
         assert!($a3 != $b2);
@@ -1830,4 +1831,126 @@ fn partialeq_vec_full() {
     assert_partial_eq_valid!(slicemut2,slicemut3; vec2,vec3);
     assert_partial_eq_valid!(vec2,vec3; array2,array3);
     assert_partial_eq_valid!(vec2,vec3; arrayref2,arrayref3);
+    assert_partial_eq_valid!(vec2,vec3; arrayref2[..],arrayref3[..]);
+}
+
+#[test]
+fn test_vec_cycle() {
+    #[derive(Debug)]
+    struct C<'a> {
+        v: Vec<Cell<Option<&'a C<'a>>>>,
+    }
+
+    impl<'a> C<'a> {
+        fn new() -> C<'a> {
+            C { v: Vec::new() }
+        }
+    }
+
+    let mut c1 = C::new();
+    let mut c2 = C::new();
+    let mut c3 = C::new();
+
+    // Push
+    c1.v.push(Cell::new(None));
+    c1.v.push(Cell::new(None));
+
+    c2.v.push(Cell::new(None));
+    c2.v.push(Cell::new(None));
+
+    c3.v.push(Cell::new(None));
+    c3.v.push(Cell::new(None));
+
+    // Set
+    c1.v[0].set(Some(&c2));
+    c1.v[1].set(Some(&c3));
+
+    c2.v[0].set(Some(&c2));
+    c2.v[1].set(Some(&c3));
+
+    c3.v[0].set(Some(&c1));
+    c3.v[1].set(Some(&c2));
+}
+
+#[test]
+fn test_vec_cycle_wrapped() {
+    struct Refs<'a> {
+        v: Vec<Cell<Option<&'a C<'a>>>>,
+    }
+
+    struct C<'a> {
+        refs: Refs<'a>,
+    }
+
+    impl<'a> Refs<'a> {
+        fn new() -> Refs<'a> {
+            Refs { v: Vec::new() }
+        }
+    }
+
+    impl<'a> C<'a> {
+        fn new() -> C<'a> {
+            C { refs: Refs::new() }
+        }
+    }
+
+    let mut c1 = C::new();
+    let mut c2 = C::new();
+    let mut c3 = C::new();
+
+    c1.refs.v.push(Cell::new(None));
+    c1.refs.v.push(Cell::new(None));
+    c2.refs.v.push(Cell::new(None));
+    c2.refs.v.push(Cell::new(None));
+    c3.refs.v.push(Cell::new(None));
+    c3.refs.v.push(Cell::new(None));
+
+    c1.refs.v[0].set(Some(&c2));
+    c1.refs.v[1].set(Some(&c3));
+    c2.refs.v[0].set(Some(&c2));
+    c2.refs.v[1].set(Some(&c3));
+    c3.refs.v[0].set(Some(&c1));
+    c3.refs.v[1].set(Some(&c2));
+}
+
+#[test]
+fn test_zero_sized_vec_push() {
+    const N: usize = 8;
+
+    for len in 0..N {
+        let mut tester = Vec::with_capacity(len);
+        assert_eq!(tester.len(), 0);
+        assert!(tester.capacity() >= len);
+        for _ in 0..len {
+            tester.push(());
+        }
+        assert_eq!(tester.len(), len);
+        assert_eq!(tester.iter().count(), len);
+        tester.clear();
+    }
+}
+
+#[test]
+fn test_vec_macro_repeat() {
+    assert_eq!(vec![1; 3], vec![1, 1, 1]);
+    assert_eq!(vec![1; 2], vec![1, 1]);
+    assert_eq!(vec![1; 1], vec![1]);
+    assert_eq!(vec![1; 0], vec![]);
+
+    // from_elem syntax (see RFC 832)
+    let el = Box::new(1);
+    let n = 3;
+    assert_eq!(vec![el; n], vec![Box::new(1), Box::new(1), Box::new(1)]);
+}
+
+#[test]
+fn test_vec_swap() {
+    let mut a: Vec<isize> = vec![0, 1, 2, 3, 4, 5, 6];
+    a.swap(2, 4);
+    assert_eq!(a[2], 4);
+    assert_eq!(a[4], 2);
+    let mut n = 42;
+    swap(&mut n, &mut a[0]);
+    assert_eq!(a[0], 42);
+    assert_eq!(n, 0);
 }

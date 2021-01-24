@@ -11,6 +11,10 @@ pub fn opts() -> TargetOptions {
             "-fno-use-linker-plugin".to_string(),
             // Always enable DEP (NX bit) when it is available
             "-Wl,--nxcompat".to_string(),
+            // Enable ASLR
+            "-Wl,--dynamicbase".to_string(),
+            // ASLR will rebase it anyway so leaving that option enabled only leads to confusion
+            "-Wl,--disable-auto-image-base".to_string(),
         ],
     );
 
@@ -23,6 +27,7 @@ pub fn opts() -> TargetOptions {
         "-lmsvcrt".to_string(),
         "-lmingwex".to_string(),
         "-lmingw32".to_string(),
+        "-lgcc".to_string(), // alas, mingw* libraries above depend on libgcc
         // mingw's msvcrt is a weird hybrid import library and static library.
         // And it seems that the linker fails to use import symbols from msvcrt
         // that are required from functions in msvcrt in certain cases. For example
@@ -41,8 +46,6 @@ pub fn opts() -> TargetOptions {
         // the shared libgcc_s-dw2-1.dll. This is required to support
         // unwinding across DLL boundaries.
         "-lgcc_s".to_string(),
-        "-lgcc".to_string(),
-        "-lkernel32".to_string(),
     ];
     late_link_args_dynamic.insert(LinkerFlavor::Gcc, dynamic_unwind_libs.clone());
     late_link_args_dynamic.insert(LinkerFlavor::Lld(LldFlavor::Ld), dynamic_unwind_libs);
@@ -54,15 +57,14 @@ pub fn opts() -> TargetOptions {
         // boundaries when unwinding across FFI boundaries.
         "-lgcc_eh".to_string(),
         "-l:libpthread.a".to_string(),
-        "-lgcc".to_string(),
-        // libpthread depends on libmsvcrt, so we need to link it *again*.
-        "-lmsvcrt".to_string(),
-        "-lkernel32".to_string(),
     ];
     late_link_args_static.insert(LinkerFlavor::Gcc, static_unwind_libs.clone());
     late_link_args_static.insert(LinkerFlavor::Lld(LldFlavor::Ld), static_unwind_libs);
 
     TargetOptions {
+        os: "windows".to_string(),
+        env: "gnu".to_string(),
+        vendor: "pc".to_string(),
         // FIXME(#13846) this should be enabled for windows
         function_sections: false,
         linker: Some("gcc".to_string()),
@@ -73,7 +75,7 @@ pub fn opts() -> TargetOptions {
         exe_suffix: ".exe".to_string(),
         staticlib_prefix: "lib".to_string(),
         staticlib_suffix: ".a".to_string(),
-        target_family: Some("windows".to_string()),
+        os_family: Some("windows".to_string()),
         is_like_windows: true,
         allows_weak_linkage: false,
         pre_link_args,

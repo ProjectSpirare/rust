@@ -543,9 +543,12 @@ impl<'a, 'b> Context<'a, 'b> {
                             let idx = self.args.len();
                             self.arg_types.push(Vec::new());
                             self.arg_unique_types.push(Vec::new());
-                            self.args.push(
-                                self.ecx.expr_ident(self.fmtsp, Ident::new(name, self.fmtsp)),
-                            );
+                            let span = if self.is_literal {
+                                *self.arg_spans.get(self.curpiece).unwrap_or(&self.fmtsp)
+                            } else {
+                                self.fmtsp
+                            };
+                            self.args.push(self.ecx.expr_ident(span, Ident::new(name, span)));
                             self.names.insert(name, idx);
                             self.verify_arg_type(Exact(idx), ty)
                         } else {
@@ -1041,10 +1044,7 @@ pub fn expand_preparsed_format_args(
 
     let numbered_position_args = pieces.iter().any(|arg: &parse::Piece<'_>| match *arg {
         parse::String(_) => false,
-        parse::NextArgument(arg) => match arg.position {
-            parse::Position::ArgumentIs(_) => true,
-            _ => false,
-        },
+        parse::NextArgument(arg) => matches!(arg.position, parse::Position::ArgumentIs(_)),
     });
 
     cx.build_index_map();

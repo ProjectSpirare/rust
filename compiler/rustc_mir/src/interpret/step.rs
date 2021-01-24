@@ -95,14 +95,12 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
             // Mark locals as alive
             StorageLive(local) => {
-                let old_val = self.storage_live(*local)?;
-                self.deallocate_local(old_val)?;
+                self.storage_live(*local)?;
             }
 
             // Mark locals as dead
             StorageDead(local) => {
-                let old_val = self.storage_dead(*local);
-                self.deallocate_local(old_val)?;
+                self.storage_dead(*local)?;
             }
 
             // No dynamic semantics attached to `FakeRead`; MIR
@@ -266,10 +264,14 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             NullaryOp(mir::NullOp::SizeOf, ty) => {
                 let ty = self.subst_from_current_frame_and_normalize_erasing_regions(ty);
                 let layout = self.layout_of(ty)?;
-                assert!(
-                    !layout.is_unsized(),
-                    "SizeOf nullary MIR operator called for unsized type"
-                );
+                if layout.is_unsized() {
+                    // FIXME: This should be a span_bug (#80742)
+                    self.tcx.sess.delay_span_bug(
+                        self.frame().current_span(),
+                        &format!("SizeOf nullary MIR operator called for unsized type {}", ty),
+                    );
+                    throw_inval!(SizeOfUnsizedType(ty));
+                }
                 self.write_scalar(Scalar::from_machine_usize(layout.size.bytes(), self), dest)?;
             }
 

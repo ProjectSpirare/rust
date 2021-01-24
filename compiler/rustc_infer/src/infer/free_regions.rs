@@ -93,10 +93,7 @@ impl<'tcx> FreeRegionMap<'tcx> {
 
     /// True for free regions other than `'static`.
     pub fn is_free(&self, r: Region<'_>) -> bool {
-        match *r {
-            ty::ReEarlyBound(_) | ty::ReFree(_) => true,
-            _ => false,
-        }
+        matches!(r, ty::ReEarlyBound(_) | ty::ReFree(_))
     }
 
     /// True if `r` is a free region or static of the sort that this
@@ -157,7 +154,7 @@ impl<'tcx> FreeRegionRelations<'tcx> for FreeRegionMap<'tcx> {
 
 impl<'a, 'tcx> Lift<'tcx> for FreeRegionMap<'a> {
     type Lifted = FreeRegionMap<'tcx>;
-    fn lift_to_tcx(&self, tcx: TyCtxt<'tcx>) -> Option<FreeRegionMap<'tcx>> {
-        self.relation.maybe_map(|&fr| tcx.lift(&fr)).map(|relation| FreeRegionMap { relation })
+    fn lift_to_tcx(self, tcx: TyCtxt<'tcx>) -> Option<FreeRegionMap<'tcx>> {
+        self.relation.maybe_map(|&fr| tcx.lift(fr)).map(|relation| FreeRegionMap { relation })
     }
 }

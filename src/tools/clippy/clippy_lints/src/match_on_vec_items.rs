@@ -1,4 +1,3 @@
-use crate::utils::walk_ptrs_ty;
 use crate::utils::{is_type_diagnostic_item, is_type_lang_item, snippet, span_lint_and_sugg};
 use if_chain::if_chain;
 use rustc_errors::Applicability;
@@ -6,6 +5,7 @@ use rustc_hir::{Expr, ExprKind, LangItem, MatchSource};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::lint::in_external_macro;
 use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_span::sym;
 
 declare_clippy_lint! {
     /// **What it does:** Checks for `match vec[idx]` or `match vec[n..m]`.
@@ -90,12 +90,12 @@ fn is_vec_indexing<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> Opti
 
 fn is_vector(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let ty = cx.typeck_results().expr_ty(expr);
-    let ty = walk_ptrs_ty(ty);
-    is_type_diagnostic_item(cx, ty, sym!(vec_type))
+    let ty = ty.peel_refs();
+    is_type_diagnostic_item(cx, ty, sym::vec_type)
 }
 
 fn is_full_range(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let ty = cx.typeck_results().expr_ty(expr);
-    let ty = walk_ptrs_ty(ty);
+    let ty = ty.peel_refs();
     is_type_lang_item(cx, ty, LangItem::RangeFull)
 }

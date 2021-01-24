@@ -26,8 +26,14 @@ const GATED_CFGS: &[GatedCfg] = &[
     (sym::target_thread_local, sym::cfg_target_thread_local, cfg_fn!(cfg_target_thread_local)),
     (sym::target_has_atomic, sym::cfg_target_has_atomic, cfg_fn!(cfg_target_has_atomic)),
     (sym::target_has_atomic_load_store, sym::cfg_target_has_atomic, cfg_fn!(cfg_target_has_atomic)),
+    (
+        sym::target_has_atomic_equal_alignment,
+        sym::cfg_target_has_atomic,
+        cfg_fn!(cfg_target_has_atomic),
+    ),
     (sym::sanitize, sym::cfg_sanitize, cfg_fn!(cfg_sanitize)),
     (sym::version, sym::cfg_version, cfg_fn!(cfg_version)),
+    (sym::panic, sym::cfg_panic, cfg_fn!(cfg_panic)),
 ];
 
 /// Find a gated cfg determined by the `pred`icate which is given the cfg's name.
@@ -78,10 +84,7 @@ impl std::fmt::Debug for AttributeGate {
 
 impl AttributeGate {
     fn is_deprecated(&self) -> bool {
-        match *self {
-            Self::Gated(Stability::Deprecated(_, _), ..) => true,
-            _ => false,
-        }
+        matches!(*self, Self::Gated(Stability::Deprecated(_, _), ..))
     }
 }
 
@@ -331,6 +334,8 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         optimize, AssumedUsed, template!(List: "size|speed"), optimize_attribute,
         experimental!(optimize),
     ),
+    // RFC 2867
+    gated!(instruction_set, AssumedUsed, template!(List: "set"), isa_attribute, experimental!(instruction_set)),
 
     gated!(ffi_returns_twice, AssumedUsed, template!(Word), experimental!(ffi_returns_twice)),
     gated!(ffi_pure, AssumedUsed, template!(Word), experimental!(ffi_pure)),
@@ -343,6 +348,8 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         register_tool, CrateLevel, template!(List: "tool1, tool2, ..."),
         experimental!(register_tool),
     ),
+
+    gated!(cmse_nonsecure_entry, AssumedUsed, template!(Word), experimental!(cmse_nonsecure_entry)),
 
     // ==========================================================================
     // Internal attributes: Stability, deprecation, and unsafe:
@@ -369,6 +376,10 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     gated!(
         allow_internal_unstable, AssumedUsed, template!(Word, List: "feat1, feat2, ..."),
         "allow_internal_unstable side-steps feature gating and stability checks",
+    ),
+    gated!(
+        rustc_allow_const_fn_unstable, AssumedUsed, template!(Word, List: "feat1, feat2, ..."),
+        "rustc_allow_const_fn_unstable side-steps feature gating and stability checks"
     ),
     gated!(
         allow_internal_unsafe, Normal, template!(Word),
@@ -431,7 +442,7 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     // Internal attributes, Macro related:
     // ==========================================================================
 
-    rustc_attr!(rustc_builtin_macro, AssumedUsed, template!(Word), IMPL_DETAIL),
+    rustc_attr!(rustc_builtin_macro, AssumedUsed, template!(Word, NameValueStr: "name"), IMPL_DETAIL),
     rustc_attr!(rustc_proc_macro_decls, Normal, template!(Word), INTERNAL_UNSTABLE),
     rustc_attr!(
         rustc_macro_transparency, AssumedUsed,
@@ -459,7 +470,6 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     // ==========================================================================
 
     rustc_attr!(rustc_promotable, AssumedUsed, template!(Word), IMPL_DETAIL),
-    rustc_attr!(rustc_allow_const_fn_ptr, AssumedUsed, template!(Word), IMPL_DETAIL),
     rustc_attr!(rustc_args_required_const, AssumedUsed, template!(List: "N"), INTERNAL_UNSTABLE),
 
     // ==========================================================================
@@ -537,6 +547,7 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     // ==========================================================================
 
     rustc_attr!(TEST, rustc_outlives, Normal, template!(Word)),
+    rustc_attr!(TEST, rustc_capture_analysis, Normal, template!(Word)),
     rustc_attr!(TEST, rustc_variance, Normal, template!(Word)),
     rustc_attr!(TEST, rustc_layout, Normal, template!(List: "field1, field2, ...")),
     rustc_attr!(TEST, rustc_regions, Normal, template!(Word)),
@@ -590,7 +601,7 @@ pub fn is_builtin_attr_name(name: Symbol) -> bool {
     BUILTIN_ATTRIBUTE_MAP.get(&name).is_some()
 }
 
-pub static BUILTIN_ATTRIBUTE_MAP: SyncLazy<FxHashMap<Symbol, &'static BuiltinAttribute>> =
+pub static BUILTIN_ATTRIBUTE_MAP: SyncLazy<FxHashMap<Symbol, &BuiltinAttribute>> =
     SyncLazy::new(|| {
         let mut map = FxHashMap::default();
         for attr in BUILTIN_ATTRIBUTES.iter() {

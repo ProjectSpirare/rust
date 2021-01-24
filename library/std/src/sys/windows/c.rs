@@ -31,6 +31,8 @@ pub type WORD = u16;
 pub type CHAR = c_char;
 pub type ULONG_PTR = usize;
 pub type ULONG = c_ulong;
+pub type NTSTATUS = LONG;
+pub type ACCESS_MASK = DWORD;
 
 pub type LPBOOL = *mut BOOL;
 pub type LPBYTE = *mut BYTE;
@@ -47,7 +49,6 @@ pub type LPWCH = *mut WCHAR;
 pub type LPWIN32_FIND_DATAW = *mut WIN32_FIND_DATAW;
 pub type LPWSADATA = *mut WSADATA;
 pub type LPWSAPROTOCOL_INFO = *mut WSAPROTOCOL_INFO;
-pub type LPSTR = *mut CHAR;
 pub type LPWSTR = *mut WCHAR;
 pub type LPFILETIME = *mut FILETIME;
 pub type LPWSABUF = *mut WSABUF;
@@ -285,6 +286,8 @@ pub const FD_SETSIZE: usize = 64;
 pub const STACK_SIZE_PARAM_IS_A_RESERVATION: DWORD = 0x00010000;
 
 pub const HEAP_ZERO_MEMORY: DWORD = 0x00000008;
+
+pub const STATUS_SUCCESS: NTSTATUS = 0x00000000;
 
 #[repr(C)]
 #[cfg(not(target_pointer_width = "64"))]
@@ -876,16 +879,6 @@ extern "system" {
     pub fn DeleteFileW(lpPathName: LPCWSTR) -> BOOL;
     pub fn GetCurrentDirectoryW(nBufferLength: DWORD, lpBuffer: LPWSTR) -> DWORD;
     pub fn SetCurrentDirectoryW(lpPathName: LPCWSTR) -> BOOL;
-    pub fn WideCharToMultiByte(
-        CodePage: UINT,
-        dwFlags: DWORD,
-        lpWideCharStr: LPCWSTR,
-        cchWideChar: c_int,
-        lpMultiByteStr: LPSTR,
-        cbMultiByte: c_int,
-        lpDefaultChar: LPCSTR,
-        lpUsedDefaultChar: LPBOOL,
-    ) -> c_int;
 
     pub fn closesocket(socket: SOCKET) -> c_int;
     pub fn recv(socket: SOCKET, buf: *mut c_void, len: c_int, flags: c_int) -> c_int;
@@ -1032,7 +1025,7 @@ extern "system" {
 // Functions that aren't available on every version of Windows that we support,
 // but we still use them and just provide some form of a fallback implementation.
 compat_fn! {
-    kernel32:
+    "kernel32":
 
     pub fn CreateSymbolicLinkW(_lpSymlinkFileName: LPCWSTR,
                                _lpTargetFileName: LPCWSTR,
@@ -1094,5 +1087,48 @@ compat_fn! {
     }
     pub fn TryAcquireSRWLockShared(SRWLock: PSRWLOCK) -> BOOLEAN {
         panic!("rwlocks not available")
+    }
+}
+compat_fn! {
+    "api-ms-win-core-synch-l1-2-0":
+    pub fn WaitOnAddress(
+        Address: LPVOID,
+        CompareAddress: LPVOID,
+        AddressSize: SIZE_T,
+        dwMilliseconds: DWORD
+    ) -> BOOL {
+        panic!("WaitOnAddress not available")
+    }
+    pub fn WakeByAddressSingle(Address: LPVOID) -> () {
+        // If this api is unavailable, there cannot be anything waiting, because
+        // WaitOnAddress would've panicked. So it's fine to do nothing here.
+    }
+}
+
+compat_fn! {
+    "ntdll":
+    pub fn NtCreateKeyedEvent(
+        KeyedEventHandle: LPHANDLE,
+        DesiredAccess: ACCESS_MASK,
+        ObjectAttributes: LPVOID,
+        Flags: ULONG
+    ) -> NTSTATUS {
+        panic!("keyed events not available")
+    }
+    pub fn NtReleaseKeyedEvent(
+        EventHandle: HANDLE,
+        Key: LPVOID,
+        Alertable: BOOLEAN,
+        Timeout: PLARGE_INTEGER
+    ) -> NTSTATUS {
+        panic!("keyed events not available")
+    }
+    pub fn NtWaitForKeyedEvent(
+        EventHandle: HANDLE,
+        Key: LPVOID,
+        Alertable: BOOLEAN,
+        Timeout: PLARGE_INTEGER
+    ) -> NTSTATUS {
+        panic!("keyed events not available")
     }
 }

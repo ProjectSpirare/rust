@@ -21,7 +21,7 @@
 // references.
 //
 // Signatures do not include visibility info. I'm not sure if this is a feature
-// or an ommission (FIXME).
+// or an omission (FIXME).
 //
 // FIXME where clauses need implementing, defs/refs in generics are mostly missing.
 
@@ -262,7 +262,7 @@ impl<'hir> Sig for hir::Ty<'hir> {
                 } else {
                     let start = offset + prefix.len() + 5;
                     let end = start + name.len();
-                    // FIXME should put the proper path in there, not elipses.
+                    // FIXME should put the proper path in there, not ellipsis.
                     Ok(Signature {
                         text: prefix + "...::" + &name,
                         defs: vec![],
@@ -272,7 +272,7 @@ impl<'hir> Sig for hir::Ty<'hir> {
             }
             hir::TyKind::Path(hir::QPath::TypeRelative(ty, segment)) => {
                 let nested_ty = ty.make(offset + 1, id, scx)?;
-                let prefix = format!("<{}>::", nested_ty.text,);
+                let prefix = format!("<{}>::", nested_ty.text);
 
                 let name = path_segment_to_string(segment);
                 let res = scx.get_path_res(id.ok_or("Missing id for Path")?);
@@ -501,7 +501,7 @@ impl<'hir> Sig for hir::Item<'hir> {
 
                 Ok(sig)
             }
-            hir::ItemKind::Impl {
+            hir::ItemKind::Impl(hir::Impl {
                 unsafety,
                 polarity,
                 defaultness,
@@ -511,7 +511,7 @@ impl<'hir> Sig for hir::Item<'hir> {
                 ref of_trait,
                 ref self_ty,
                 items: _,
-            } => {
+            }) => {
                 let mut text = String::new();
                 if let hir::Defaultness::Default { .. } = defaultness {
                     text.push_str("default ");
@@ -550,8 +550,8 @@ impl<'hir> Sig for hir::Item<'hir> {
 
                 // FIXME where clause
             }
-            hir::ItemKind::ForeignMod(_) => Err("extern mod"),
-            hir::ItemKind::GlobalAsm(_) => Err("glboal asm"),
+            hir::ItemKind::ForeignMod { .. } => Err("extern mod"),
+            hir::ItemKind::GlobalAsm(_) => Err("global asm"),
             hir::ItemKind::ExternCrate(_) => Err("extern crate"),
             hir::ItemKind::OpaqueTy(..) => Err("opaque type"),
             // FIXME should implement this (e.g., pub use).
@@ -614,9 +614,12 @@ impl<'hir> Sig for hir::Generics<'hir> {
                 start: offset + text.len(),
                 end: offset + text.len() + param_text.as_str().len(),
             });
-            if let hir::GenericParamKind::Const { ref ty } = param.kind {
+            if let hir::GenericParamKind::Const { ref ty, ref default } = param.kind {
                 param_text.push_str(": ");
                 param_text.push_str(&ty_to_string(&ty));
+                if let Some(ref _default) = default {
+                    // FIXME(const_generics_defaults): push the `default` value here
+                }
             }
             if !param.bounds.is_empty() {
                 param_text.push_str(": ");
@@ -677,7 +680,7 @@ impl<'hir> Sig for hir::Variant<'hir> {
         let mut text = self.ident.to_string();
         match self.data {
             hir::VariantData::Struct(fields, r) => {
-                let id = parent_id.unwrap();
+                let id = parent_id.ok_or("Missing id for Variant's parent")?;
                 let name_def = SigElement {
                     id: id_from_hir_id(id, scx),
                     start: offset,

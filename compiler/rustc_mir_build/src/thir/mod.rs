@@ -139,6 +139,11 @@ crate enum ExprKind<'tcx> {
     Box {
         value: ExprRef<'tcx>,
     },
+    If {
+        cond: ExprRef<'tcx>,
+        then: ExprRef<'tcx>,
+        else_opt: Option<ExprRef<'tcx>>,
+    },
     Call {
         ty: Ty<'tcx>,
         fun: ExprRef<'tcx>,
@@ -211,8 +216,14 @@ crate enum ExprKind<'tcx> {
     VarRef {
         id: hir::HirId,
     },
-    /// first argument, used for self in a closure
-    SelfRef,
+    /// Used to represent upvars mentioned in a closure/generator
+    UpvarRef {
+        /// DefId of the closure/generator
+        closure_def_id: DefId,
+
+        /// HirId of the root variable
+        var_hir_id: hir::HirId,
+    },
     Borrow {
         borrow_kind: BorrowKind,
         arg: ExprRef<'tcx>,
@@ -231,6 +242,9 @@ crate enum ExprKind<'tcx> {
     },
     Return {
         value: Option<ExprRef<'tcx>>,
+    },
+    ConstBlock {
+        value: &'tcx Const<'tcx>,
     },
     Repeat {
         value: ExprRef<'tcx>,
@@ -335,6 +349,7 @@ crate struct Arm<'tcx> {
 #[derive(Clone, Debug)]
 crate enum Guard<'tcx> {
     If(ExprRef<'tcx>),
+    IfLet(Pat<'tcx>, ExprRef<'tcx>),
 }
 
 #[derive(Copy, Clone, Debug)]

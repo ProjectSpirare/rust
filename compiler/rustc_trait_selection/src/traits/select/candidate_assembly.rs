@@ -7,16 +7,22 @@
 //! [rustc dev guide]:https://rustc-dev-guide.rust-lang.org/traits/resolution.html#candidate-assembly
 use rustc_hir as hir;
 use rustc_infer::traits::{Obligation, SelectionError, TraitObligation};
+use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, TypeFoldable};
 use rustc_target::spec::abi::Abi;
 
+use crate::traits::coherence::Conflict;
 use crate::traits::{util, SelectionResult};
+use crate::traits::{Overflow, Unimplemented};
 
 use super::BuiltinImplConditions;
+use super::IntercrateAmbiguityCause;
+use super::OverflowError;
 use super::SelectionCandidate::{self, *};
-use super::{SelectionCandidateSet, SelectionContext, TraitObligationStack};
+use super::{EvaluatedCandidate, SelectionCandidateSet, SelectionContext, TraitObligationStack};
 
 impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
+    #[instrument(level = "debug", skip(self))]
     pub(super) fn candidate_from_obligation<'o>(
         &mut self,
         stack: &TraitObligationStack<'o, 'tcx>,
@@ -30,16 +36,13 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         // this is because we want the unbound variables to be
         // replaced with fresh types starting from index 0.
         let cache_fresh_trait_pred = self.infcx.freshen(stack.obligation.predicate);
-        debug!(
-            "candidate_from_obligation(cache_fresh_trait_pred={:?}, obligation={:?})",
-            cache_fresh_trait_pred, stack
-        );
+        debug!(?cache_fresh_trait_pred);
         debug_assert!(!stack.obligation.predicate.has_escaping_bound_vars());
 
         if let Some(c) =
             self.check_candidate_cache(stack.obligation.param_env, cache_fresh_trait_pred)
         {
-            debug!("CACHE HIT: SELECT({:?})={:?}", cache_fresh_trait_pred, c);
+            debug!(candidate = ?c, "CACHE HIT");
             return c;
         }
 
@@ -52,7 +55,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         let (candidate, dep_node) =
             self.in_task(|this| this.candidate_from_obligation_no_cache(stack));
 
-        debug!("CACHE MISS: SELECT({:?})={:?}", cache_fresh_trait_pred, candidate);
+        debug!(?candidate, "CACHE MISS");
         self.insert_candidate_cache(
             stack.obligation.param_env,
             cache_fresh_trait_pred,
@@ -60,6 +63,161 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             candidate.clone(),
         );
         candidate
+    }
+
+    fn candidate_from_obligation_no_cache<'o>(
+        &mut self,
+        stack: &TraitObligationStack<'o, 'tcx>,
+    ) -> SelectionResult<'tcx, SelectionCandidate<'tcx>> {
+        if let Some(conflict) = self.is_knowable(stack) {
+            debug!("coherence stage: not knowable");
+            if self.intercrate_ambiguity_causes.is_some() {
+                debug!("evaluate_stack: intercrate_ambiguity_causes is some");
+                // Heuristics: show the diagnostics when there are no candidates in crate.
+                if let Ok(candidate_set) = self.assemble_candidates(stack) {
+                    let mut no_candidates_apply = true;
+
+                    for c in candidate_set.vec.iter() {
+                        if self.evaluate_candidate(stack, &c)?.may_apply() {
+                            no_candidates_apply = false;
+                            break;
+                        }
+                    }
+
+                    if !candidate_set.ambiguous && no_candidates_apply {
+                        let trait_ref = stack.obligation.predicate.skip_binder().trait_ref;
+                        let self_ty = trait_ref.self_ty();
+                        let (trait_desc, self_desc) = with_no_trimmed_paths(|| {
+                            let trait_desc = trait_ref.print_only_trait_path().to_string();
+                            let self_desc = if self_ty.has_concrete_skeleton() {
+                                Some(self_ty.to_string())
+                            } else {
+                                None
+                            };
+                            (trait_desc, self_desc)
+                        });
+                        let cause = if let Conflict::Upstream = conflict {
+                            IntercrateAmbiguityCause::UpstreamCrateUpdate { trait_desc, self_desc }
+                        } else {
+                            IntercrateAmbiguityCause::DownstreamCrate { trait_desc, self_desc }
+                        };
+                        debug!(?cause, "evaluate_stack: pushing cause");
+                        self.intercrate_ambiguity_causes.as_mut().unwrap().push(cause);
+                    }
+                }
+            }
+            return Ok(None);
+        }
+
+        let candidate_set = self.assemble_candidates(stack)?;
+
+        if candidate_set.ambiguous {
+            debug!("candidate set contains ambig");
+            return Ok(None);
+        }
+
+        let mut candidates = candidate_set.vec;
+
+        debug!(?stack, ?candidates, "assembled {} candidates", candidates.len());
+
+        // At this point, we know that each of the entries in the
+        // candidate set is *individually* applicable. Now we have to
+        // figure out if they contain mutual incompatibilities. This
+        // frequently arises if we have an unconstrained input type --
+        // for example, we are looking for `$0: Eq` where `$0` is some
+        // unconstrained type variable. In that case, we'll get a
+        // candidate which assumes $0 == int, one that assumes `$0 ==
+        // usize`, etc. This spells an ambiguity.
+
+        // If there is more than one candidate, first winnow them down
+        // by considering extra conditions (nested obligations and so
+        // forth). We don't winnow if there is exactly one
+        // candidate. This is a relatively minor distinction but it
+        // can lead to better inference and error-reporting. An
+        // example would be if there was an impl:
+        //
+        //     impl<T:Clone> Vec<T> { fn push_clone(...) { ... } }
+        //
+        // and we were to see some code `foo.push_clone()` where `boo`
+        // is a `Vec<Bar>` and `Bar` does not implement `Clone`.  If
+        // we were to winnow, we'd wind up with zero candidates.
+        // Instead, we select the right impl now but report "`Bar` does
+        // not implement `Clone`".
+        if candidates.len() == 1 {
+            return self.filter_negative_and_reservation_impls(candidates.pop().unwrap());
+        }
+
+        // Winnow, but record the exact outcome of evaluation, which
+        // is needed for specialization. Propagate overflow if it occurs.
+        let mut candidates = candidates
+            .into_iter()
+            .map(|c| match self.evaluate_candidate(stack, &c) {
+                Ok(eval) if eval.may_apply() => {
+                    Ok(Some(EvaluatedCandidate { candidate: c, evaluation: eval }))
+                }
+                Ok(_) => Ok(None),
+                Err(OverflowError) => Err(Overflow),
+            })
+            .flat_map(Result::transpose)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        debug!(?stack, ?candidates, "winnowed to {} candidates", candidates.len());
+
+        let needs_infer = stack.obligation.predicate.has_infer_types_or_consts();
+
+        // If there are STILL multiple candidates, we can further
+        // reduce the list by dropping duplicates -- including
+        // resolving specializations.
+        if candidates.len() > 1 {
+            let mut i = 0;
+            while i < candidates.len() {
+                let is_dup = (0..candidates.len()).filter(|&j| i != j).any(|j| {
+                    self.candidate_should_be_dropped_in_favor_of(
+                        &candidates[i],
+                        &candidates[j],
+                        needs_infer,
+                    )
+                });
+                if is_dup {
+                    debug!(candidate = ?candidates[i], "Dropping candidate #{}/{}", i, candidates.len());
+                    candidates.swap_remove(i);
+                } else {
+                    debug!(candidate = ?candidates[i], "Retaining candidate #{}/{}", i, candidates.len());
+                    i += 1;
+
+                    // If there are *STILL* multiple candidates, give up
+                    // and report ambiguity.
+                    if i > 1 {
+                        debug!("multiple matches, ambig");
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        // If there are *NO* candidates, then there are no impls --
+        // that we know of, anyway. Note that in the case where there
+        // are unbound type variables within the obligation, it might
+        // be the case that you could still satisfy the obligation
+        // from another crate by instantiating the type variables with
+        // a type from another crate that does have an impl. This case
+        // is checked for in `evaluate_stack` (and hence users
+        // who might care about this case, like coherence, should use
+        // that function).
+        if candidates.is_empty() {
+            // If there's an error type, 'downgrade' our result from
+            // `Err(Unimplemented)` to `Ok(None)`. This helps us avoid
+            // emitting additional spurious errors, since we're guaranteed
+            // to have emitted at least one.
+            if stack.obligation.references_error() {
+                debug!("no results for error type, treating as ambiguous");
+                return Ok(None);
+            }
+            return Err(Unimplemented);
+        }
+
+        // Just one candidate left.
+        self.filter_negative_and_reservation_impls(candidates.pop().unwrap().candidate)
     }
 
     pub(super) fn assemble_candidates<'o>(
@@ -71,7 +229,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             param_env: obligation.param_env,
             cause: obligation.cause.clone(),
             recursion_depth: obligation.recursion_depth,
-            predicate: self.infcx().resolve_vars_if_possible(&obligation.predicate),
+            predicate: self.infcx().resolve_vars_if_possible(obligation.predicate),
         };
 
         if obligation.predicate.skip_binder().self_ty().is_ty_var() {
@@ -89,7 +247,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
 
         let mut candidates = SelectionCandidateSet { vec: Vec::new(), ambiguous: false };
 
-        self.assemble_candidates_for_trait_alias(obligation, &mut candidates)?;
+        self.assemble_candidates_for_trait_alias(obligation, &mut candidates);
 
         // Other bounds. Consider both in-scope bounds from fn decl
         // and applicable impls. There is a certain set of precedence rules here.
@@ -97,15 +255,15 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         let lang_items = self.tcx().lang_items();
 
         if lang_items.copy_trait() == Some(def_id) {
-            debug!("obligation self ty is {:?}", obligation.predicate.skip_binder().self_ty());
+            debug!(obligation_self_ty = ?obligation.predicate.skip_binder().self_ty());
 
             // User-defined copy impls are permitted, but only for
             // structs and enums.
-            self.assemble_candidates_from_impls(obligation, &mut candidates)?;
+            self.assemble_candidates_from_impls(obligation, &mut candidates);
 
             // For other types, we'll use the builtin rules.
             let copy_conditions = self.copy_clone_conditions(obligation);
-            self.assemble_builtin_bound_candidates(copy_conditions, &mut candidates)?;
+            self.assemble_builtin_bound_candidates(copy_conditions, &mut candidates);
         } else if lang_items.discriminant_kind_trait() == Some(def_id) {
             // `DiscriminantKind` is automatically implemented for every type.
             candidates.vec.push(DiscriminantKindCandidate);
@@ -113,7 +271,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             // Sized is never implementable by end-users, it is
             // always automatically computed.
             let sized_conditions = self.sized_conditions(obligation);
-            self.assemble_builtin_bound_candidates(sized_conditions, &mut candidates)?;
+            self.assemble_builtin_bound_candidates(sized_conditions, &mut candidates);
         } else if lang_items.unsize_trait() == Some(def_id) {
             self.assemble_candidates_for_unsizing(obligation, &mut candidates);
         } else {
@@ -122,13 +280,13 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 // for `Copy` also has builtin support for `Clone`, and tuples/arrays of `Clone`
                 // types have builtin support for `Clone`.
                 let clone_conditions = self.copy_clone_conditions(obligation);
-                self.assemble_builtin_bound_candidates(clone_conditions, &mut candidates)?;
+                self.assemble_builtin_bound_candidates(clone_conditions, &mut candidates);
             }
 
-            self.assemble_generator_candidates(obligation, &mut candidates)?;
-            self.assemble_closure_candidates(obligation, &mut candidates)?;
-            self.assemble_fn_pointer_candidates(obligation, &mut candidates)?;
-            self.assemble_candidates_from_impls(obligation, &mut candidates)?;
+            self.assemble_generator_candidates(obligation, &mut candidates);
+            self.assemble_closure_candidates(obligation, &mut candidates);
+            self.assemble_fn_pointer_candidates(obligation, &mut candidates);
+            self.assemble_candidates_from_impls(obligation, &mut candidates);
             self.assemble_candidates_from_object_ty(obligation, &mut candidates);
         }
 
@@ -137,7 +295,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         // Auto implementations have lower priority, so we only
         // consider triggering a default if there is no other impl that can apply.
         if candidates.vec.is_empty() {
-            self.assemble_candidates_from_auto_impls(obligation, &mut candidates)?;
+            self.assemble_candidates_from_auto_impls(obligation, &mut candidates);
         }
         debug!("candidate list size: {}", candidates.vec.len());
         Ok(candidates)
@@ -148,7 +306,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         obligation: &TraitObligation<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
     ) {
-        debug!("assemble_candidates_for_projected_tys({:?})", obligation);
+        debug!(?obligation, "assemble_candidates_from_projected_tys");
 
         // Before we go into the whole placeholder thing, just
         // quickly check if the self-type is a projection at all.
@@ -167,8 +325,8 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             .infcx
             .probe(|_| self.match_projection_obligation_against_definition_bounds(obligation));
 
-        if result {
-            candidates.vec.push(ProjectionCandidate);
+        for predicate_index in result {
+            candidates.vec.push(ProjectionCandidate(predicate_index));
         }
     }
 
@@ -181,7 +339,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         stack: &TraitObligationStack<'o, 'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
     ) -> Result<(), SelectionError<'tcx>> {
-        debug!("assemble_candidates_from_caller_bounds({:?})", stack.obligation);
+        debug!(?stack.obligation, "assemble_candidates_from_caller_bounds");
 
         let all_bounds = stack
             .obligation
@@ -192,18 +350,15 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
 
         // Micro-optimization: filter out predicates relating to different traits.
         let matching_bounds =
-            all_bounds.filter(|p| p.def_id() == stack.obligation.predicate.def_id());
+            all_bounds.filter(|p| p.value.def_id() == stack.obligation.predicate.def_id());
 
         // Keep only those bounds which may apply, and propagate overflow if it occurs.
-        let mut param_candidates = vec![];
         for bound in matching_bounds {
-            let wc = self.evaluate_where_clause(stack, bound)?;
+            let wc = self.evaluate_where_clause(stack, bound.value)?;
             if wc.may_apply() {
-                param_candidates.push(ParamCandidate(bound));
+                candidates.vec.push(ParamCandidate(bound));
             }
         }
-
-        candidates.vec.extend(param_candidates);
 
         Ok(())
     }
@@ -212,9 +367,9 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         &mut self,
         obligation: &TraitObligation<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
-    ) -> Result<(), SelectionError<'tcx>> {
+    ) {
         if self.tcx().lang_items().gen_trait() != Some(obligation.predicate.def_id()) {
-            return Ok(());
+            return;
         }
 
         // Okay to skip binder because the substs on generator types never
@@ -223,10 +378,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         let self_ty = obligation.self_ty().skip_binder();
         match self_ty.kind() {
             ty::Generator(..) => {
-                debug!(
-                    "assemble_generator_candidates: self_ty={:?} obligation={:?}",
-                    self_ty, obligation
-                );
+                debug!(?self_ty, ?obligation, "assemble_generator_candidates",);
 
                 candidates.vec.push(GeneratorCandidate);
             }
@@ -236,8 +388,6 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             }
             _ => {}
         }
-
-        Ok(())
     }
 
     /// Checks for the artificial impl that the compiler will create for an obligation like `X :
@@ -250,11 +400,11 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         &mut self,
         obligation: &TraitObligation<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
-    ) -> Result<(), SelectionError<'tcx>> {
+    ) {
         let kind = match self.tcx().fn_trait_kind_from_lang_item(obligation.predicate.def_id()) {
             Some(k) => k,
             None => {
-                return Ok(());
+                return;
             }
         };
 
@@ -263,10 +413,10 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         // type/region parameters
         match *obligation.self_ty().skip_binder().kind() {
             ty::Closure(_, closure_substs) => {
-                debug!("assemble_unboxed_candidates: kind={:?} obligation={:?}", kind, obligation);
+                debug!(?kind, ?obligation, "assemble_unboxed_candidates");
                 match self.infcx.closure_kind(closure_substs) {
                     Some(closure_kind) => {
-                        debug!("assemble_unboxed_candidates: closure_kind = {:?}", closure_kind);
+                        debug!(?closure_kind, "assemble_unboxed_candidates");
                         if closure_kind.extends(kind) {
                             candidates.vec.push(ClosureCandidate);
                         }
@@ -283,8 +433,6 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             }
             _ => {}
         }
-
-        Ok(())
     }
 
     /// Implements one of the `Fn()` family for a fn pointer.
@@ -292,10 +440,10 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         &mut self,
         obligation: &TraitObligation<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
-    ) -> Result<(), SelectionError<'tcx>> {
+    ) {
         // We provide impl of all fn traits for fn pointers.
         if self.tcx().fn_trait_kind_from_lang_item(obligation.predicate.def_id()).is_none() {
-            return Ok(());
+            return;
         }
 
         // Okay to skip binder because what we are inspecting doesn't involve bound regions.
@@ -333,8 +481,6 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             }
             _ => {}
         }
-
-        Ok(())
     }
 
     /// Searches for impls that might apply to `obligation`.
@@ -342,8 +488,8 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         &mut self,
         obligation: &TraitObligation<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
-    ) -> Result<(), SelectionError<'tcx>> {
-        debug!("assemble_candidates_from_impls(obligation={:?})", obligation);
+    ) {
+        debug!(?obligation, "assemble_candidates_from_impls");
 
         // Essentially any user-written impl will match with an error type,
         // so creating `ImplCandidates` isn't useful. However, we might
@@ -352,7 +498,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         // Since compilation is already guaranteed to fail, this is just
         // to try to show the 'nicest' possible errors to the user.
         if obligation.references_error() {
-            return Ok(());
+            return;
         }
 
         self.tcx().for_each_relevant_impl(
@@ -366,18 +512,16 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 });
             },
         );
-
-        Ok(())
     }
 
     fn assemble_candidates_from_auto_impls(
         &mut self,
         obligation: &TraitObligation<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
-    ) -> Result<(), SelectionError<'tcx>> {
+    ) {
         // Okay to skip binder here because the tests we do below do not involve bound regions.
         let self_ty = obligation.self_ty().skip_binder();
-        debug!("assemble_candidates_from_auto_impls(self_ty={:?})", self_ty);
+        debug!(?self_ty, "assemble_candidates_from_auto_impls");
 
         let def_id = obligation.predicate.def_id();
 
@@ -406,7 +550,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     // where-clause or, in the case of an object type,
                     // it could be that the object type lists the
                     // trait (e.g., `Foo+Send : Send`). See
-                    // `compile-fail/typeck-default-trait-impl-send-param.rs`
+                    // `ui/typeck/typeck-default-trait-impl-send-param.rs`
                     // for an example of a test case that exercises
                     // this path.
                 }
@@ -433,8 +577,6 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 _ => candidates.vec.push(AutoImplCandidate(def_id)),
             }
         }
-
-        Ok(())
     }
 
     /// Searches for impls that might apply to `obligation`.
@@ -444,15 +586,15 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         candidates: &mut SelectionCandidateSet<'tcx>,
     ) {
         debug!(
-            "assemble_candidates_from_object_ty(self_ty={:?})",
-            obligation.self_ty().skip_binder()
+            self_ty = ?obligation.self_ty().skip_binder(),
+            "assemble_candidates_from_object_ty",
         );
 
         self.infcx.probe(|_snapshot| {
             // The code below doesn't care about regions, and the
             // self-ty here doesn't escape this probe, so just erase
             // any LBR.
-            let self_ty = self.tcx().erase_late_bound_regions(&obligation.self_ty());
+            let self_ty = self.tcx().erase_late_bound_regions(obligation.self_ty());
             let poly_trait_ref = match self_ty.kind() {
                 ty::Dynamic(ref data, ..) => {
                     if data.auto_traits().any(|did| did == obligation.predicate.def_id()) {
@@ -485,26 +627,32 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 _ => return,
             };
 
-            debug!("assemble_candidates_from_object_ty: poly_trait_ref={:?}", poly_trait_ref);
+            debug!(?poly_trait_ref, "assemble_candidates_from_object_ty");
+
+            let poly_trait_predicate = self.infcx().resolve_vars_if_possible(obligation.predicate);
+            let placeholder_trait_predicate =
+                self.infcx().replace_bound_vars_with_placeholders(poly_trait_predicate);
 
             // Count only those upcast versions that match the trait-ref
             // we are looking for. Specifically, do not only check for the
             // correct trait, but also the correct type parameters.
             // For example, we may be trying to upcast `Foo` to `Bar<i32>`,
             // but `Foo` is declared as `trait Foo: Bar<u32>`.
-            let upcast_trait_refs = util::supertraits(self.tcx(), poly_trait_ref)
-                .filter(|upcast_trait_ref| {
-                    self.infcx
-                        .probe(|_| self.match_poly_trait_ref(obligation, *upcast_trait_ref).is_ok())
+            let candidate_supertraits = util::supertraits(self.tcx(), poly_trait_ref)
+                .enumerate()
+                .filter(|&(_, upcast_trait_ref)| {
+                    self.infcx.probe(|_| {
+                        self.match_normalize_trait_ref(
+                            obligation,
+                            upcast_trait_ref,
+                            placeholder_trait_predicate.trait_ref,
+                        )
+                        .is_ok()
+                    })
                 })
-                .count();
+                .map(|(idx, _)| ObjectCandidate(idx));
 
-            if upcast_trait_refs > 1 {
-                // Can be upcast in many ways; need more type information.
-                candidates.ambiguous = true;
-            } else if upcast_trait_refs == 1 {
-                candidates.vec.push(ObjectCandidate);
-            }
+            candidates.vec.extend(candidate_supertraits);
         })
     }
 
@@ -537,7 +685,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         };
         let target = obligation.predicate.skip_binder().trait_ref.substs.type_at(1);
 
-        debug!("assemble_candidates_for_unsizing(source={:?}, target={:?})", source, target);
+        debug!(?source, ?target, "assemble_candidates_for_unsizing");
 
         let may_apply = match (source.kind(), target.kind()) {
             // Trait+Kx+'a -> Trait+Ky+'b (upcasts).
@@ -595,18 +743,16 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         &mut self,
         obligation: &TraitObligation<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
-    ) -> Result<(), SelectionError<'tcx>> {
+    ) {
         // Okay to skip binder here because the tests we do below do not involve bound regions.
         let self_ty = obligation.self_ty().skip_binder();
-        debug!("assemble_candidates_for_trait_alias(self_ty={:?})", self_ty);
+        debug!(?self_ty, "assemble_candidates_for_trait_alias");
 
         let def_id = obligation.predicate.def_id();
 
         if self.tcx().is_trait_alias(def_id) {
             candidates.vec.push(TraitAliasCandidate(def_id));
         }
-
-        Ok(())
     }
 
     /// Assembles the trait which are built-in to the language itself:
@@ -615,10 +761,10 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         &mut self,
         conditions: BuiltinImplConditions<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
-    ) -> Result<(), SelectionError<'tcx>> {
+    ) {
         match conditions {
             BuiltinImplConditions::Where(nested) => {
-                debug!("builtin_bound: nested={:?}", nested);
+                debug!(?nested, "builtin_bound");
                 candidates
                     .vec
                     .push(BuiltinCandidate { has_nested: !nested.skip_binder().is_empty() });
@@ -629,7 +775,5 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 candidates.ambiguous = true;
             }
         }
-
-        Ok(())
     }
 }

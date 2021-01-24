@@ -3,7 +3,7 @@
 //! # Problem statement
 //!
 //! We are given a decimal string such as `12.34e56`. This string consists of integral (`12`),
-//! fractional (`45`), and exponent (`56`) parts. All parts are optional and interpreted as zero
+//! fractional (`34`), and exponent (`56`) parts. All parts are optional and interpreted as zero
 //! when missing.
 //!
 //! We seek the IEEE 754 floating point number that is closest to the exact value of the decimal
@@ -33,7 +33,7 @@
 //!
 //! Primarily, this module and its children implement the algorithms described in:
 //! "How to Read Floating Point Numbers Accurately" by William D. Clinger,
-//! available online: http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.45.4152
+//! available online: <http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.45.4152>
 //!
 //! In addition, there are numerous helper functions that are used in the paper but not available
 //! in Rust (or at least in core). Our version is additionally complicated by the need to handle

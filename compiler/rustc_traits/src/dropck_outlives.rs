@@ -106,7 +106,7 @@ fn dropck_outlives<'tcx>(
                 // do not themselves define a destructor", more or less. We have
                 // to push them onto the stack to be expanded.
                 for ty in constraints.dtorck_types.drain(..) {
-                    match infcx.at(&cause, param_env).normalize(&ty) {
+                    match infcx.at(&cause, param_env).normalize(ty) {
                         Ok(Normalized { value: ty, obligations }) => {
                             fulfill_cx.register_predicate_obligations(infcx, obligations);
 
@@ -210,12 +210,25 @@ fn dtorck_constraint_for_ty<'tcx>(
             Ok::<_, NoSolution>(())
         })?,
 
-        ty::Closure(_, substs) => rustc_data_structures::stack::ensure_sufficient_stack(|| {
-            for ty in substs.as_closure().upvar_tys() {
-                dtorck_constraint_for_ty(tcx, span, for_ty, depth + 1, ty, constraints)?;
+        ty::Closure(_, substs) => {
+            if !substs.as_closure().is_valid() {
+                // By the time this code runs, all type variables ought to
+                // be fully resolved.
+
+                tcx.sess.delay_span_bug(
+                    span,
+                    &format!("upvar_tys for closure not found. Expected capture information for closure {}", ty,),
+                );
+                return Err(NoSolution);
             }
-            Ok::<_, NoSolution>(())
-        })?,
+
+            rustc_data_structures::stack::ensure_sufficient_stack(|| {
+                for ty in substs.as_closure().upvar_tys() {
+                    dtorck_constraint_for_ty(tcx, span, for_ty, depth + 1, ty, constraints)?;
+                }
+                Ok::<_, NoSolution>(())
+            })?
+        }
 
         ty::Generator(_, substs, _movability) => {
             // rust-lang/rust#49918: types can be constructed, stored
@@ -240,6 +253,16 @@ fn dtorck_constraint_for_ty<'tcx>(
             // only take place through references with lifetimes
             // derived from lifetimes attached to the upvars and resume
             // argument, and we *do* incorporate those here.
+
+            if !substs.as_generator().is_valid() {
+                // By the time this code runs, all type variables ought to
+                // be fully resolved.
+                tcx.sess.delay_span_bug(
+                    span,
+                    &format!("upvar_tys for generator not found. Expected capture information for generator {}", ty,),
+                );
+                return Err(NoSolution);
+            }
 
             constraints.outlives.extend(
                 substs

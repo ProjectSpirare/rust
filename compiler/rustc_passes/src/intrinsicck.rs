@@ -78,7 +78,7 @@ impl ExprVisitor<'tcx> {
                 return;
             }
 
-            // Special-case transmutting from `typeof(function)` and
+            // Special-case transmuting from `typeof(function)` and
             // `Option<typeof(function)>` to present a clearer error.
             let from = unpack_option_like(self.tcx, from);
             if let (&ty::FnDef(..), SizeSkeleton::Known(size_to)) = (from.kind(), sk_to) {
@@ -143,7 +143,7 @@ impl ExprVisitor<'tcx> {
     ) -> Option<InlineAsmType> {
         // Check the type against the allowed types for inline asm.
         let ty = self.typeck_results.expr_ty_adjusted(expr);
-        let asm_ty_isize = match self.tcx.sess.target.ptr_width {
+        let asm_ty_isize = match self.tcx.sess.target.pointer_width {
             16 => InlineAsmType::I16,
             32 => InlineAsmType::I32,
             64 => InlineAsmType::I64,
@@ -184,7 +184,7 @@ impl ExprVisitor<'tcx> {
                         Some(InlineAsmType::VecI128(fields.len() as u64))
                     }
                     ty::Int(IntTy::Isize) | ty::Uint(UintTy::Usize) => {
-                        Some(match self.tcx.sess.target.ptr_width {
+                        Some(match self.tcx.sess.target.pointer_width {
                             16 => InlineAsmType::VecI16(fields.len() as u64),
                             32 => InlineAsmType::VecI32(fields.len() as u64),
                             64 => InlineAsmType::VecI64(fields.len() as u64),
@@ -347,7 +347,7 @@ impl ExprVisitor<'tcx> {
     }
 
     fn check_asm(&self, asm: &hir::InlineAsm<'tcx>) {
-        for (idx, op) in asm.operands.iter().enumerate() {
+        for (idx, (op, _op_sp)) in asm.operands.iter().enumerate() {
             match *op {
                 hir::InlineAsmOperand::In { reg, ref expr } => {
                     self.check_asm_operand_type(idx, reg, expr, asm.template, None);

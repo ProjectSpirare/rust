@@ -4,6 +4,10 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let target = env::var("TARGET").expect("TARGET was not set");
 
+    if cfg!(feature = "system-llvm-libunwind") {
+        return;
+    }
+
     if cfg!(feature = "llvm-libunwind")
         && ((target.contains("linux") && !target.contains("musl")) || target.contains("fuchsia"))
     {
@@ -12,11 +16,9 @@ fn main() {
     } else if target.contains("x86_64-fortanix-unknown-sgx") {
         llvm_libunwind::compile();
     } else if target.contains("linux") {
+        // linking for Linux is handled in lib.rs
         if target.contains("musl") {
-            // linking for musl is handled in lib.rs
             llvm_libunwind::compile();
-        } else if !target.contains("android") {
-            println!("cargo:rustc-link-lib=gcc_s");
         }
     } else if target.contains("freebsd") {
         println!("cargo:rustc-link-lib=gcc_s");
@@ -46,8 +48,6 @@ fn main() {
         println!("cargo:rustc-link-lib=gcc_s");
     } else if target.contains("redox") {
         // redox is handled in lib.rs
-    } else if target.contains("cloudabi") {
-        println!("cargo:rustc-link-lib=unwind");
     }
 }
 

@@ -35,7 +35,7 @@ where
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Eq> Eq for [T] {}
 
-/// Implements comparison of vectors lexicographically.
+/// Implements comparison of vectors [lexicographically](Ord#lexicographical-comparison).
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Ord> Ord for [T] {
     fn cmp(&self, other: &[T]) -> Ordering {
@@ -43,7 +43,7 @@ impl<T: Ord> Ord for [T] {
     }
 }
 
-/// Implements comparison of vectors lexicographically.
+/// Implements comparison of vectors [lexicographically](Ord#lexicographical-comparison).
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: PartialOrd> PartialOrd for [T] {
     fn partial_cmp(&self, other: &[T]) -> Option<Ordering> {
@@ -75,28 +75,6 @@ where
     }
 }
 
-// Use an equal-pointer optimization when types are `Eq`
-// We can't make `A` and `B` the same type because `min_specialization` won't
-// allow it.
-impl<A, B> SlicePartialEq<B> for [A]
-where
-    A: MarkerEq<B>,
-{
-    default fn equal(&self, other: &[B]) -> bool {
-        if self.len() != other.len() {
-            return false;
-        }
-
-        // While performance would suffer if `guaranteed_eq` just returned `false`
-        // for all arguments, correctness and return value of this function are not affected.
-        if self.as_ptr().guaranteed_eq(other.as_ptr() as *const A) {
-            return true;
-        }
-
-        self.iter().zip(other.iter()).all(|(x, y)| x == y)
-    }
-}
-
 // Use memcmp for bytewise equality when the types allow
 impl<A, B> SlicePartialEq<B> for [A]
 where
@@ -107,11 +85,6 @@ where
             return false;
         }
 
-        // While performance would suffer if `guaranteed_eq` just returned `false`
-        // for all arguments, correctness and return value of this function are not affected.
-        if self.as_ptr().guaranteed_eq(other.as_ptr() as *const A) {
-            return true;
-        }
         // SAFETY: `self` and `other` are references and are thus guaranteed to be valid.
         // The two slices have been checked to have the same size above.
         unsafe {
@@ -268,12 +241,14 @@ where
 }
 
 impl SliceContains for u8 {
+    #[inline]
     fn slice_contains(&self, x: &[Self]) -> bool {
         memchr::memchr(*self, x).is_some()
     }
 }
 
 impl SliceContains for i8 {
+    #[inline]
     fn slice_contains(&self, x: &[Self]) -> bool {
         let byte = *self as u8;
         // SAFETY: `i8` and `u8` have the same memory layout, thus casting `x.as_ptr()`

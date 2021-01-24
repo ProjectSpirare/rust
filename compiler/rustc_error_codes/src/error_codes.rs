@@ -18,7 +18,6 @@ E0010: include_str!("./error_codes/E0010.md"),
 E0013: include_str!("./error_codes/E0013.md"),
 E0014: include_str!("./error_codes/E0014.md"),
 E0015: include_str!("./error_codes/E0015.md"),
-E0019: include_str!("./error_codes/E0019.md"),
 E0023: include_str!("./error_codes/E0023.md"),
 E0025: include_str!("./error_codes/E0025.md"),
 E0026: include_str!("./error_codes/E0026.md"),
@@ -112,6 +111,7 @@ E0206: include_str!("./error_codes/E0206.md"),
 E0207: include_str!("./error_codes/E0207.md"),
 E0210: include_str!("./error_codes/E0210.md"),
 E0211: include_str!("./error_codes/E0211.md"),
+E0212: include_str!("./error_codes/E0212.md"),
 E0214: include_str!("./error_codes/E0214.md"),
 E0220: include_str!("./error_codes/E0220.md"),
 E0221: include_str!("./error_codes/E0221.md"),
@@ -284,6 +284,7 @@ E0537: include_str!("./error_codes/E0537.md"),
 E0538: include_str!("./error_codes/E0538.md"),
 E0539: include_str!("./error_codes/E0539.md"),
 E0541: include_str!("./error_codes/E0541.md"),
+E0546: include_str!("./error_codes/E0546.md"),
 E0550: include_str!("./error_codes/E0550.md"),
 E0551: include_str!("./error_codes/E0551.md"),
 E0552: include_str!("./error_codes/E0552.md"),
@@ -440,6 +441,8 @@ E0751: include_str!("./error_codes/E0751.md"),
 E0752: include_str!("./error_codes/E0752.md"),
 E0753: include_str!("./error_codes/E0753.md"),
 E0754: include_str!("./error_codes/E0754.md"),
+E0755: include_str!("./error_codes/E0755.md"),
+E0756: include_str!("./error_codes/E0756.md"),
 E0758: include_str!("./error_codes/E0758.md"),
 E0759: include_str!("./error_codes/E0759.md"),
 E0760: include_str!("./error_codes/E0760.md"),
@@ -456,9 +459,16 @@ E0770: include_str!("./error_codes/E0770.md"),
 E0771: include_str!("./error_codes/E0771.md"),
 E0773: include_str!("./error_codes/E0773.md"),
 E0774: include_str!("./error_codes/E0774.md"),
+E0775: include_str!("./error_codes/E0775.md"),
+E0776: include_str!("./error_codes/E0776.md"),
+E0777: include_str!("./error_codes/E0777.md"),
+E0778: include_str!("./error_codes/E0778.md"),
+E0779: include_str!("./error_codes/E0779.md"),
+E0780: include_str!("./error_codes/E0780.md"),
 ;
 //  E0006, // merged with E0005
 //  E0008, // cannot bind by-move into a pattern guard
+//  E0019, merged into E0015
 //  E0035, merged into E0087/E0089
 //  E0036, merged into E0087/E0089
 //  E0068,
@@ -495,7 +505,6 @@ E0774: include_str!("./error_codes/E0774.md"),
 //  E0196, // cannot determine a type for this closure
     E0208,
 //  E0209, // builtin traits can only be implemented on structs or enums
-    E0212, // cannot extract an associated type from a higher-ranked trait bound
 //  E0213, // associated types are not accepted in this context
 //  E0215, // angle-bracket notation is not stable with `Fn`
 //  E0216, // parenthetical notation is only stable with `Fn`
@@ -596,7 +605,6 @@ E0774: include_str!("./error_codes/E0774.md"),
     E0543, // missing 'reason'
     E0544, // multiple stability levels
     E0545, // incorrect 'issue'
-    E0546, // missing 'feature'
     E0547, // missing 'issue'
 //  E0548, // replaced with a generic attribute input check
     // rustc_deprecated attribute must be paired with either stable or unstable
@@ -632,8 +640,6 @@ E0774: include_str!("./error_codes/E0774.md"),
     E0722, // Malformed `#[optimize]` attribute
     E0726, // non-explicit (not `'_`) elided lifetime in unsupported position
 //  E0738, // Removed; errored on `#[track_caller] fn`s in `extern "Rust" { ... }`.
-    E0755, // `#[ffi_pure]` is only allowed on foreign functions
-    E0756, // `#[ffi_const]` is only allowed on foreign functions
     E0757, // `#[ffi_const]` functions cannot be `#[ffi_pure]`
     E0772, // `'static' obligation coming from `impl dyn Trait {}` or `impl Foo for dyn Bar {}`.
 }

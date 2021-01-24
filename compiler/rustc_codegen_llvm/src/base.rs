@@ -1,17 +1,15 @@
-//! Codegen the completed AST to the LLVM IR.
-//!
-//! Some functions here, such as codegen_block and codegen_expr, return a value --
-//! the result of the codegen to LLVM -- while others, such as codegen_fn
-//! and mono_item, are called only for the side effect of adding a
-//! particular definition to the LLVM IR output we're producing.
+//! Codegen the MIR to the LLVM IR.
 //!
 //! Hopefully useful general knowledge about codegen:
 //!
-//! * There's no way to find out the `Ty` type of a Value. Doing so
+//! * There's no way to find out the [`Ty`] type of a [`Value`]. Doing so
 //!   would be "trying to get the eggs out of an omelette" (credit:
-//!   pcwalton). You can, instead, find out its `llvm::Type` by calling `val_ty`,
-//!   but one `llvm::Type` corresponds to many `Ty`s; for instance, `tup(int, int,
-//!   int)` and `rec(x=int, y=int, z=int)` will have the same `llvm::Type`.
+//!   pcwalton). You can, instead, find out its [`llvm::Type`] by calling [`val_ty`],
+//!   but one [`llvm::Type`] corresponds to many [`Ty`]s; for instance, `tup(int, int,
+//!   int)` and `rec(x=int, y=int, z=int)` will have the same [`llvm::Type`].
+//!
+//! [`Ty`]: rustc_middle::ty::Ty
+//! [`val_ty`]: common::val_ty
 
 use super::ModuleLlvm;
 
@@ -60,7 +58,7 @@ pub fn write_compressed_metadata<'tcx>(
         unsafe { llvm::LLVMAddGlobal(metadata_llmod, common::val_ty(llconst), buf.as_ptr()) };
     unsafe {
         llvm::LLVMSetInitializer(llglobal, llconst);
-        let section_name = metadata::metadata_section_name(&tcx.sess.target.target);
+        let section_name = metadata::metadata_section_name(&tcx.sess.target);
         let name = SmallCStr::new(section_name);
         llvm::LLVMSetSection(llglobal, name.as_ptr());
 
@@ -97,21 +95,23 @@ pub fn compile_codegen_unit(
     tcx: TyCtxt<'tcx>,
     cgu_name: Symbol,
 ) -> (ModuleCodegen<ModuleLlvm>, u64) {
-    let prof_timer = tcx.prof.generic_activity_with_arg("codegen_module", cgu_name.to_string());
     let start_time = Instant::now();
 
     let dep_node = tcx.codegen_unit(cgu_name).codegen_dep_node(tcx);
     let (module, _) =
         tcx.dep_graph.with_task(dep_node, tcx, cgu_name, module_codegen, dep_graph::hash_result);
     let time_to_codegen = start_time.elapsed();
-    drop(prof_timer);
 
     // We assume that the cost to run LLVM on a CGU is proportional to
     // the time we needed for codegenning it.
-    let cost = time_to_codegen.as_secs() * 1_000_000_000 + time_to_codegen.subsec_nanos() as u64;
+    let cost = time_to_codegen.as_nanos() as u64;
 
     fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<ModuleLlvm> {
         let cgu = tcx.codegen_unit(cgu_name);
+        let _prof_timer = tcx.prof.generic_activity_with_args(
+            "codegen_module",
+            &[cgu_name.to_string(), cgu.size_estimate().to_string()],
+        );
         // Instantiate monomorphizations without filling out definitions yet...
         let llvm_module = ModuleLlvm::new(tcx, &cgu_name.as_str());
         {

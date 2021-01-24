@@ -22,9 +22,9 @@ impl FlagComputation {
         result
     }
 
-    pub fn for_predicate(kind: &ty::PredicateKind<'_>) -> FlagComputation {
+    pub fn for_predicate(binder: ty::Binder<ty::PredicateKind<'_>>) -> FlagComputation {
         let mut result = FlagComputation::new();
-        result.add_predicate_kind(kind);
+        result.add_predicate(binder);
         result
     }
 
@@ -53,7 +53,14 @@ impl FlagComputation {
 
     /// Adds the flags/depth from a set of types that appear within the current type, but within a
     /// region binder.
-    fn add_bound_computation(&mut self, computation: FlagComputation) {
+    fn bound_computation<T, F>(&mut self, value: ty::Binder<T>, f: F)
+    where
+        F: FnOnce(&mut Self, T),
+    {
+        let mut computation = FlagComputation::new();
+
+        f(&mut computation, value.skip_binder());
+
         self.add_flags(computation.flags);
 
         // The types that contributed to `computation` occurred within
@@ -101,9 +108,7 @@ impl FlagComputation {
             }
 
             &ty::GeneratorWitness(ts) => {
-                let mut computation = FlagComputation::new();
-                computation.add_tys(ts.skip_binder());
-                self.add_bound_computation(computation);
+                self.bound_computation(ts, |flags, ts| flags.add_tys(ts));
             }
 
             &ty::Closure(_, substs) => {
@@ -154,20 +159,17 @@ impl FlagComputation {
                 self.add_substs(substs);
             }
 
-            &ty::Dynamic(ref obj, r) => {
-                let mut computation = FlagComputation::new();
-                for predicate in obj.skip_binder().iter() {
-                    match predicate {
+            &ty::Dynamic(obj, r) => {
+                for predicate in obj.iter() {
+                    self.bound_computation(predicate, |computation, predicate| match predicate {
                         ty::ExistentialPredicate::Trait(tr) => computation.add_substs(tr.substs),
                         ty::ExistentialPredicate::Projection(p) => {
-                            let mut proj_computation = FlagComputation::new();
-                            proj_computation.add_existential_projection(&p);
-                            self.add_bound_computation(proj_computation);
+                            computation.add_existential_projection(&p);
                         }
                         ty::ExistentialPredicate::AutoTrait(_) => {}
-                    }
+                    });
                 }
-                self.add_bound_computation(computation);
+
                 self.add_region(r);
             }
 
@@ -195,61 +197,53 @@ impl FlagComputation {
                 self.add_substs(substs);
             }
 
-            &ty::FnPtr(f) => {
-                self.add_fn_sig(f);
-            }
+            &ty::FnPtr(fn_sig) => self.bound_computation(fn_sig, |computation, fn_sig| {
+                computation.add_tys(fn_sig.inputs());
+                computation.add_ty(fn_sig.output());
+            }),
         }
     }
 
-    fn add_predicate_kind(&mut self, kind: &ty::PredicateKind<'_>) {
-        match kind {
-            ty::PredicateKind::ForAll(binder) => {
-                let mut computation = FlagComputation::new();
-
-                computation.add_predicate_atom(binder.skip_binder());
-
-                self.add_bound_computation(computation);
-            }
-            &ty::PredicateKind::Atom(atom) => self.add_predicate_atom(atom),
-        }
+    fn add_predicate(&mut self, binder: ty::Binder<ty::PredicateKind<'_>>) {
+        self.bound_computation(binder, |computation, atom| computation.add_predicate_atom(atom));
     }
 
-    fn add_predicate_atom(&mut self, atom: ty::PredicateAtom<'_>) {
+    fn add_predicate_atom(&mut self, atom: ty::PredicateKind<'_>) {
         match atom {
-            ty::PredicateAtom::Trait(trait_pred, _constness) => {
+            ty::PredicateKind::Trait(trait_pred, _constness) => {
                 self.add_substs(trait_pred.trait_ref.substs);
             }
-            ty::PredicateAtom::RegionOutlives(ty::OutlivesPredicate(a, b)) => {
+            ty::PredicateKind::RegionOutlives(ty::OutlivesPredicate(a, b)) => {
                 self.add_region(a);
                 self.add_region(b);
             }
-            ty::PredicateAtom::TypeOutlives(ty::OutlivesPredicate(ty, region)) => {
+            ty::PredicateKind::TypeOutlives(ty::OutlivesPredicate(ty, region)) => {
                 self.add_ty(ty);
                 self.add_region(region);
             }
-            ty::PredicateAtom::Subtype(ty::SubtypePredicate { a_is_expected: _, a, b }) => {
+            ty::PredicateKind::Subtype(ty::SubtypePredicate { a_is_expected: _, a, b }) => {
                 self.add_ty(a);
                 self.add_ty(b);
             }
-            ty::PredicateAtom::Projection(ty::ProjectionPredicate { projection_ty, ty }) => {
+            ty::PredicateKind::Projection(ty::ProjectionPredicate { projection_ty, ty }) => {
                 self.add_projection_ty(projection_ty);
                 self.add_ty(ty);
             }
-            ty::PredicateAtom::WellFormed(arg) => {
+            ty::PredicateKind::WellFormed(arg) => {
                 self.add_substs(slice::from_ref(&arg));
             }
-            ty::PredicateAtom::ObjectSafe(_def_id) => {}
-            ty::PredicateAtom::ClosureKind(_def_id, substs, _kind) => {
+            ty::PredicateKind::ObjectSafe(_def_id) => {}
+            ty::PredicateKind::ClosureKind(_def_id, substs, _kind) => {
                 self.add_substs(substs);
             }
-            ty::PredicateAtom::ConstEvaluatable(_def_id, substs) => {
+            ty::PredicateKind::ConstEvaluatable(_def_id, substs) => {
                 self.add_substs(substs);
             }
-            ty::PredicateAtom::ConstEquate(expected, found) => {
+            ty::PredicateKind::ConstEquate(expected, found) => {
                 self.add_const(expected);
                 self.add_const(found);
             }
-            ty::PredicateAtom::TypeWellFormedFromEnv(ty) => {
+            ty::PredicateKind::TypeWellFormedFromEnv(ty) => {
                 self.add_ty(ty);
             }
         }
@@ -264,15 +258,6 @@ impl FlagComputation {
         for &ty in tys {
             self.add_ty(ty);
         }
-    }
-
-    fn add_fn_sig(&mut self, fn_sig: ty::PolyFnSig<'_>) {
-        let mut computation = FlagComputation::new();
-
-        computation.add_tys(fn_sig.skip_binder().inputs());
-        computation.add_ty(fn_sig.skip_binder().output());
-
-        self.add_bound_computation(computation);
     }
 
     fn add_region(&mut self, r: ty::Region<'_>) {

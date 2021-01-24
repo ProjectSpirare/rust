@@ -1,6 +1,6 @@
 #![feature(nll)]
 #![feature(static_nobundle)]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
+#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 
 // NOTE: This crate only exists to allow linking on mingw targets.
 
@@ -21,7 +21,6 @@ impl RustString {
 
 /// Appending to a Rust string -- used by RawRustStringOstream.
 #[no_mangle]
-#[allow(improper_ctypes_definitions)]
 pub unsafe extern "C" fn LLVMRustStringWriteImpl(
     sr: &RustString,
     ptr: *const c_char,
@@ -39,7 +38,7 @@ pub fn initialize_available_targets() {
         ($cfg:meta, $($method:ident),*) => { {
             #[cfg($cfg)]
             fn init() {
-                extern {
+                extern "C" {
                     $(fn $method();)*
                 }
                 unsafe {
@@ -168,6 +167,7 @@ pub fn initialize_available_targets() {
         LLVMInitializeWebAssemblyTargetInfo,
         LLVMInitializeWebAssemblyTarget,
         LLVMInitializeWebAssemblyTargetMC,
-        LLVMInitializeWebAssemblyAsmPrinter
+        LLVMInitializeWebAssemblyAsmPrinter,
+        LLVMInitializeWebAssemblyAsmParser
     );
 }

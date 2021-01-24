@@ -385,7 +385,7 @@ pub mod printf {
         if let Start = state {
             match c {
                 '1'..='9' => {
-                    let end = at_next_cp_while(next, is_digit);
+                    let end = at_next_cp_while(next, char::is_ascii_digit);
                     match end.next_cp() {
                         // Yes, this *is* the parameter.
                         Some(('$', end2)) => {
@@ -427,7 +427,7 @@ pub mod printf {
                     move_to!(next);
                 }
                 '1'..='9' => {
-                    let end = at_next_cp_while(next, is_digit);
+                    let end = at_next_cp_while(next, char::is_ascii_digit);
                     state = Prec;
                     width = Some(Num::from_str(at.slice_between(end).unwrap(), None));
                     move_to!(end);
@@ -441,7 +441,7 @@ pub mod printf {
         }
 
         if let WidthArg = state {
-            let end = at_next_cp_while(at, is_digit);
+            let end = at_next_cp_while(at, char::is_ascii_digit);
             match end.next_cp() {
                 Some(('$', end2)) => {
                     state = Prec;
@@ -473,7 +473,7 @@ pub mod printf {
         if let PrecInner = state {
             match c {
                 '*' => {
-                    let end = at_next_cp_while(next, is_digit);
+                    let end = at_next_cp_while(next, char::is_ascii_digit);
                     match end.next_cp() {
                         Some(('$', end2)) => {
                             state = Length;
@@ -488,7 +488,7 @@ pub mod printf {
                     }
                 }
                 '0'..='9' => {
-                    let end = at_next_cp_while(next, is_digit);
+                    let end = at_next_cp_while(next, char::is_ascii_digit);
                     state = Length;
                     precision = Some(Num::from_str(at.slice_between(end).unwrap(), None));
                     move_to!(end);
@@ -518,8 +518,7 @@ pub mod printf {
                         .and_then(|end| end.at_next_cp())
                         .map(|end| (next.slice_between(end).unwrap(), end));
                     let end = match end {
-                        Some(("32", end)) => end,
-                        Some(("64", end)) => end,
+                        Some(("32" | "64", end)) => end,
                         _ => next,
                     };
                     state = Type;
@@ -564,12 +563,12 @@ pub mod printf {
 
     fn at_next_cp_while<F>(mut cur: Cur<'_>, mut pred: F) -> Cur<'_>
     where
-        F: FnMut(char) -> bool,
+        F: FnMut(&char) -> bool,
     {
         loop {
             match cur.next_cp() {
                 Some((c, next)) => {
-                    if pred(c) {
+                    if pred(&c) {
                         cur = next;
                     } else {
                         return cur;
@@ -580,18 +579,8 @@ pub mod printf {
         }
     }
 
-    fn is_digit(c: char) -> bool {
-        match c {
-            '0'..='9' => true,
-            _ => false,
-        }
-    }
-
-    fn is_flag(c: char) -> bool {
-        match c {
-            '0' | '-' | '+' | ' ' | '#' | '\'' => true,
-            _ => false,
-        }
+    fn is_flag(c: &char) -> bool {
+        matches!(c, '0' | '-' | '+' | ' ' | '#' | '\'')
     }
 
     #[cfg(test)]
@@ -657,17 +646,13 @@ pub mod shell {
     impl<'a> Iterator for Substitutions<'a> {
         type Item = Substitution<'a>;
         fn next(&mut self) -> Option<Self::Item> {
-            match parse_next_substitution(self.s) {
-                Some((mut sub, tail)) => {
-                    self.s = tail;
-                    if let Some(InnerSpan { start, end }) = sub.position() {
-                        sub.set_position(start + self.pos, end + self.pos);
-                        self.pos += end;
-                    }
-                    Some(sub)
-                }
-                None => None,
+            let (mut sub, tail) = parse_next_substitution(self.s)?;
+            self.s = tail;
+            if let Some(InnerSpan { start, end }) = sub.position() {
+                sub.set_position(start + self.pos, end + self.pos);
+                self.pos += end;
             }
+            Some(sub)
         }
 
         fn size_hint(&self) -> (usize, Option<usize>) {
@@ -724,17 +709,11 @@ pub mod shell {
     }
 
     fn is_ident_head(c: char) -> bool {
-        match c {
-            'a'..='z' | 'A'..='Z' | '_' => true,
-            _ => false,
-        }
+        c.is_ascii_alphabetic() || c == '_'
     }
 
     fn is_ident_tail(c: char) -> bool {
-        match c {
-            '0'..='9' => true,
-            c => is_ident_head(c),
-        }
+        c.is_ascii_alphanumeric() || c == '_'
     }
 
     #[cfg(test)]

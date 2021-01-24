@@ -1,5 +1,4 @@
 use crate::traits::*;
-use rustc_hir::def_id::CrateNum;
 use rustc_index::vec::IndexVec;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mir;
@@ -9,13 +8,12 @@ use rustc_span::symbol::{kw, Symbol};
 use rustc_span::{BytePos, Span};
 use rustc_target::abi::{LayoutOf, Size};
 
-use super::operand::OperandValue;
+use super::operand::{OperandRef, OperandValue};
 use super::place::PlaceRef;
 use super::{FunctionCx, LocalRef};
 
-pub struct FunctionDebugContext<D> {
-    pub scopes: IndexVec<mir::SourceScope, DebugScope<D>>,
-    pub defining_crate: CrateNum,
+pub struct FunctionDebugContext<S, L> {
+    pub scopes: IndexVec<mir::SourceScope, DebugScope<S, L>>,
 }
 
 #[derive(Copy, Clone)]
@@ -38,76 +36,102 @@ pub struct PerLocalVarDebugInfo<'tcx, D> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct DebugScope<D> {
-    pub scope_metadata: Option<D>,
+pub struct DebugScope<S, L> {
+    // FIXME(eddyb) this should never be `None`, after initialization.
+    pub dbg_scope: Option<S>,
+
+    /// Call site location, if this scope was inlined from another function.
+    pub inlined_at: Option<L>,
+
     // Start and end offsets of the file to which this DIScope belongs.
     // These are used to quickly determine whether some span refers to the same file.
     pub file_start_pos: BytePos,
     pub file_end_pos: BytePos,
 }
 
-impl<D> DebugScope<D> {
-    pub fn is_valid(&self) -> bool {
-        self.scope_metadata.is_some()
+impl<'tcx, S: Copy, L: Copy> DebugScope<S, L> {
+    /// DILocations inherit source file name from the parent DIScope.  Due to macro expansions
+    /// it may so happen that the current span belongs to a different file than the DIScope
+    /// corresponding to span's containing source scope.  If so, we need to create a DIScope
+    /// "extension" into that file.
+    pub fn adjust_dbg_scope_for_span<Cx: CodegenMethods<'tcx, DIScope = S, DILocation = L>>(
+        &self,
+        cx: &Cx,
+        span: Span,
+    ) -> S {
+        // FIXME(eddyb) this should never be `None`.
+        let dbg_scope = self
+            .dbg_scope
+            .unwrap_or_else(|| bug!("`dbg_scope` is only `None` during initialization"));
+
+        let pos = span.lo();
+        if pos < self.file_start_pos || pos >= self.file_end_pos {
+            let sm = cx.sess().source_map();
+            cx.extend_scope_to_file(dbg_scope, &sm.lookup_char_pos(pos).file)
+        } else {
+            dbg_scope
+        }
     }
 }
 
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     pub fn set_debug_loc(&self, bx: &mut Bx, source_info: mir::SourceInfo) {
-        let (scope, span) = self.debug_loc(source_info);
-        if let Some(scope) = scope {
-            bx.set_source_location(scope, span);
+        bx.set_span(source_info.span);
+        if let Some(dbg_loc) = self.dbg_loc(source_info) {
+            bx.set_dbg_loc(dbg_loc);
         }
     }
 
-    pub fn debug_loc(&self, source_info: mir::SourceInfo) -> (Option<Bx::DIScope>, Span) {
+    fn dbg_loc(&self, source_info: mir::SourceInfo) -> Option<Bx::DILocation> {
+        let (dbg_scope, inlined_at, span) = self.adjusted_span_and_dbg_scope(source_info)?;
+        Some(self.cx.dbg_loc(dbg_scope, inlined_at, span))
+    }
+
+    fn adjusted_span_and_dbg_scope(
+        &self,
+        source_info: mir::SourceInfo,
+    ) -> Option<(Bx::DIScope, Option<Bx::DILocation>, Span)> {
+        let span = self.adjust_span_for_debugging(source_info.span);
+        let scope = &self.debug_context.as_ref()?.scopes[source_info.scope];
+        Some((scope.adjust_dbg_scope_for_span(self.cx, span), scope.inlined_at, span))
+    }
+
+    /// In order to have a good line stepping behavior in debugger, we overwrite debug
+    /// locations of macro expansions with that of the outermost expansion site
+    /// (unless the crate is being compiled with `-Z debug-macros`).
+    fn adjust_span_for_debugging(&self, mut span: Span) -> Span {
         // Bail out if debug info emission is not enabled.
-        match self.debug_context {
-            None => return (None, source_info.span),
-            Some(_) => {}
+        if self.debug_context.is_none() {
+            return span;
         }
 
-        // In order to have a good line stepping behavior in debugger, we overwrite debug
-        // locations of macro expansions with that of the outermost expansion site
-        // (unless the crate is being compiled with `-Z debug-macros`).
-        if !source_info.span.from_expansion() || self.cx.sess().opts.debugging_opts.debug_macros {
-            let scope = self.scope_metadata_for_loc(source_info.scope, source_info.span.lo());
-            (scope, source_info.span)
-        } else {
+        if span.from_expansion() && !self.cx.sess().opts.debugging_opts.debug_macros {
             // Walk up the macro expansion chain until we reach a non-expanded span.
             // We also stop at the function body level because no line stepping can occur
             // at the level above that.
-            let span = rustc_span::hygiene::walk_chain(source_info.span, self.mir.span.ctxt());
-            let scope = self.scope_metadata_for_loc(source_info.scope, span.lo());
             // Use span of the outermost expansion site, while keeping the original lexical scope.
-            (scope, span)
+            span = rustc_span::hygiene::walk_chain(span, self.mir.span.ctxt());
         }
+
+        span
     }
 
-    // DILocations inherit source file name from the parent DIScope.  Due to macro expansions
-    // it may so happen that the current span belongs to a different file than the DIScope
-    // corresponding to span's containing source scope.  If so, we need to create a DIScope
-    // "extension" into that file.
-    fn scope_metadata_for_loc(
-        &self,
-        scope_id: mir::SourceScope,
-        pos: BytePos,
-    ) -> Option<Bx::DIScope> {
-        let debug_context = self.debug_context.as_ref()?;
-        let scope_metadata = debug_context.scopes[scope_id].scope_metadata;
-        if pos < debug_context.scopes[scope_id].file_start_pos
-            || pos >= debug_context.scopes[scope_id].file_end_pos
-        {
-            let sm = self.cx.sess().source_map();
-            let defining_crate = debug_context.defining_crate;
-            Some(self.cx.extend_scope_to_file(
-                scope_metadata.unwrap(),
-                &sm.lookup_char_pos(pos).file,
-                defining_crate,
-            ))
-        } else {
-            scope_metadata
+    fn spill_operand_to_stack(
+        operand: &OperandRef<'tcx, Bx::Value>,
+        name: Option<String>,
+        bx: &mut Bx,
+    ) -> PlaceRef<'tcx, Bx::Value> {
+        // "Spill" the value onto the stack, for debuginfo,
+        // without forcing non-debuginfo uses of the local
+        // to also load from the stack every single time.
+        // FIXME(#68817) use `llvm.dbg.value` instead,
+        // at least for the cases which LLVM handles correctly.
+        let spill_slot = PlaceRef::alloca(bx, operand.layout);
+        if let Some(name) = name {
+            bx.set_var_name(spill_slot.llval, &(name + ".dbg.spill"));
         }
+        operand.val.store(bx, spill_slot);
+        spill_slot
     }
 
     /// Apply debuginfo and/or name, after creating the `alloca` for a local,
@@ -146,26 +170,22 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 // (after #67586 gets fixed).
                 None
             } else {
-                let name = kw::Invalid;
+                let name = kw::Empty;
                 let decl = &self.mir.local_decls[local];
-                let (scope, span) = if full_debug_info {
-                    self.debug_loc(decl.source_info)
-                } else {
-                    (None, decl.source_info.span)
-                };
-                let dbg_var = scope.map(|scope| {
-                    // FIXME(eddyb) is this `+ 1` needed at all?
-                    let kind = VariableKind::ArgumentVariable(arg_index + 1);
+                let dbg_var = if full_debug_info {
+                    self.adjusted_span_and_dbg_scope(decl.source_info).map(
+                        |(dbg_scope, _, span)| {
+                            // FIXME(eddyb) is this `+ 1` needed at all?
+                            let kind = VariableKind::ArgumentVariable(arg_index + 1);
 
-                    self.cx.create_dbg_var(
-                        self.debug_context.as_ref().unwrap(),
-                        name,
-                        self.monomorphize(&decl.ty),
-                        scope,
-                        kind,
-                        span,
+                            let arg_ty = self.monomorphize(decl.ty);
+
+                            self.cx.create_dbg_var(name, arg_ty, dbg_scope, kind, span)
+                        },
                     )
-                });
+                } else {
+                    None
+                };
 
                 Some(PerLocalVarDebugInfo {
                     name,
@@ -184,7 +204,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             None
         } else {
             Some(match whole_local_var.or(fallback_var) {
-                Some(var) if var.name != kw::Invalid => var.name.to_string(),
+                Some(var) if var.name != kw::Empty => var.name.to_string(),
                 _ => format!("{:?}", local),
             })
         };
@@ -224,17 +244,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     return;
                 }
 
-                // "Spill" the value onto the stack, for debuginfo,
-                // without forcing non-debuginfo uses of the local
-                // to also load from the stack every single time.
-                // FIXME(#68817) use `llvm.dbg.value` instead,
-                // at least for the cases which LLVM handles correctly.
-                let spill_slot = PlaceRef::alloca(bx, operand.layout);
-                if let Some(name) = name {
-                    bx.set_var_name(spill_slot.llval, &(name + ".dbg.spill"));
-                }
-                operand.val.store(bx, spill_slot);
-                spill_slot
+                Self::spill_operand_to_stack(operand, name, bx)
             }
 
             LocalRef::Place(place) => *place,
@@ -246,6 +256,15 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         let vars = vars.iter().copied().chain(fallback_var);
 
         for var in vars {
+            let dbg_var = match var.dbg_var {
+                Some(dbg_var) => dbg_var,
+                None => continue,
+            };
+            let dbg_loc = match self.dbg_loc(var.source_info) {
+                Some(dbg_loc) => dbg_loc,
+                None => continue,
+            };
+
             let mut layout = base.layout;
             let mut direct_offset = Size::ZERO;
             // FIXME(eddyb) use smallvec here.
@@ -282,19 +301,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 }
             }
 
-            let (scope, span) = self.debug_loc(var.source_info);
-            if let Some(scope) = scope {
-                if let Some(dbg_var) = var.dbg_var {
-                    bx.dbg_var_addr(
-                        dbg_var,
-                        scope,
-                        base.llval,
-                        direct_offset,
-                        &indirect_offsets,
-                        span,
-                    );
-                }
-            }
+            bx.dbg_var_addr(dbg_var, dbg_loc, base.llval, direct_offset, &indirect_offsets);
         }
     }
 
@@ -309,6 +316,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     /// Partition all `VarDebugInfo` in `self.mir`, by their base `Local`.
     pub fn compute_per_local_var_debug_info(
         &self,
+        bx: &mut Bx,
     ) -> Option<IndexVec<mir::Local, Vec<PerLocalVarDebugInfo<'tcx, Bx::DIVariable>>>> {
         let full_debug_info = self.cx.sess().opts.debuginfo == DebugInfo::Full;
 
@@ -318,43 +326,68 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
         let mut per_local = IndexVec::from_elem(vec![], &self.mir.local_decls);
         for var in &self.mir.var_debug_info {
-            let (scope, span) = if full_debug_info {
-                self.debug_loc(var.source_info)
+            let dbg_scope_and_span = if full_debug_info {
+                self.adjusted_span_and_dbg_scope(var.source_info)
             } else {
-                (None, var.source_info.span)
+                None
             };
-            let dbg_var = scope.map(|scope| {
-                let place = var.place;
-                let var_ty = self.monomorphized_place_ty(place.as_ref());
-                let var_kind = if self.mir.local_kind(place.local) == mir::LocalKind::Arg
-                    && place.projection.is_empty()
-                    && var.source_info.scope == mir::OUTERMOST_SOURCE_SCOPE
-                {
-                    let arg_index = place.local.index() - 1;
 
-                    // FIXME(eddyb) shouldn't `ArgumentVariable` indices be
-                    // offset in closures to account for the hidden environment?
-                    // Also, is this `+ 1` needed at all?
-                    VariableKind::ArgumentVariable(arg_index + 1)
-                } else {
-                    VariableKind::LocalVariable
+            let dbg_var = dbg_scope_and_span.map(|(dbg_scope, _, span)| {
+                let (var_ty, var_kind) = match var.value {
+                    mir::VarDebugInfoContents::Place(place) => {
+                        let var_ty = self.monomorphized_place_ty(place.as_ref());
+                        let var_kind = if self.mir.local_kind(place.local) == mir::LocalKind::Arg
+                            && place.projection.is_empty()
+                            && var.source_info.scope == mir::OUTERMOST_SOURCE_SCOPE
+                        {
+                            let arg_index = place.local.index() - 1;
+
+                            // FIXME(eddyb) shouldn't `ArgumentVariable` indices be
+                            // offset in closures to account for the hidden environment?
+                            // Also, is this `+ 1` needed at all?
+                            VariableKind::ArgumentVariable(arg_index + 1)
+                        } else {
+                            VariableKind::LocalVariable
+                        };
+                        (var_ty, var_kind)
+                    }
+                    mir::VarDebugInfoContents::Const(c) => {
+                        let ty = self.monomorphize(c.literal.ty);
+                        (ty, VariableKind::LocalVariable)
+                    }
                 };
-                self.cx.create_dbg_var(
-                    self.debug_context.as_ref().unwrap(),
-                    var.name,
-                    var_ty,
-                    scope,
-                    var_kind,
-                    span,
-                )
+
+                self.cx.create_dbg_var(var.name, var_ty, dbg_scope, var_kind, span)
             });
 
-            per_local[var.place.local].push(PerLocalVarDebugInfo {
-                name: var.name,
-                source_info: var.source_info,
-                dbg_var,
-                projection: var.place.projection,
-            });
+            match var.value {
+                mir::VarDebugInfoContents::Place(place) => {
+                    per_local[place.local].push(PerLocalVarDebugInfo {
+                        name: var.name,
+                        source_info: var.source_info,
+                        dbg_var,
+                        projection: place.projection,
+                    });
+                }
+                mir::VarDebugInfoContents::Const(c) => {
+                    if let Some(dbg_var) = dbg_var {
+                        let dbg_loc = match self.dbg_loc(var.source_info) {
+                            Some(dbg_loc) => dbg_loc,
+                            None => continue,
+                        };
+
+                        if let Ok(operand) = self.eval_mir_constant_to_operand(bx, &c) {
+                            let base = Self::spill_operand_to_stack(
+                                &operand,
+                                Some(var.name.to_string()),
+                                bx,
+                            );
+
+                            bx.dbg_var_addr(dbg_var, dbg_loc, base.llval, Size::ZERO, &[]);
+                        }
+                    }
+                }
+            }
         }
         Some(per_local)
     }

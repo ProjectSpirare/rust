@@ -15,6 +15,8 @@ use rustc_middle::ty::{self, AssocItemContainer, RegionKind, Ty, TypeFoldable, T
 use rustc_span::symbol::Ident;
 use rustc_span::{MultiSpan, Span};
 
+use std::ops::ControlFlow;
+
 impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
     /// Print the error message for lifetime errors when the return type is a static `impl Trait`,
     /// `dyn Trait` or if a method call on a trait object introduces a static requirement.
@@ -39,6 +41,14 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             ) if **sub_r == RegionKind::ReStatic => {
                 // This is for an implicit `'static` requirement coming from `impl dyn Trait {}`.
                 if let ObligationCauseCode::UnifyReceiver(ctxt) = &cause.code {
+                    // This may have a closure and it would cause ICE
+                    // through `find_param_with_region` (#78262).
+                    let anon_reg_sup = tcx.is_suitable_region(sup_r)?;
+                    let fn_returns = tcx.return_type_impl_or_dyn_traits(anon_reg_sup.def_id);
+                    if fn_returns.is_empty() {
+                        return None;
+                    }
+
                     let param = self.find_param_with_region(sup_r, sub_r)?;
                     let lifetime = if sup_r.has_name() {
                         format!("lifetime `{}`", sup_r)
@@ -335,9 +345,10 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         match tcx.hir().get_if_local(def_id) {
             Some(Node::ImplItem(ImplItem { ident, hir_id, .. })) => {
                 match tcx.hir().find(tcx.hir().get_parent_item(*hir_id)) {
-                    Some(Node::Item(Item { kind: ItemKind::Impl { self_ty, .. }, .. })) => {
-                        Some((*ident, self_ty))
-                    }
+                    Some(Node::Item(Item {
+                        kind: ItemKind::Impl(hir::Impl { self_ty, .. }),
+                        ..
+                    })) => Some((*ident, self_ty)),
                     _ => None,
                 }
             }
@@ -357,7 +368,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
                                 let impl_did = tcx.hir().local_def_id(*impl_node);
                                 match tcx.hir().get_if_local(impl_did.to_def_id()) {
                                     Some(Node::Item(Item {
-                                        kind: ItemKind::Impl { self_ty, .. },
+                                        kind: ItemKind::Impl(hir::Impl { self_ty, .. }),
                                         ..
                                     })) if trait_objects.iter().all(|did| {
                                         // FIXME: we should check `self_ty` against the receiver
@@ -404,7 +415,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             tcx,
             ctxt.param_env,
             ctxt.assoc_item.def_id,
-            self.infcx.resolve_vars_if_possible(&ctxt.substs),
+            self.infcx.resolve_vars_if_possible(ctxt.substs),
         ) {
             Ok(Some(instance)) => instance,
             _ => return false,
@@ -464,13 +475,13 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
 struct TraitObjectVisitor(Vec<DefId>);
 
 impl TypeVisitor<'_> for TraitObjectVisitor {
-    fn visit_ty(&mut self, t: Ty<'_>) -> bool {
+    fn visit_ty(&mut self, t: Ty<'_>) -> ControlFlow<Self::BreakTy> {
         match t.kind() {
             ty::Dynamic(preds, RegionKind::ReStatic) => {
                 if let Some(def_id) = preds.principal_def_id() {
                     self.0.push(def_id);
                 }
-                false
+                ControlFlow::CONTINUE
             }
             _ => t.super_visit_with(self),
         }
@@ -488,18 +499,16 @@ impl<'tcx> Visitor<'tcx> for HirTraitObjectVisitor {
     }
 
     fn visit_ty(&mut self, t: &'tcx hir::Ty<'tcx>) {
-        match t.kind {
-            TyKind::TraitObject(
-                poly_trait_refs,
-                Lifetime { name: LifetimeName::ImplicitObjectLifetimeDefault, .. },
-            ) => {
-                for ptr in poly_trait_refs {
-                    if Some(self.1) == ptr.trait_ref.trait_def_id() {
-                        self.0.push(ptr.span);
-                    }
+        if let TyKind::TraitObject(
+            poly_trait_refs,
+            Lifetime { name: LifetimeName::ImplicitObjectLifetimeDefault, .. },
+        ) = t.kind
+        {
+            for ptr in poly_trait_refs {
+                if Some(self.1) == ptr.trait_ref.trait_def_id() {
+                    self.0.push(ptr.span);
                 }
             }
-            _ => {}
         }
         walk_ty(self, t);
     }

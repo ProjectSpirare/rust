@@ -12,9 +12,9 @@ use crate::MemFlags;
 use rustc_ast as ast;
 use rustc_hir::lang_items::LangItem;
 use rustc_index::vec::Idx;
-use rustc_middle::mir;
-use rustc_middle::mir::interpret::{AllocId, ConstValue, Pointer, Scalar};
+use rustc_middle::mir::interpret::ConstValue;
 use rustc_middle::mir::AssertKind;
+use rustc_middle::mir::{self, SwitchTargets};
 use rustc_middle::ty::layout::{FnAbiExt, HasTyCtxt};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, Instance, Ty, TypeFoldable};
@@ -23,8 +23,6 @@ use rustc_span::{sym, Symbol};
 use rustc_target::abi::call::{ArgAbi, FnAbi, PassMode};
 use rustc_target::abi::{self, LayoutOf};
 use rustc_target::spec::abi::Abi;
-
-use std::borrow::Cow;
 
 /// Used by `FunctionCx::codegen_terminator` for emitting common patterns
 /// e.g., creating a basic block, calling a function, etc.
@@ -39,12 +37,9 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
     /// `funclet_bb` member if it is not `None`.
     fn funclet<'b, Bx: BuilderMethods<'a, 'tcx>>(
         &self,
-        fx: &'b mut FunctionCx<'a, 'tcx, Bx>,
+        fx: &'b FunctionCx<'a, 'tcx, Bx>,
     ) -> Option<&'b Bx::Funclet> {
-        match self.funclet_bb {
-            Some(funcl) => fx.funclets[funcl].as_ref(),
-            None => None,
-        }
+        self.funclet_bb.and_then(|funcl| fx.funclets[funcl].as_ref())
     }
 
     fn lltarget<Bx: BuilderMethods<'a, 'tcx>>(
@@ -165,7 +160,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
                 target <= self.bb
                     && target.start_location().is_predecessor_of(self.bb.start_location(), mir)
             }) {
-                bx.sideeffect();
+                bx.sideeffect(false);
             }
         }
     }
@@ -198,42 +193,37 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         mut bx: Bx,
         discr: &mir::Operand<'tcx>,
         switch_ty: Ty<'tcx>,
-        values: &Cow<'tcx, [u128]>,
-        targets: &Vec<mir::BasicBlock>,
+        targets: &SwitchTargets,
     ) {
         let discr = self.codegen_operand(&mut bx, &discr);
         // `switch_ty` is redundant, sanity-check that.
         assert_eq!(discr.layout.ty, switch_ty);
-        if targets.len() == 2 {
-            // If there are two targets, emit br instead of switch
-            let lltrue = helper.llblock(self, targets[0]);
-            let llfalse = helper.llblock(self, targets[1]);
+        helper.maybe_sideeffect(self.mir, &mut bx, targets.all_targets());
+
+        let mut target_iter = targets.iter();
+        if target_iter.len() == 1 {
+            // If there are two targets (one conditional, one fallback), emit br instead of switch
+            let (test_value, target) = target_iter.next().unwrap();
+            let lltrue = helper.llblock(self, target);
+            let llfalse = helper.llblock(self, targets.otherwise());
             if switch_ty == bx.tcx().types.bool {
-                helper.maybe_sideeffect(self.mir, &mut bx, targets.as_slice());
                 // Don't generate trivial icmps when switching on bool
-                if let [0] = values[..] {
-                    bx.cond_br(discr.immediate(), llfalse, lltrue);
-                } else {
-                    assert_eq!(&values[..], &[1]);
-                    bx.cond_br(discr.immediate(), lltrue, llfalse);
+                match test_value {
+                    0 => bx.cond_br(discr.immediate(), llfalse, lltrue),
+                    1 => bx.cond_br(discr.immediate(), lltrue, llfalse),
+                    _ => bug!(),
                 }
             } else {
                 let switch_llty = bx.immediate_backend_type(bx.layout_of(switch_ty));
-                let llval = bx.const_uint_big(switch_llty, values[0]);
+                let llval = bx.const_uint_big(switch_llty, test_value);
                 let cmp = bx.icmp(IntPredicate::IntEQ, discr.immediate(), llval);
-                helper.maybe_sideeffect(self.mir, &mut bx, targets.as_slice());
                 bx.cond_br(cmp, lltrue, llfalse);
             }
         } else {
-            helper.maybe_sideeffect(self.mir, &mut bx, targets.as_slice());
-            let (otherwise, targets) = targets.split_last().unwrap();
             bx.switch(
                 discr.immediate(),
-                helper.llblock(self, *otherwise),
-                values
-                    .iter()
-                    .zip(targets)
-                    .map(|(&value, target)| (value, helper.llblock(self, *target))),
+                helper.llblock(self, targets.otherwise()),
+                target_iter.map(|(value, target)| (value, helper.llblock(self, target))),
             );
         }
     }
@@ -262,7 +252,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             return;
         }
         let llval = match self.fn_abi.ret.mode {
-            PassMode::Ignore | PassMode::Indirect(..) => {
+            PassMode::Ignore | PassMode::Indirect { .. } => {
                 bx.ret_void();
                 return;
             }
@@ -313,7 +303,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         unwind: Option<mir::BasicBlock>,
     ) {
         let ty = location.ty(self.mir, bx.tcx()).ty;
-        let ty = self.monomorphize(&ty);
+        let ty = self.monomorphize(ty);
         let drop_fn = Instance::resolve_drop_in_place(bx.tcx(), ty);
 
         if let ty::InstanceDef::DropGlue(_, None) = drop_fn.def {
@@ -412,7 +402,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         self.set_debug_loc(&mut bx, terminator.source_info);
 
         // Get the location information.
-        let location = self.get_caller_location(&mut bx, span).immediate();
+        let location = self.get_caller_location(&mut bx, terminator.source_info).immediate();
 
         // Put together the arguments to the panic entry point.
         let (lang_item, args) = match msg {
@@ -449,7 +439,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         bx: &mut Bx,
         intrinsic: Option<Symbol>,
         instance: Option<Instance<'tcx>>,
-        span: Span,
+        source_info: mir::SourceInfo,
         destination: &Option<(mir::Place<'tcx>, mir::BasicBlock)>,
         cleanup: Option<mir::BasicBlock>,
     ) -> bool {
@@ -461,7 +451,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             Inhabited,
             ZeroValid,
             UninitValid,
-        };
+        }
         let panic_intrinsic = intrinsic.and_then(|i| match i {
             sym::assert_inhabited => Some(AssertIntrinsic::Inhabited),
             sym::assert_zero_valid => Some(AssertIntrinsic::ZeroValid),
@@ -491,11 +481,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     }
                 });
                 let msg = bx.const_str(Symbol::intern(&msg_str));
-                let location = self.get_caller_location(bx, span).immediate();
+                let location = self.get_caller_location(bx, source_info).immediate();
 
                 // Obtain the panic entry point.
                 // FIXME: dedup this with `codegen_assert_terminator` above.
-                let def_id = common::langcall(bx.tcx(), Some(span), "", LangItem::Panic);
+                let def_id =
+                    common::langcall(bx.tcx(), Some(source_info.span), "", LangItem::Panic);
                 let instance = ty::Instance::mono(bx.tcx(), def_id);
                 let fn_abi = FnAbi::of_instance(bx, instance, &[]);
                 let llfn = bx.get_fn_addr(instance);
@@ -531,12 +522,14 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         mut bx: Bx,
         terminator: &mir::Terminator<'tcx>,
         func: &mir::Operand<'tcx>,
-        args: &Vec<mir::Operand<'tcx>>,
+        args: &[mir::Operand<'tcx>],
         destination: &Option<(mir::Place<'tcx>, mir::BasicBlock)>,
         cleanup: Option<mir::BasicBlock>,
         fn_span: Span,
     ) {
-        let span = terminator.source_info.span;
+        let source_info = terminator.source_info;
+        let span = source_info.span;
+
         // Create the callee. This is a fn ptr or zero-sized and hence a kind of scalar.
         let callee = self.codegen_operand(&mut bx, func);
 
@@ -580,7 +573,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             .iter()
             .map(|op_arg| {
                 let op_ty = op_arg.ty(self.mir, bx.tcx());
-                self.monomorphize(&op_ty)
+                self.monomorphize(op_ty)
             })
             .collect::<Vec<_>>();
 
@@ -613,7 +606,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             &mut bx,
             intrinsic,
             instance,
-            span,
+            source_info,
             destination,
             cleanup,
         ) {
@@ -634,7 +627,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
         if intrinsic == Some(sym::caller_location) {
             if let Some((_, target)) = destination.as_ref() {
-                let location = self.get_caller_location(&mut bx, fn_span);
+                let location = self
+                    .get_caller_location(&mut bx, mir::SourceInfo { span: fn_span, ..source_info });
 
                 if let ReturnDest::IndirectOperand(tmp, _) = ret_dest {
                     location.val.store(&mut bx, tmp);
@@ -687,12 +681,13 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 })
                 .collect();
 
-            bx.codegen_intrinsic_call(
+            Self::codegen_intrinsic_call(
+                &mut bx,
                 *instance.as_ref().unwrap(),
                 &fn_abi,
                 &args,
                 dest,
-                terminator.source_info.span,
+                span,
             );
 
             if let ReturnDest::IndirectOperand(dst, _) = ret_dest {
@@ -799,7 +794,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 args.len() + 1,
                 "#[track_caller] fn's must have 1 more argument in their ABI than in their MIR",
             );
-            let location = self.get_caller_location(&mut bx, fn_span);
+            let location =
+                self.get_caller_location(&mut bx, mir::SourceInfo { span: fn_span, ..source_info });
             debug!(
                 "codegen_call_terminator({:?}): location={:?} (fn_span {:?})",
                 terminator, location, fn_span
@@ -867,30 +863,18 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         let ty = constant.literal.ty;
                         let size = bx.layout_of(ty).size;
                         let scalar = match const_value {
-                            // Promoted constants are evaluated into a ByRef instead of a Scalar,
-                            // but we want the scalar value here.
-                            ConstValue::ByRef { alloc, offset } => {
-                                let ptr = Pointer::new(AllocId(0), offset);
-                                alloc
-                                    .read_scalar(&bx, ptr, size)
-                                    .and_then(|s| s.check_init())
-                                    .unwrap_or_else(|e| {
-                                        bx.tcx().sess.span_err(
-                                            span,
-                                            &format!("Could not evaluate asm const: {}", e),
-                                        );
-
-                                        // We are erroring out, just emit a dummy constant.
-                                        Scalar::from_u64(0)
-                                    })
-                            }
-                            _ => span_bug!(span, "expected ByRef for promoted asm const"),
+                            ConstValue::Scalar(s) => s,
+                            _ => span_bug!(
+                                span,
+                                "expected Scalar for promoted asm const, but got {:#?}",
+                                const_value
+                            ),
                         };
                         let value = scalar.assert_bits(size);
                         let string = match ty.kind() {
                             ty::Uint(_) => value.to_string(),
                             ty::Int(int_ty) => {
-                                match int_ty.normalize(bx.tcx().sess.target.ptr_width) {
+                                match int_ty.normalize(bx.tcx().sess.target.pointer_width) {
                                     ast::IntTy::I8 => (value as i8).to_string(),
                                     ast::IntTy::I16 => (value as i16).to_string(),
                                     ast::IntTy::I32 => (value as i32).to_string(),
@@ -913,7 +897,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     }
                 }
                 mir::InlineAsmOperand::SymFn { ref value } => {
-                    let literal = self.monomorphize(&value.literal);
+                    let literal = self.monomorphize(value.literal);
                     if let ty::FnDef(def_id, substs) = *literal.ty.kind() {
                         let instance = ty::Instance::resolve_for_fn_ptr(
                             bx.tcx(),
@@ -982,12 +966,28 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             }
 
             mir::TerminatorKind::Goto { target } => {
-                helper.maybe_sideeffect(self.mir, &mut bx, &[target]);
+                if bb == target {
+                    // This is an unconditional branch back to this same basic
+                    // block. That means we have something like a `loop {}`
+                    // statement. Currently LLVM miscompiles this because it
+                    // assumes forward progress. We want to prevent this in all
+                    // cases, but that has a fairly high cost to compile times
+                    // currently. Instead, try to handle this specific case
+                    // which comes up commonly in practice (e.g., in embedded
+                    // code).
+                    //
+                    // The `true` here means we insert side effects regardless
+                    // of -Zinsert-sideeffect being passed on unconditional
+                    // branching to the same basic block.
+                    bx.sideeffect(true);
+                } else {
+                    helper.maybe_sideeffect(self.mir, &mut bx, &[target]);
+                }
                 helper.funclet_br(self, &mut bx, target);
             }
 
-            mir::TerminatorKind::SwitchInt { ref discr, switch_ty, ref values, ref targets } => {
-                self.codegen_switchint_terminator(helper, bx, discr, switch_ty, values, targets);
+            mir::TerminatorKind::SwitchInt { ref discr, switch_ty, ref targets } => {
+                self.codegen_switchint_terminator(helper, bx, discr, switch_ty, targets);
             }
 
             mir::TerminatorKind::Return => {
@@ -1098,7 +1098,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         // Force by-ref if we have to load through a cast pointer.
         let (mut llval, align, by_ref) = match op.val {
             Immediate(_) | Pair(..) => match arg.mode {
-                PassMode::Indirect(..) | PassMode::Cast(_) => {
+                PassMode::Indirect { .. } | PassMode::Cast(_) => {
                     let scratch = PlaceRef::alloca(bx, arg.layout);
                     op.val.store(bx, scratch);
                     (scratch.llval, scratch.align, true)
@@ -1181,17 +1181,49 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         }
     }
 
-    fn get_caller_location(&mut self, bx: &mut Bx, span: Span) -> OperandRef<'tcx, Bx::Value> {
-        self.caller_location.unwrap_or_else(|| {
+    fn get_caller_location(
+        &mut self,
+        bx: &mut Bx,
+        mut source_info: mir::SourceInfo,
+    ) -> OperandRef<'tcx, Bx::Value> {
+        let tcx = bx.tcx();
+
+        let mut span_to_caller_location = |span: Span| {
             let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
-            let caller = bx.tcx().sess.source_map().lookup_char_pos(topmost.lo());
-            let const_loc = bx.tcx().const_caller_location((
+            let caller = tcx.sess.source_map().lookup_char_pos(topmost.lo());
+            let const_loc = tcx.const_caller_location((
                 Symbol::intern(&caller.file.name.to_string()),
                 caller.line as u32,
                 caller.col_display as u32 + 1,
             ));
             OperandRef::from_const(bx, const_loc, bx.tcx().caller_location_ty())
-        })
+        };
+
+        // Walk up the `SourceScope`s, in case some of them are from MIR inlining.
+        // If so, the starting `source_info.span` is in the innermost inlined
+        // function, and will be replaced with outer callsite spans as long
+        // as the inlined functions were `#[track_caller]`.
+        loop {
+            let scope_data = &self.mir.source_scopes[source_info.scope];
+
+            if let Some((callee, callsite_span)) = scope_data.inlined {
+                // Stop inside the most nested non-`#[track_caller]` function,
+                // before ever reaching its caller (which is irrelevant).
+                if !callee.def.requires_caller_location(tcx) {
+                    return span_to_caller_location(source_info.span);
+                }
+                source_info.span = callsite_span;
+            }
+
+            // Skip past all of the parents with `inlined: None`.
+            match scope_data.inlined_parent_scope {
+                Some(parent) => source_info.scope = parent,
+                None => break,
+            }
+        }
+
+        // No inlined `SourceScope`s, or all of them were `#[track_caller]`.
+        self.caller_location.unwrap_or_else(|| span_to_caller_location(source_info.span))
     }
 
     fn get_personality_slot(&mut self, bx: &mut Bx) -> PlaceRef<'tcx, Bx::Value> {
@@ -1363,6 +1395,25 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         dst: PlaceRef<'tcx, Bx::Value>,
     ) {
         let src = self.codegen_operand(bx, src);
+
+        // Special-case transmutes between scalars as simple bitcasts.
+        match (&src.layout.abi, &dst.layout.abi) {
+            (abi::Abi::Scalar(src_scalar), abi::Abi::Scalar(dst_scalar)) => {
+                // HACK(eddyb) LLVM doesn't like `bitcast`s between pointers and non-pointers.
+                if (src_scalar.value == abi::Pointer) == (dst_scalar.value == abi::Pointer) {
+                    assert_eq!(src.layout.size, dst.layout.size);
+
+                    // NOTE(eddyb) the `from_immediate` and `to_immediate_scalar`
+                    // conversions allow handling `bool`s the same as `u8`s.
+                    let src = bx.from_immediate(src.immediate());
+                    let src_as_dst = bx.bitcast(src, bx.backend_type(dst.layout));
+                    Immediate(bx.to_immediate_scalar(src_as_dst, dst_scalar)).store(bx, dst);
+                    return;
+                }
+            }
+            _ => {}
+        }
+
         let llty = bx.backend_type(src.layout);
         let cast_ptr = bx.pointercast(dst.llval, bx.type_ptr_to(llty));
         let align = src.layout.align.abi.min(dst.align);

@@ -73,7 +73,7 @@ macro_rules! span_mirbug {
             $context.last_span,
             &format!(
                 "broken MIR in {:?} ({:?}): {}",
-                $context.mir_def_id,
+                $context.body.source.def_id(),
                 $elem,
                 format_args!($($message)*),
             ),
@@ -113,7 +113,6 @@ mod relate_tys;
 /// - `param_env` -- parameter environment to use for trait solving
 /// - `body` -- MIR body to type-check
 /// - `promoted` -- map of promoted constants within `body`
-/// - `mir_def_id` -- `LocalDefId` from which the MIR is derived
 /// - `universal_regions` -- the universal regions from `body`s function signature
 /// - `location_table` -- MIR location map of `body`
 /// - `borrow_set` -- information about borrows occurring in `body`
@@ -126,7 +125,6 @@ pub(crate) fn type_check<'mir, 'tcx>(
     param_env: ty::ParamEnv<'tcx>,
     body: &Body<'tcx>,
     promoted: &IndexVec<Promoted, Body<'tcx>>,
-    mir_def_id: LocalDefId,
     universal_regions: &Rc<UniversalRegions<'tcx>>,
     location_table: &LocationTable,
     borrow_set: &BorrowSet<'tcx>,
@@ -170,7 +168,6 @@ pub(crate) fn type_check<'mir, 'tcx>(
 
     let opaque_type_values = type_check_internal(
         infcx,
-        mir_def_id,
         param_env,
         body,
         promoted,
@@ -192,7 +189,6 @@ pub(crate) fn type_check<'mir, 'tcx>(
 
 fn type_check_internal<'a, 'tcx, R>(
     infcx: &'a InferCtxt<'a, 'tcx>,
-    mir_def_id: LocalDefId,
     param_env: ty::ParamEnv<'tcx>,
     body: &'a Body<'tcx>,
     promoted: &'a IndexVec<Promoted, Body<'tcx>>,
@@ -205,7 +201,6 @@ fn type_check_internal<'a, 'tcx, R>(
     let mut checker = TypeChecker::new(
         infcx,
         body,
-        mir_def_id,
         param_env,
         region_bound_pairs,
         implicit_region_bound,
@@ -272,7 +267,6 @@ struct TypeVerifier<'a, 'b, 'tcx> {
     body: &'b Body<'tcx>,
     promoted: &'b IndexVec<Promoted, Body<'tcx>>,
     last_span: Span,
-    mir_def_id: LocalDefId,
     errors_reported: bool,
 }
 
@@ -460,14 +454,7 @@ impl<'a, 'b, 'tcx> TypeVerifier<'a, 'b, 'tcx> {
         body: &'b Body<'tcx>,
         promoted: &'b IndexVec<Promoted, Body<'tcx>>,
     ) -> Self {
-        TypeVerifier {
-            body,
-            promoted,
-            mir_def_id: cx.mir_def_id,
-            cx,
-            last_span: body.span,
-            errors_reported: false,
-        }
+        TypeVerifier { body, promoted, cx, last_span: body.span, errors_reported: false }
     }
 
     fn tcx(&self) -> TyCtxt<'tcx> {
@@ -762,7 +749,11 @@ impl<'a, 'b, 'tcx> TypeVerifier<'a, 'b, 'tcx> {
                     (&adt_def.variants[VariantIdx::new(0)], substs)
                 }
                 ty::Closure(_, substs) => {
-                    return match substs.as_closure().upvar_tys().nth(field.index()) {
+                    return match substs
+                        .as_closure()
+                        .tupled_upvars_ty()
+                        .tuple_element_ty(field.index())
+                    {
                         Some(ty) => Ok(ty),
                         None => Err(FieldAccessError::OutOfRange {
                             field_count: substs.as_closure().upvar_tys().count(),
@@ -797,7 +788,7 @@ impl<'a, 'b, 'tcx> TypeVerifier<'a, 'b, 'tcx> {
         };
 
         if let Some(field) = variant.fields.get(field.index()) {
-            Ok(self.cx.normalize(&field.ty(tcx, substs), location))
+            Ok(self.cx.normalize(field.ty(tcx, substs), location))
         } else {
             Err(FieldAccessError::OutOfRange { field_count: variant.fields.len() })
         }
@@ -816,7 +807,6 @@ struct TypeChecker<'a, 'tcx> {
     /// User type annotations are shared between the main MIR and the MIR of
     /// all of the promoted items.
     user_type_annotations: &'a CanonicalUserTypeAnnotations<'tcx>,
-    mir_def_id: LocalDefId,
     region_bound_pairs: &'a RegionBoundPairs<'tcx>,
     implicit_region_bound: ty::Region<'tcx>,
     reported_errors: FxHashSet<(Ty<'tcx>, Span)>,
@@ -965,7 +955,6 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     fn new(
         infcx: &'a InferCtxt<'a, 'tcx>,
         body: &'a Body<'tcx>,
-        mir_def_id: LocalDefId,
         param_env: ty::ParamEnv<'tcx>,
         region_bound_pairs: &'a RegionBoundPairs<'tcx>,
         implicit_region_bound: ty::Region<'tcx>,
@@ -975,7 +964,6 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         let mut checker = Self {
             infcx,
             last_span: DUMMY_SP,
-            mir_def_id,
             body,
             user_type_annotations: &body.user_type_annotations,
             param_env,
@@ -988,6 +976,11 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         };
         checker.check_user_type_annotations();
         checker
+    }
+
+    fn unsized_feature_enabled(&self) -> bool {
+        let features = self.tcx().features();
+        features.unsized_locals || features.unsized_fn_params
     }
 
     /// Equate the inferred type and the annotated type for user type annotations
@@ -1021,7 +1014,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     }
 
                     self.prove_predicate(
-                        ty::PredicateAtom::WellFormed(inferred_ty.into()).to_predicate(self.tcx()),
+                        ty::PredicateKind::WellFormed(inferred_ty.into()).to_predicate(self.tcx()),
                         Locations::All(span),
                         ConstraintCategory::TypeAnnotation,
                     );
@@ -1145,7 +1138,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 // the resulting inferend values are stored with the
                 // def-id of the base function.
                 let parent_def_id =
-                    self.tcx().closure_base_def_id(self.mir_def_id.to_def_id()).expect_local();
+                    self.tcx().closure_base_def_id(self.body.source.def_id()).expect_local();
                 return self.eq_opaque_type_and_type(sub, sup, parent_def_id, locations, category);
             } else {
                 return Err(terr);
@@ -1242,7 +1235,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         let concrete_opaque_types = &tcx.typeck(anon_owner_def_id).concrete_opaque_types;
         let mut opaque_type_values = Vec::new();
 
-        debug!("eq_opaque_type_and_type: mir_def_id={:?}", self.mir_def_id);
+        debug!("eq_opaque_type_and_type: mir_def_id={:?}", body.source.def_id());
         let opaque_type_map = self.fully_perform_op(
             locations,
             category,
@@ -1256,7 +1249,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                             anon_owner_def_id,
                             dummy_body_id,
                             param_env,
-                            &anon_ty,
+                            anon_ty,
                             locations.span(body),
                         ));
                     debug!(
@@ -1273,7 +1266,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     obligations.obligations.push(traits::Obligation::new(
                         ObligationCause::dummy(),
                         param_env,
-                        ty::PredicateAtom::WellFormed(revealed_ty.into()).to_predicate(infcx.tcx),
+                        ty::PredicateKind::WellFormed(revealed_ty.into()).to_predicate(infcx.tcx),
                     ));
                     obligations.add(
                         infcx
@@ -1282,7 +1275,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     );
 
                     for (&opaque_def_id, opaque_decl) in &opaque_type_map {
-                        let resolved_ty = infcx.resolve_vars_if_possible(&opaque_decl.concrete_ty);
+                        let resolved_ty = infcx.resolve_vars_if_possible(opaque_decl.concrete_ty);
                         let concrete_is_opaque = if let ty::Opaque(def_id, _) = resolved_ty.kind() {
                             *def_id == opaque_def_id
                         } else {
@@ -1307,7 +1300,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                         let subst_opaque_defn_ty =
                             opaque_defn_ty.concrete_type.subst(tcx, opaque_decl.substs);
                         let renumbered_opaque_defn_ty =
-                            renumber::renumber_regions(infcx, &subst_opaque_defn_ty);
+                            renumber::renumber_regions(infcx, subst_opaque_defn_ty);
 
                         debug!(
                             "eq_opaque_type_and_type: concrete_ty={:?}={:?} opaque_defn_ty={:?}",
@@ -1472,7 +1465,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 }
 
                 self.check_rvalue(body, rv, location);
-                if !self.tcx().features().unsized_locals {
+                if !self.unsized_feature_enabled() {
                     let trait_ref = ty::TraitRef {
                         def_id: tcx.require_lang_item(LangItem::Sized, Some(self.last_span)),
                         substs: tcx.mk_substs_trait(place_ty, &[]),
@@ -1612,13 +1605,13 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 let (sig, map) = self.infcx.replace_bound_vars_with_fresh_vars(
                     term.source_info.span,
                     LateBoundRegionConversionTime::FnCall,
-                    &sig,
+                    sig,
                 );
                 let sig = self.normalize(sig, term_location);
                 self.check_call_dest(body, term, &sig, destination, term_location);
 
                 self.prove_predicates(
-                    sig.inputs_and_output.iter().map(|ty| ty::PredicateAtom::WellFormed(ty.into())),
+                    sig.inputs_and_output.iter().map(|ty| ty::PredicateKind::WellFormed(ty.into())),
                     term_location.to_locations(),
                     ConstraintCategory::Boring,
                 );
@@ -1733,9 +1726,9 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     );
                 }
 
-                // When `#![feature(unsized_locals)]` is not enabled,
+                // When `unsized_fn_params` and `unsized_locals` are both not enabled,
                 // this check is done at `check_local`.
-                if self.tcx().features().unsized_locals {
+                if self.unsized_feature_enabled() {
                     let span = term.source_info.span;
                     self.ensure_place_sized(dest_ty, span);
                 }
@@ -1793,7 +1786,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 self.assert_iscleanup(body, block_data, target, is_cleanup)
             }
             TerminatorKind::SwitchInt { ref targets, .. } => {
-                for target in targets {
+                for target in targets.all_targets() {
                     self.assert_iscleanup(body, block_data, *target, is_cleanup);
                 }
             }
@@ -1862,8 +1855,8 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     self.assert_iscleanup(body, block_data, unwind, true);
                 }
             }
-            TerminatorKind::InlineAsm { ref destination, .. } => {
-                if let &Some(target) = destination {
+            TerminatorKind::InlineAsm { destination, .. } => {
+                if let Some(target) = destination {
                     self.assert_iscleanup(body, block_data, target, is_cleanup);
                 }
             }
@@ -1896,9 +1889,9 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             LocalKind::Var | LocalKind::Temp => {}
         }
 
-        // When `#![feature(unsized_locals)]` is enabled, only function calls
+        // When `unsized_fn_params` or `unsized_locals` is enabled, only function calls
         // and nullary ops are checked in `check_call_dest`.
-        if !self.tcx().features().unsized_locals {
+        if !self.unsized_feature_enabled() {
             let span = local_decl.source_info.span;
             let ty = local_decl.ty;
             self.ensure_place_sized(ty, span);
@@ -1911,7 +1904,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         // Erase the regions from `ty` to get a global type.  The
         // `Sized` bound in no way depends on precise regions, so this
         // shouldn't affect `is_sized`.
-        let erased_ty = tcx.erase_regions(&ty);
+        let erased_ty = tcx.erase_regions(ty);
         if !erased_ty.is_sized(tcx.at(span), self.param_env) {
             // in current MIR construction, all non-control-flow rvalue
             // expressions evaluate through `as_temp` or `into` a return
@@ -1995,48 +1988,48 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 // If the length is larger than 1, the repeat expression will need to copy the
                 // element, so we require the `Copy` trait.
                 if len.try_eval_usize(tcx, self.param_env).map_or(true, |len| len > 1) {
-                    if let Operand::Move(_) = operand {
-                        // While this is located in `nll::typeck` this error is not an NLL error, it's
-                        // a required check to make sure that repeated elements implement `Copy`.
-                        let span = body.source_info(location).span;
-                        let ty = operand.ty(body, tcx);
-                        if !self.infcx.type_is_copy_modulo_regions(self.param_env, ty, span) {
-                            let ccx = ConstCx::new_with_param_env(
-                                tcx,
-                                self.mir_def_id,
-                                body,
-                                self.param_env,
-                            );
-                            // To determine if `const_in_array_repeat_expressions` feature gate should
-                            // be mentioned, need to check if the rvalue is promotable.
-                            let should_suggest =
-                                should_suggest_const_in_array_repeat_expressions_attribute(
-                                    &ccx, operand,
-                                );
-                            debug!("check_rvalue: should_suggest={:?}", should_suggest);
+                    match operand {
+                        Operand::Copy(..) | Operand::Constant(..) => {
+                            // These are always okay: direct use of a const, or a value that can evidently be copied.
+                        }
+                        Operand::Move(_) => {
+                            // Make sure that repeated elements implement `Copy`.
+                            let span = body.source_info(location).span;
+                            let ty = operand.ty(body, tcx);
+                            if !self.infcx.type_is_copy_modulo_regions(self.param_env, ty, span) {
+                                let ccx = ConstCx::new_with_param_env(tcx, body, self.param_env);
+                                // To determine if `const_in_array_repeat_expressions` feature gate should
+                                // be mentioned, need to check if the rvalue is promotable.
+                                let should_suggest =
+                                    should_suggest_const_in_array_repeat_expressions_attribute(
+                                        &ccx, operand,
+                                    );
+                                debug!("check_rvalue: should_suggest={:?}", should_suggest);
 
-                            self.infcx.report_selection_error(
-                                &traits::Obligation::new(
-                                    ObligationCause::new(
-                                        span,
-                                        self.tcx().hir().local_def_id_to_hir_id(self.mir_def_id),
-                                        traits::ObligationCauseCode::RepeatVec(should_suggest),
-                                    ),
-                                    self.param_env,
-                                    ty::Binder::bind(ty::TraitRef::new(
-                                        self.tcx().require_lang_item(
-                                            LangItem::Copy,
-                                            Some(self.last_span),
+                                let def_id = body.source.def_id().expect_local();
+                                self.infcx.report_selection_error(
+                                    &traits::Obligation::new(
+                                        ObligationCause::new(
+                                            span,
+                                            self.tcx().hir().local_def_id_to_hir_id(def_id),
+                                            traits::ObligationCauseCode::RepeatVec(should_suggest),
                                         ),
-                                        tcx.mk_substs_trait(ty, &[]),
-                                    ))
-                                    .without_const()
-                                    .to_predicate(self.tcx()),
-                                ),
-                                &traits::SelectionError::Unimplemented,
-                                false,
-                                false,
-                            );
+                                        self.param_env,
+                                        ty::Binder::bind(ty::TraitRef::new(
+                                            self.tcx().require_lang_item(
+                                                LangItem::Copy,
+                                                Some(self.last_span),
+                                            ),
+                                            tcx.mk_substs_trait(ty, &[]),
+                                        ))
+                                        .without_const()
+                                        .to_predicate(self.tcx()),
+                                    ),
+                                    &traits::SelectionError::Unimplemented,
+                                    false,
+                                    false,
+                                );
+                            }
                         }
                     }
                 }
@@ -2044,7 +2037,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
 
             Rvalue::NullaryOp(_, ty) => {
                 // Even with unsized locals cannot box an unsized value.
-                if self.tcx().features().unsized_locals {
+                if self.unsized_feature_enabled() {
                     let span = body.source_info(location).span;
                     self.ensure_place_sized(ty, span);
                 }
@@ -2701,7 +2694,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         category: ConstraintCategory,
     ) {
         self.prove_predicates(
-            Some(ty::PredicateAtom::Trait(
+            Some(ty::PredicateKind::Trait(
                 ty::TraitPredicate { trait_ref },
                 hir::Constness::NotConst,
             )),

@@ -8,9 +8,9 @@ LL | |
 LL | |     })
    | |_____^
    |
-   = note: defining type: case1::{{closure}}#0 with closure substs [
+   = note: defining type: case1::{closure#0} with closure substs [
                i32,
-               for<'r> extern "rust-call" fn((std::cell::Cell<&'_#1r u32>, std::cell::Cell<&ReLateBound(DebruijnIndex(0), BrNamed('r)) u32>)),
+               for<'r> extern "rust-call" fn((std::cell::Cell<&'_#1r u32>, std::cell::Cell<&ReLateBound(DebruijnIndex(0), BoundRegion { kind: BrNamed('r) }) u32>)),
                (),
            ]
 
@@ -47,9 +47,9 @@ LL | |         cell_x.set(cell_a.get()); // forces 'a: 'x, implies 'a = 'static 
 LL | |     })
    | |_____^
    |
-   = note: defining type: case2::{{closure}}#0 with closure substs [
+   = note: defining type: case2::{closure#0} with closure substs [
                i32,
-               for<'r> extern "rust-call" fn((std::cell::Cell<&'_#1r u32>, std::cell::Cell<&ReLateBound(DebruijnIndex(0), BrNamed('r)) u32>)),
+               for<'r> extern "rust-call" fn((std::cell::Cell<&'_#1r u32>, std::cell::Cell<&ReLateBound(DebruijnIndex(0), BoundRegion { kind: BrNamed('r) }) u32>)),
                (),
            ]
    = note: number of external vids: 2

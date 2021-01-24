@@ -6,16 +6,16 @@
 //!
 //! This API is completely unstable and subject to change.
 
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![allow(incomplete_features)]
+#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
+#![feature(array_windows)]
 #![feature(control_flow_enum)]
 #![feature(in_band_lifetimes)]
 #![feature(unboxed_closures)]
-#![feature(generators)]
 #![feature(generator_trait)]
 #![feature(fn_traits)]
+#![feature(int_bits_const)]
 #![feature(min_specialization)]
-#![feature(optin_builtin_traits)]
+#![feature(auto_traits)]
 #![feature(nll)]
 #![feature(allow_internal_unstable)]
 #![feature(hash_raw_entry)]
@@ -26,9 +26,12 @@
 #![feature(thread_id_value)]
 #![feature(extend_one)]
 #![feature(const_panic)]
-#![feature(const_generics)]
+#![cfg_attr(bootstrap, feature(min_const_generics))]
+#![feature(new_uninit)]
 #![feature(once_cell)]
+#![feature(maybe_uninit_uninit_array)]
 #![allow(rustc::default_hash_types)]
+#![deny(unaligned_references)]
 
 #[macro_use]
 extern crate tracing;
@@ -46,9 +49,9 @@ pub fn cold_path<F: FnOnce() -> R, R>(f: F) -> R {
 #[macro_export]
 macro_rules! likely {
     ($e:expr) => {
-        #[allow(unused_unsafe)]
-        {
-            unsafe { std::intrinsics::likely($e) }
+        match $e {
+            #[allow(unused_unsafe)]
+            e => unsafe { std::intrinsics::likely(e) },
         }
     };
 }
@@ -56,9 +59,9 @@ macro_rules! likely {
 #[macro_export]
 macro_rules! unlikely {
     ($e:expr) => {
-        #[allow(unused_unsafe)]
-        {
-            unsafe { std::intrinsics::unlikely($e) }
+        match $e {
+            #[allow(unused_unsafe)]
+            e => unsafe { std::intrinsics::unlikely(e) },
         }
     };
 }
@@ -69,6 +72,7 @@ pub mod box_region;
 pub mod captures;
 pub mod const_cstr;
 pub mod flock;
+pub mod functor;
 pub mod fx;
 pub mod graph;
 pub mod jobserver;
@@ -87,24 +91,27 @@ pub mod sorted_map;
 pub mod stable_set;
 #[macro_use]
 pub mod stable_hasher;
+mod atomic_ref;
+pub mod fingerprint;
+pub mod profiling;
 pub mod sharded;
 pub mod stack;
 pub mod sync;
 pub mod thin_vec;
 pub mod tiny_list;
 pub mod transitive_relation;
-pub use ena::undo_log;
-pub use ena::unify;
-mod atomic_ref;
-pub mod fingerprint;
-pub mod profiling;
 pub mod vec_linked_list;
 pub mod work_queue;
 pub use atomic_ref::AtomicRef;
 pub mod frozen;
+pub mod sso;
+pub mod steal;
 pub mod tagged_ptr;
 pub mod temp_dir;
 pub mod unhash;
+
+pub use ena::undo_log;
+pub use ena::unify;
 
 pub struct OnDrop<F: Fn()>(pub F);
 

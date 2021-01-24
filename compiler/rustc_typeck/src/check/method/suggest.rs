@@ -2,7 +2,6 @@
 //! found or is otherwise invalid.
 
 use crate::check::FnCtxt;
-use rustc_ast::util::lev_distance;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_errors::{pluralize, struct_span_err, Applicability, DiagnosticBuilder};
 use rustc_hir as hir;
@@ -13,15 +12,16 @@ use rustc_hir::lang_items::LangItem;
 use rustc_hir::{ExprKind, Node, QPath};
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use rustc_middle::hir::map as hir_map;
+use rustc_middle::ty::fast_reject::simplify_type;
 use rustc_middle::ty::print::with_crate_prefix;
 use rustc_middle::ty::{
     self, ToPolyTraitRef, ToPredicate, Ty, TyCtxt, TypeFoldable, WithConstness,
 };
+use rustc_span::lev_distance;
 use rustc_span::symbol::{kw, sym, Ident};
 use rustc_span::{source_map, FileName, Span};
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt;
 use rustc_trait_selection::traits::Obligation;
-use rustc_trait_selection::traits::SelectionContext;
 
 use std::cmp::Ordering;
 
@@ -249,7 +249,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }) => {
                 let tcx = self.tcx;
 
-                let actual = self.resolve_vars_if_possible(&rcvr_ty);
+                let actual = self.resolve_vars_if_possible(rcvr_ty);
                 let ty_str = self.ty_to_string(actual);
                 let is_method = mode == Mode::MethodCall;
                 let item_kind = if is_method {
@@ -333,7 +333,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             }
                             ExprKind::Path(ref qpath) => {
                                 // local binding
-                                if let &QPath::Resolved(_, ref path) = &qpath {
+                                if let QPath::Resolved(_, path) = qpath {
                                     if let hir::def::Res::Local(hir_id) = path.res {
                                         let span = tcx.hir().span(hir_id);
                                         let snippet = tcx.sess.source_map().span_to_snippet(span);
@@ -582,8 +582,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let mut collect_type_param_suggestions =
                         |self_ty: Ty<'tcx>, parent_pred: &ty::Predicate<'tcx>, obligation: &str| {
                             // We don't care about regions here, so it's fine to skip the binder here.
-                            if let (ty::Param(_), ty::PredicateAtom::Trait(p, _)) =
-                                (self_ty.kind(), parent_pred.skip_binders())
+                            if let (ty::Param(_), ty::PredicateKind::Trait(p, _)) =
+                                (self_ty.kind(), parent_pred.kind().skip_binder())
                             {
                                 if let ty::Adt(def, _) = p.trait_ref.self_ty().kind() {
                                     let node = def.did.as_local().map(|def_id| {
@@ -620,8 +620,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             ty::Adt(def, _) => bound_spans.push((def_span(def.did), msg)),
                             // Point at the trait object that couldn't satisfy the bound.
                             ty::Dynamic(preds, _) => {
-                                for pred in preds.skip_binder() {
-                                    match pred {
+                                for pred in preds.iter() {
+                                    match pred.skip_binder() {
                                         ty::ExistentialPredicate::Trait(tr) => {
                                             bound_spans.push((def_span(tr.def_id), msg.clone()))
                                         }
@@ -637,9 +637,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         }
                     };
                     let mut format_pred = |pred: ty::Predicate<'tcx>| {
-                        match pred.skip_binders() {
-                            ty::PredicateAtom::Projection(pred) => {
-                                let pred = ty::Binder::bind(pred);
+                        let bound_predicate = pred.kind();
+                        match bound_predicate.skip_binder() {
+                            ty::PredicateKind::Projection(pred) => {
+                                let pred = bound_predicate.rebind(pred);
                                 // `<Foo as Iterator>::Item = String`.
                                 let trait_ref =
                                     pred.skip_binder().projection_ty.trait_ref(self.tcx);
@@ -657,9 +658,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 bound_span_label(trait_ref.self_ty(), &obligation, &quiet);
                                 Some((obligation, trait_ref.self_ty()))
                             }
-                            ty::PredicateAtom::Trait(poly_trait_ref, _) => {
-                                let poly_trait_ref = ty::Binder::bind(poly_trait_ref);
-                                let p = poly_trait_ref.skip_binder().trait_ref;
+                            ty::PredicateKind::Trait(poly_trait_ref, _) => {
+                                let p = poly_trait_ref.trait_ref;
                                 let self_ty = p.self_ty();
                                 let path = p.print_only_trait_path();
                                 let obligation = format!("{}: {}", self_ty, path);
@@ -674,9 +674,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         .iter()
                         .filter_map(|(pred, parent_pred)| {
                             format_pred(*pred).map(|(p, self_ty)| match parent_pred {
-                                None => format!("`{}`", p),
+                                None => format!("`{}`", &p),
                                 Some(parent_pred) => match format_pred(*parent_pred) {
-                                    None => format!("`{}`", p),
+                                    None => format!("`{}`", &p),
                                     Some((parent_p, _)) => {
                                         collect_type_param_suggestions(self_ty, parent_pred, &p);
                                         format!("`{}`\nwhich is required by `{}`", p, parent_p)
@@ -745,7 +745,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 if actual.is_enum() {
                     let adt_def = actual.ty_adt_def().expect("enum is not an ADT");
                     if let Some(suggestion) = lev_distance::find_best_match_for_name(
-                        adt_def.variants.iter().map(|s| &s.ident.name),
+                        &adt_def.variants.iter().map(|s| s.ident.name).collect::<Vec<_>>(),
                         item_name.name,
                         None,
                     ) {
@@ -870,46 +870,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         call: &hir::Expr<'_>,
         span: Span,
     ) {
-        if let ty::Opaque(def_id, _) = *ty.kind() {
-            let future_trait = self.tcx.require_lang_item(LangItem::Future, None);
-            // Future::Output
-            let item_def_id = self
-                .tcx
-                .associated_items(future_trait)
-                .in_definition_order()
-                .next()
-                .unwrap()
-                .def_id;
-
-            let projection_ty = self.tcx.projection_ty_from_predicates((def_id, item_def_id));
-            let cause = self.misc(span);
-            let mut selcx = SelectionContext::new(&self.infcx);
-            let mut obligations = vec![];
-            if let Some(projection_ty) = projection_ty {
-                let normalized_ty = rustc_trait_selection::traits::normalize_projection_type(
-                    &mut selcx,
-                    self.param_env,
-                    projection_ty,
-                    cause,
-                    0,
-                    &mut obligations,
-                );
-                debug!(
-                    "suggest_await_before_method: normalized_ty={:?}, ty_kind={:?}",
-                    self.resolve_vars_if_possible(&normalized_ty),
-                    normalized_ty.kind(),
-                );
-                let method_exists = self.method_exists(item_name, normalized_ty, call.hir_id, true);
-                debug!("suggest_await_before_method: is_method_exist={}", method_exists);
-                if method_exists {
-                    err.span_suggestion_verbose(
-                        span.shrink_to_lo(),
-                        "consider awaiting before this method call",
-                        "await.".to_string(),
-                        Applicability::MaybeIncorrect,
-                    );
-                }
-            }
+        let output_ty = match self.infcx.get_impl_future_output_ty(ty) {
+            Some(output_ty) => self.resolve_vars_if_possible(output_ty),
+            _ => return,
+        };
+        let method_exists = self.method_exists(item_name, output_ty, call.hir_id, true);
+        debug!("suggest_await_before_method: is_method_exist={}", method_exists);
+        if method_exists {
+            err.span_suggestion_verbose(
+                span.shrink_to_lo(),
+                "consider `await`ing on the `Future` and calling the method on its `Output`",
+                "await.".to_string(),
+                Applicability::MaybeIncorrect,
+            );
         }
     }
 
@@ -1019,11 +992,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // implementing a trait would be legal but is rejected
                 // here).
                 unsatisfied_predicates.iter().all(|(p, _)| {
-                    match p.skip_binders() {
+                    match p.kind().skip_binder() {
                         // Hide traits if they are present in predicates as they can be fixed without
                         // having to implement them.
-                        ty::PredicateAtom::Trait(t, _) => t.def_id() == info.def_id,
-                        ty::PredicateAtom::Projection(p) => {
+                        ty::PredicateKind::Trait(t, _) => t.def_id() == info.def_id,
+                        ty::PredicateKind::Projection(p) => {
                             p.projection_ty.item_def_id == info.def_id
                         }
                         _ => false,
@@ -1102,19 +1075,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             } else {
                 "items from traits can only be used if the trait is implemented and in scope"
             });
+            let candidates_len = candidates.len();
             let message = |action| {
                 format!(
                     "the following {traits_define} an item `{name}`, perhaps you need to {action} \
                      {one_of_them}:",
                     traits_define =
-                        if candidates.len() == 1 { "trait defines" } else { "traits define" },
+                        if candidates_len == 1 { "trait defines" } else { "traits define" },
                     action = action,
-                    one_of_them = if candidates.len() == 1 { "it" } else { "one of them" },
+                    one_of_them = if candidates_len == 1 { "it" } else { "one of them" },
                     name = item_name,
                 )
             };
             // Obtain the span for `param` and use it for a structured suggestion.
-            let mut suggested = false;
             if let (Some(ref param), Some(ref table)) =
                 (param_type, self.in_progress_typeck_results)
             {
@@ -1175,7 +1148,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                     Applicability::MaybeIncorrect,
                                 );
                             }
-                            suggested = true;
+                            return;
                         }
                         Node::Item(hir::Item {
                             kind: hir::ItemKind::Trait(.., bounds, _),
@@ -1195,45 +1168,96 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 }),
                                 Applicability::MaybeIncorrect,
                             );
-                            suggested = true;
+                            return;
                         }
                         _ => {}
                     }
                 }
             }
 
-            if !suggested {
-                let action = if let Some(param) = param_type {
-                    format!("restrict type parameter `{}` with", param)
-                } else {
-                    // FIXME: it might only need to be imported into scope, not implemented.
-                    "implement".to_string()
-                };
-                let mut use_note = true;
-                if let [trait_info] = &candidates[..] {
-                    if let Some(span) = self.tcx.hir().span_if_local(trait_info.def_id) {
-                        err.span_note(
-                            self.tcx.sess.source_map().guess_head_span(span),
-                            &format!(
-                                "`{}` defines an item `{}`, perhaps you need to {} it",
-                                self.tcx.def_path_str(trait_info.def_id),
-                                item_name,
-                                action
-                            ),
-                        );
-                        use_note = false
+            let (potential_candidates, explicitly_negative) = if param_type.is_some() {
+                // FIXME: Even though negative bounds are not implemented, we could maybe handle
+                // cases where a positive bound implies a negative impl.
+                (candidates, Vec::new())
+            } else if let Some(simp_rcvr_ty) = simplify_type(self.tcx, rcvr_ty, true) {
+                let mut potential_candidates = Vec::new();
+                let mut explicitly_negative = Vec::new();
+                for candidate in candidates {
+                    // Check if there's a negative impl of `candidate` for `rcvr_ty`
+                    if self
+                        .tcx
+                        .all_impls(candidate.def_id)
+                        .filter(|imp_did| {
+                            self.tcx.impl_polarity(*imp_did) == ty::ImplPolarity::Negative
+                        })
+                        .any(|imp_did| {
+                            let imp = self.tcx.impl_trait_ref(imp_did).unwrap();
+                            let imp_simp = simplify_type(self.tcx, imp.self_ty(), true);
+                            imp_simp.map_or(false, |s| s == simp_rcvr_ty)
+                        })
+                    {
+                        explicitly_negative.push(candidate);
+                    } else {
+                        potential_candidates.push(candidate);
                     }
                 }
-                if use_note {
+                (potential_candidates, explicitly_negative)
+            } else {
+                // We don't know enough about `recv_ty` to make proper suggestions.
+                (candidates, Vec::new())
+            };
+
+            let action = if let Some(param) = param_type {
+                format!("restrict type parameter `{}` with", param)
+            } else {
+                // FIXME: it might only need to be imported into scope, not implemented.
+                "implement".to_string()
+            };
+            match &potential_candidates[..] {
+                [] => {}
+                [trait_info] if trait_info.def_id.is_local() => {
+                    let span = self.tcx.hir().span_if_local(trait_info.def_id).unwrap();
+                    err.span_note(
+                        self.tcx.sess.source_map().guess_head_span(span),
+                        &format!(
+                            "`{}` defines an item `{}`, perhaps you need to {} it",
+                            self.tcx.def_path_str(trait_info.def_id),
+                            item_name,
+                            action
+                        ),
+                    );
+                }
+                trait_infos => {
                     let mut msg = message(action);
-                    for (i, trait_info) in candidates.iter().enumerate() {
+                    for (i, trait_info) in trait_infos.iter().enumerate() {
                         msg.push_str(&format!(
                             "\ncandidate #{}: `{}`",
                             i + 1,
                             self.tcx.def_path_str(trait_info.def_id),
                         ));
                     }
-                    err.note(&msg[..]);
+                    err.note(&msg);
+                }
+            }
+            match &explicitly_negative[..] {
+                [] => {}
+                [trait_info] => {
+                    let msg = format!(
+                        "the trait `{}` defines an item `{}`, but is explicitely unimplemented",
+                        self.tcx.def_path_str(trait_info.def_id),
+                        item_name
+                    );
+                    err.note(&msg);
+                }
+                trait_infos => {
+                    let mut msg = format!(
+                        "the following traits define an item `{}`, but are explicitely unimplemented:",
+                        item_name
+                    );
+                    for trait_info in trait_infos {
+                        msg.push_str(&format!("\n{}", self.tcx.def_path_str(trait_info.def_id)));
+                    }
+                    err.note(&msg);
                 }
             }
         }
@@ -1246,11 +1270,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             match ty.kind() {
                 ty::Adt(def, _) => def.did.is_local(),
                 ty::Foreign(did) => did.is_local(),
-
-                ty::Dynamic(ref tr, ..) => {
-                    tr.principal().map(|d| d.def_id().is_local()).unwrap_or(false)
-                }
-
+                ty::Dynamic(ref tr, ..) => tr.principal().map_or(false, |d| d.def_id().is_local()),
                 ty::Param(_) => true,
 
                 // Everything else (primitive types, etc.) is effectively
@@ -1336,6 +1356,8 @@ fn compute_all_traits(tcx: TyCtxt<'_>) -> Vec<DefId> {
         fn visit_trait_item(&mut self, _trait_item: &hir::TraitItem<'_>) {}
 
         fn visit_impl_item(&mut self, _impl_item: &hir::ImplItem<'_>) {}
+
+        fn visit_foreign_item(&mut self, _foreign_item: &hir::ForeignItem<'_>) {}
     }
 
     tcx.hir().krate().visit_all_item_likes(&mut Visitor { map: &tcx.hir(), traits: &mut traits });

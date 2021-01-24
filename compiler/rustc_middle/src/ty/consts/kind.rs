@@ -23,7 +23,7 @@ pub enum ConstKind<'tcx> {
     Bound(ty::DebruijnIndex, ty::BoundVar),
 
     /// A placeholder const - universally quantified higher-ranked const.
-    Placeholder(ty::PlaceholderConst),
+    Placeholder(ty::PlaceholderConst<'tcx>),
 
     /// Used in the HIR by using `Unevaluated` everywhere and later normalizing to one of the other
     /// variants when the code is monomorphic enough for that.
@@ -82,7 +82,7 @@ impl<'tcx> ConstKind<'tcx> {
     /// Tries to evaluate the constant if it is `Unevaluated`. If that doesn't succeed, return the
     /// unevaluated constant.
     pub fn eval(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> Self {
-        self.try_eval(tcx, param_env).and_then(Result::ok).map(ConstKind::Value).unwrap_or(self)
+        self.try_eval(tcx, param_env).and_then(Result::ok).map_or(self, ConstKind::Value)
     }
 
     #[inline]
@@ -103,9 +103,9 @@ impl<'tcx> ConstKind<'tcx> {
             // so that we don't try to invoke this query with
             // any region variables.
             let param_env_and_substs = tcx
-                .erase_regions(&param_env)
+                .erase_regions(param_env)
                 .with_reveal_all_normalized(tcx)
-                .and(tcx.erase_regions(&substs));
+                .and(tcx.erase_regions(substs));
 
             // HACK(eddyb) when the query key would contain inference variables,
             // attempt using identity substs and `ParamEnv` instead, that will succeed

@@ -1,4 +1,4 @@
-use crate::dep_graph::{DepConstructor, DepNode, WorkProduct, WorkProductId};
+use crate::dep_graph::{DepNode, WorkProduct, WorkProductId};
 use crate::ich::{NodeIdHashingMode, StableHashingContext};
 use crate::ty::{subst::InternalSubsts, Instance, InstanceDef, SymbolName, TyCtxt};
 use rustc_attr::InlineAttr;
@@ -228,7 +228,7 @@ pub struct CodegenUnit<'tcx> {
 
 /// Specifies the linkage type for a `MonoItem`.
 ///
-/// See https://llvm.org/docs/LangRef.html#linkage-types for more details about these variants.
+/// See <https://llvm.org/docs/LangRef.html#linkage-types> for more details about these variants.
 #[derive(Copy, Clone, PartialEq, Debug, TyEncodable, TyDecodable, HashStable)]
 pub enum Linkage {
     External,
@@ -362,7 +362,7 @@ impl<'tcx> CodegenUnit<'tcx> {
     }
 
     pub fn codegen_dep_node(&self, tcx: TyCtxt<'tcx>) -> DepNode {
-        DepConstructor::CompileCodegenUnit(tcx, self.name())
+        crate::dep_graph::make_compile_codegen_unit(tcx, self.name())
     }
 }
 

@@ -2,13 +2,12 @@
 
 use crate::ich::NodeIdHashingMode;
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use crate::mir::interpret::{sign_extend, truncate};
 use crate::ty::fold::TypeFolder;
 use crate::ty::layout::IntegerExt;
 use crate::ty::query::TyCtxtAt;
-use crate::ty::subst::{GenericArgKind, InternalSubsts, Subst, SubstsRef};
+use crate::ty::subst::{GenericArgKind, Subst, SubstsRef};
 use crate::ty::TyKind::*;
-use crate::ty::{self, DefIdTree, GenericParamDefKind, List, Ty, TyCtxt, TypeFoldable};
+use crate::ty::{self, DefIdTree, List, Ty, TyCtxt, TypeFoldable};
 use rustc_apfloat::Float as _;
 use rustc_ast as ast;
 use rustc_attr::{self as attr, SignedInt, UnsignedInt};
@@ -19,7 +18,7 @@ use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_macros::HashStable;
-use rustc_span::Span;
+use rustc_span::{Span, DUMMY_SP};
 use rustc_target::abi::{Integer, Size, TargetDataLayout};
 use smallvec::SmallVec;
 use std::{cmp, fmt};
@@ -38,7 +37,7 @@ impl<'tcx> fmt::Display for Discr<'tcx> {
                 let size = ty::tls::with(|tcx| Integer::from_attr(&tcx, SignedInt(ity)).size());
                 let x = self.val;
                 // sign extend the raw representation to be an i128
-                let x = sign_extend(x, size) as i128;
+                let x = size.sign_extend(x) as i128;
                 write!(fmt, "{}", x)
             }
             _ => write!(fmt, "{}", self.val),
@@ -47,7 +46,7 @@ impl<'tcx> fmt::Display for Discr<'tcx> {
 }
 
 fn signed_min(size: Size) -> i128 {
-    sign_extend(1_u128 << (size.bits() - 1), size) as i128
+    size.sign_extend(1_u128 << (size.bits() - 1)) as i128
 }
 
 fn signed_max(size: Size) -> i128 {
@@ -77,14 +76,14 @@ impl<'tcx> Discr<'tcx> {
         let (val, oflo) = if signed {
             let min = signed_min(size);
             let max = signed_max(size);
-            let val = sign_extend(self.val, size) as i128;
+            let val = size.sign_extend(self.val) as i128;
             assert!(n < (i128::MAX as u128));
             let n = n as i128;
             let oflo = val > max - n;
             let val = if oflo { min + (n - (max - val) - 1) } else { val + n };
             // zero the upper bits
             let val = val as u128;
-            let val = truncate(val, size);
+            let val = size.truncate(val);
             (val, oflo)
         } else {
             let max = unsigned_max(size);
@@ -161,7 +160,7 @@ impl<'tcx> TyCtxt<'tcx> {
         // We want the type_id be independent of the types free regions, so we
         // erase them. The erase_regions() call will also anonymize bound
         // regions, which is desirable too.
-        let ty = self.erase_regions(&ty);
+        let ty = self.erase_regions(ty);
 
         hcx.while_hashing_spans(false, |hcx| {
             hcx.with_node_id_hashing_mode(NodeIdHashingMode::HashDefPath, |hcx| {
@@ -170,9 +169,7 @@ impl<'tcx> TyCtxt<'tcx> {
         });
         hasher.finish()
     }
-}
 
-impl<'tcx> TyCtxt<'tcx> {
     pub fn has_error_field(self, ty: Ty<'tcx>) -> bool {
         if let ty::Adt(def, substs) = *ty.kind() {
             for field in def.all_fields() {
@@ -224,7 +221,13 @@ impl<'tcx> TyCtxt<'tcx> {
         mut ty: Ty<'tcx>,
         normalize: impl Fn(Ty<'tcx>) -> Ty<'tcx>,
     ) -> Ty<'tcx> {
-        loop {
+        for iteration in 0.. {
+            if !self.sess.recursion_limit().value_within_limit(iteration) {
+                return self.ty_error_with_message(
+                    DUMMY_SP,
+                    &format!("reached the recursion limit finding the struct tail for {}", ty),
+                );
+            }
             match *ty.kind() {
                 ty::Adt(def, substs) => {
                     if !def.is_struct() {
@@ -343,19 +346,19 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn calculate_dtor(
         self,
         adt_did: DefId,
-        validate: &mut dyn FnMut(Self, DefId) -> Result<(), ErrorReported>,
+        validate: impl Fn(Self, DefId) -> Result<(), ErrorReported>,
     ) -> Option<ty::Destructor> {
         let drop_trait = self.lang_items().drop_trait()?;
         self.ensure().coherent_trait(drop_trait);
 
-        let mut dtor_did = None;
         let ty = self.type_of(adt_did);
-        self.for_each_relevant_impl(drop_trait, ty, |impl_did| {
+        let dtor_did = self.find_map_relevant_impl(drop_trait, ty, |impl_did| {
             if let Some(item) = self.associated_items(impl_did).in_definition_order().next() {
                 if validate(self, impl_did).is_ok() {
-                    dtor_did = Some(item.def_id);
+                    return Some(item.def_id);
                 }
             }
+            None
         });
 
         Some(ty::Destructor { did: dtor_did? })
@@ -500,7 +503,8 @@ impl<'tcx> TyCtxt<'tcx> {
         closure_substs: SubstsRef<'tcx>,
     ) -> Option<ty::Binder<Ty<'tcx>>> {
         let closure_ty = self.mk_closure(closure_def_id, closure_substs);
-        let env_region = ty::ReLateBound(ty::INNERMOST, ty::BrEnv);
+        let br = ty::BoundRegion { kind: ty::BrEnv };
+        let env_region = ty::ReLateBound(ty::INNERMOST, br);
         let closure_kind_ty = closure_substs.as_closure().kind_ty();
         let closure_kind = closure_kind_ty.to_opt_closure_kind()?;
         let env_ty = match closure_kind {
@@ -511,42 +515,32 @@ impl<'tcx> TyCtxt<'tcx> {
         Some(ty::Binder::bind(env_ty))
     }
 
-    /// Given the `DefId` of some item that has no type or const parameters, make
-    /// a suitable "empty substs" for it.
-    pub fn empty_substs_for_def_id(self, item_def_id: DefId) -> SubstsRef<'tcx> {
-        InternalSubsts::for_item(self, item_def_id, |param, _| match param.kind {
-            GenericParamDefKind::Lifetime => self.lifetimes.re_erased.into(),
-            GenericParamDefKind::Type { .. } => {
-                bug!("empty_substs_for_def_id: {:?} has type parameters", item_def_id)
-            }
-            GenericParamDefKind::Const { .. } => {
-                bug!("empty_substs_for_def_id: {:?} has const parameters", item_def_id)
-            }
-        })
-    }
-
     /// Returns `true` if the node pointed to by `def_id` is a `static` item.
-    pub fn is_static(&self, def_id: DefId) -> bool {
+    pub fn is_static(self, def_id: DefId) -> bool {
         self.static_mutability(def_id).is_some()
     }
 
     /// Returns `true` if this is a `static` item with the `#[thread_local]` attribute.
-    pub fn is_thread_local_static(&self, def_id: DefId) -> bool {
+    pub fn is_thread_local_static(self, def_id: DefId) -> bool {
         self.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::THREAD_LOCAL)
     }
 
     /// Returns `true` if the node pointed to by `def_id` is a mutable `static` item.
-    pub fn is_mutable_static(&self, def_id: DefId) -> bool {
+    pub fn is_mutable_static(self, def_id: DefId) -> bool {
         self.static_mutability(def_id) == Some(hir::Mutability::Mut)
     }
 
     /// Get the type of the pointer to the static that we use in MIR.
-    pub fn static_ptr_ty(&self, def_id: DefId) -> Ty<'tcx> {
+    pub fn static_ptr_ty(self, def_id: DefId) -> Ty<'tcx> {
         // Make sure that any constants in the static's type are evaluated.
         let static_ty = self.normalize_erasing_regions(ty::ParamEnv::empty(), self.type_of(def_id));
 
+        // Make sure that accesses to unsafe statics end up using raw pointers.
+        // For thread-locals, this needs to be kept in sync with `Rvalue::ty`.
         if self.is_mutable_static(def_id) {
             self.mk_mut_ptr(static_ty)
+        } else if self.is_foreign_item(def_id) {
+            self.mk_imm_ptr(static_ty)
         } else {
             self.mk_imm_ref(self.lifetimes.re_erased, static_ty)
         }
@@ -648,8 +642,8 @@ impl<'tcx> ty::TyS<'tcx> {
             }
             ty::Char => Some(std::char::MAX as u128),
             ty::Float(fty) => Some(match fty {
-                ast::FloatTy::F32 => ::rustc_apfloat::ieee::Single::INFINITY.to_bits(),
-                ast::FloatTy::F64 => ::rustc_apfloat::ieee::Double::INFINITY.to_bits(),
+                ast::FloatTy::F32 => rustc_apfloat::ieee::Single::INFINITY.to_bits(),
+                ast::FloatTy::F64 => rustc_apfloat::ieee::Double::INFINITY.to_bits(),
             }),
             _ => None,
         };
@@ -662,7 +656,7 @@ impl<'tcx> ty::TyS<'tcx> {
         let val = match self.kind() {
             ty::Int(_) | ty::Uint(_) => {
                 let (size, signed) = int_size_and_signed(tcx, self);
-                let val = if signed { truncate(signed_min(size) as u128, size) } else { 0 };
+                let val = if signed { size.truncate(signed_min(size) as u128) } else { 0 };
                 Some(val)
             }
             ty::Char => Some(0),
@@ -1140,6 +1134,37 @@ pub fn needs_drop_components(
         | ty::Infer(_)
         | ty::Closure(..)
         | ty::Generator(..) => Ok(smallvec![ty]),
+    }
+}
+
+// Does the equivalent of
+// ```
+// let v = self.iter().map(|p| p.fold_with(folder)).collect::<SmallVec<[_; 8]>>();
+// folder.tcx().intern_*(&v)
+// ```
+pub fn fold_list<'tcx, F, T>(
+    list: &'tcx ty::List<T>,
+    folder: &mut F,
+    intern: impl FnOnce(TyCtxt<'tcx>, &[T]) -> &'tcx ty::List<T>,
+) -> &'tcx ty::List<T>
+where
+    F: TypeFolder<'tcx>,
+    T: TypeFoldable<'tcx> + PartialEq + Copy,
+{
+    let mut iter = list.iter();
+    // Look for the first element that changed
+    if let Some((i, new_t)) = iter.by_ref().enumerate().find_map(|(i, t)| {
+        let new_t = t.fold_with(folder);
+        if new_t == t { None } else { Some((i, new_t)) }
+    }) {
+        // An element changed, prepare to intern the resulting list
+        let mut new_list = SmallVec::<[_; 8]>::with_capacity(list.len());
+        new_list.extend_from_slice(&list[..i]);
+        new_list.push(new_t);
+        new_list.extend(iter.map(|t| t.fold_with(folder)));
+        intern(folder.tcx(), &new_list)
+    } else {
+        list
     }
 }
 

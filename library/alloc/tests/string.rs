@@ -1,7 +1,11 @@
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::TryReserveError::*;
-use std::mem::size_of;
+use std::ops::Bound;
 use std::ops::Bound::*;
+use std::ops::RangeBounds;
+use std::panic;
+use std::str;
 
 pub trait IntoCow<'a, B: ?Sized>
 where
@@ -379,6 +383,20 @@ fn test_retain() {
 
     s.retain(|_| false);
     assert_eq!(s, "");
+
+    let mut s = String::from("0è0");
+    let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let mut count = 0;
+        s.retain(|_| {
+            count += 1;
+            match count {
+                1 => false,
+                2 => true,
+                _ => panic!(),
+            }
+        });
+    }));
+    assert!(std::str::from_utf8(s.as_bytes()).is_ok());
 }
 
 #[test]
@@ -548,6 +566,52 @@ fn test_replace_range_unbounded() {
 }
 
 #[test]
+fn test_replace_range_evil_start_bound() {
+    struct EvilRange(Cell<bool>);
+
+    impl RangeBounds<usize> for EvilRange {
+        fn start_bound(&self) -> Bound<&usize> {
+            Bound::Included(if self.0.get() {
+                &1
+            } else {
+                self.0.set(true);
+                &0
+            })
+        }
+        fn end_bound(&self) -> Bound<&usize> {
+            Bound::Unbounded
+        }
+    }
+
+    let mut s = String::from("🦀");
+    s.replace_range(EvilRange(Cell::new(false)), "");
+    assert_eq!(Ok(""), str::from_utf8(s.as_bytes()));
+}
+
+#[test]
+fn test_replace_range_evil_end_bound() {
+    struct EvilRange(Cell<bool>);
+
+    impl RangeBounds<usize> for EvilRange {
+        fn start_bound(&self) -> Bound<&usize> {
+            Bound::Included(&0)
+        }
+        fn end_bound(&self) -> Bound<&usize> {
+            Bound::Excluded(if self.0.get() {
+                &3
+            } else {
+                self.0.set(true);
+                &4
+            })
+        }
+    }
+
+    let mut s = String::from("🦀");
+    s.replace_range(EvilRange(Cell::new(false)), "");
+    assert_eq!(Ok(""), str::from_utf8(s.as_bytes()));
+}
+
+#[test]
 fn test_extend_ref() {
     let mut a = "foo".to_string();
     a.extend(&['b', 'a', 'r']);
@@ -605,7 +669,7 @@ fn test_try_reserve() {
     // on 64-bit, we assume the OS will give an OOM for such a ridiculous size.
     // Any platform that succeeds for these requests is technically broken with
     // ptr::offset because LLVM is the worst.
-    let guards_against_isize = size_of::<usize>() < 8;
+    let guards_against_isize = usize::BITS < 64;
 
     {
         // Note: basic stuff is checked by test_reserve
@@ -686,7 +750,7 @@ fn test_try_reserve_exact() {
     const MAX_CAP: usize = isize::MAX as usize;
     const MAX_USIZE: usize = usize::MAX;
 
-    let guards_against_isize = size_of::<usize>() < 8;
+    let guards_against_isize = usize::BITS < 64;
 
     {
         let mut empty_string: String = String::new();

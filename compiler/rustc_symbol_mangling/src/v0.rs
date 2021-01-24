@@ -132,7 +132,7 @@ impl SymbolMangler<'tcx> {
             self.push("u");
 
             // FIXME(eddyb) we should probably roll our own punycode implementation.
-            let mut punycode_bytes = match ::punycode::encode(ident) {
+            let mut punycode_bytes = match punycode::encode(ident) {
                 Ok(s) => s.into_bytes(),
                 Err(()) => bug!("symbol_names: punycode encoding failed for ident {:?}", ident),
             };
@@ -152,11 +152,8 @@ impl SymbolMangler<'tcx> {
         let _ = write!(self.out, "{}", ident.len());
 
         // Write a separating `_` if necessary (leading digit or `_`).
-        match ident.chars().next() {
-            Some('_' | '0'..='9') => {
-                self.push("_");
-            }
-            _ => {}
+        if let Some('_' | '0'..='9') = ident.chars().next() {
+            self.push("_");
         }
 
         self.push(ident);
@@ -202,15 +199,9 @@ impl SymbolMangler<'tcx> {
 
         let lifetimes = regions
             .into_iter()
-            .map(|br| {
-                match br {
-                    ty::BrAnon(i) => {
-                        // FIXME(eddyb) for some reason, `anonymize_late_bound_regions` starts at `1`.
-                        assert_ne!(i, 0);
-                        i - 1
-                    }
-                    _ => bug!("symbol_names: non-anonymized region `{:?}` in `{:?}`", br, value),
-                }
+            .map(|br| match br {
+                ty::BrAnon(i) => i,
+                _ => bug!("symbol_names: non-anonymized region `{:?}` in `{:?}`", br, value),
             })
             .max()
             .map_or(0, |max| max + 1);
@@ -262,7 +253,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
     }
 
     fn print_impl_path(
-        self,
+        mut self,
         impl_def_id: DefId,
         substs: &'tcx [GenericArg<'tcx>],
         mut self_ty: Ty<'tcx>,
@@ -287,12 +278,37 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
             }
         }
 
-        self.path_append_impl(
-            |cx| cx.print_def_path(parent_def_id, &[]),
-            &key.disambiguated_data,
-            self_ty,
-            impl_trait_ref,
-        )
+        self.push(match impl_trait_ref {
+            Some(_) => "X",
+            None => "M",
+        });
+
+        // Encode impl generic params if the substitutions contain parameters (implying
+        // polymorphization is enabled) and this isn't an inherent impl.
+        if impl_trait_ref.is_some() && substs.iter().any(|a| a.has_param_types_or_consts()) {
+            self = self.path_generic_args(
+                |this| {
+                    this.path_append_ns(
+                        |cx| cx.print_def_path(parent_def_id, &[]),
+                        'I',
+                        key.disambiguated_data.disambiguator as u64,
+                        "",
+                    )
+                },
+                substs,
+            )?;
+        } else {
+            self.push_disambiguator(key.disambiguated_data.disambiguator as u64);
+            self = self.print_def_path(parent_def_id, &[])?;
+        }
+
+        self = self_ty.print(self)?;
+
+        if let Some(trait_ref) = impl_trait_ref {
+            self = self.print_def_path(trait_ref.def_id, trait_ref.substs)?;
+        }
+
+        Ok(self)
     }
 
     fn print_region(mut self, region: ty::Region<'_>) -> Result<Self::Region, Self::Error> {
@@ -303,11 +319,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
 
             // Late-bound lifetimes use indices starting at 1,
             // see `BinderLevel` for more details.
-            ty::ReLateBound(debruijn, ty::BrAnon(i)) => {
-                // FIXME(eddyb) for some reason, `anonymize_late_bound_regions` starts at `1`.
-                assert_ne!(i, 0);
-                let i = i - 1;
-
+            ty::ReLateBound(debruijn, ty::BoundRegion { kind: ty::BrAnon(i) }) => {
                 let binder = &self.binders[self.binders.len() - 1 - debruijn.index()];
                 let depth = binder.lifetime_depths.start + i;
 
@@ -453,9 +465,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
 
             ty::Dynamic(predicates, r) => {
                 self.push("D");
-                self = self.in_binder(&predicates, |cx, predicates| {
-                    cx.print_dyn_existential(predicates)
-                })?;
+                self = self.print_dyn_existential(predicates)?;
                 self = r.print(self)?;
             }
 
@@ -474,26 +484,29 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
 
     fn print_dyn_existential(
         mut self,
-        predicates: &'tcx ty::List<ty::ExistentialPredicate<'tcx>>,
+        predicates: &'tcx ty::List<ty::Binder<ty::ExistentialPredicate<'tcx>>>,
     ) -> Result<Self::DynExistential, Self::Error> {
         for predicate in predicates {
-            match predicate {
-                ty::ExistentialPredicate::Trait(trait_ref) => {
-                    // Use a type that can't appear in defaults of type parameters.
-                    let dummy_self = self.tcx.mk_ty_infer(ty::FreshTy(0));
-                    let trait_ref = trait_ref.with_self_ty(self.tcx, dummy_self);
-                    self = self.print_def_path(trait_ref.def_id, trait_ref.substs)?;
+            self = self.in_binder(&predicate, |mut cx, predicate| {
+                match predicate {
+                    ty::ExistentialPredicate::Trait(trait_ref) => {
+                        // Use a type that can't appear in defaults of type parameters.
+                        let dummy_self = cx.tcx.mk_ty_infer(ty::FreshTy(0));
+                        let trait_ref = trait_ref.with_self_ty(cx.tcx, dummy_self);
+                        cx = cx.print_def_path(trait_ref.def_id, trait_ref.substs)?;
+                    }
+                    ty::ExistentialPredicate::Projection(projection) => {
+                        let name = cx.tcx.associated_item(projection.item_def_id).ident;
+                        cx.push("p");
+                        cx.push_ident(&name.as_str());
+                        cx = projection.ty.print(cx)?;
+                    }
+                    ty::ExistentialPredicate::AutoTrait(def_id) => {
+                        cx = cx.print_def_path(*def_id, &[])?;
+                    }
                 }
-                ty::ExistentialPredicate::Projection(projection) => {
-                    let name = self.tcx.associated_item(projection.item_def_id).ident;
-                    self.push("p");
-                    self.push_ident(&name.as_str());
-                    self = projection.ty.print(self)?;
-                }
-                ty::ExistentialPredicate::AutoTrait(def_id) => {
-                    self = self.print_def_path(def_id, &[])?;
-                }
-            }
+                Ok(cx)
+            })?;
         }
         self.push("E");
         Ok(self)
@@ -505,16 +518,31 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
         }
         let start = self.out.len();
 
-        match ct.ty.kind() {
-            ty::Uint(_) => {}
+        let mut neg = false;
+        let val = match ct.ty.kind() {
+            ty::Uint(_) | ty::Bool | ty::Char => {
+                ct.try_eval_bits(self.tcx, ty::ParamEnv::reveal_all(), ct.ty)
+            }
+            ty::Int(_) => {
+                let param_env = ty::ParamEnv::reveal_all();
+                ct.try_eval_bits(self.tcx, param_env, ct.ty).and_then(|b| {
+                    let sz = self.tcx.layout_of(param_env.and(ct.ty)).ok()?.size;
+                    let val = sz.sign_extend(b) as i128;
+                    if val < 0 {
+                        neg = true;
+                    }
+                    Some(val.wrapping_abs() as u128)
+                })
+            }
             _ => {
                 bug!("symbol_names: unsupported constant of type `{}` ({:?})", ct.ty, ct);
             }
-        }
-        self = ct.ty.print(self)?;
+        };
 
-        if let Some(bits) = ct.try_eval_bits(self.tcx, ty::ParamEnv::reveal_all(), ct.ty) {
-            let _ = write!(self.out, "{:x}_", bits);
+        if let Some(bits) = val {
+            // We only print the type if the const can be evaluated.
+            self = ct.ty.print(self)?;
+            let _ = write!(self.out, "{}{:x}_", if neg { "n" } else { "" }, bits);
         } else {
             // NOTE(eddyb) despite having the path, we need to
             // encode a placeholder, as the path could refer
@@ -540,6 +568,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
         self.push_ident(&name);
         Ok(self)
     }
+
     fn path_qualified(
         mut self,
         self_ty: Ty<'tcx>,
@@ -554,24 +583,16 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
     }
 
     fn path_append_impl(
-        mut self,
-        print_prefix: impl FnOnce(Self) -> Result<Self::Path, Self::Error>,
-        disambiguated_data: &DisambiguatedDefPathData,
-        self_ty: Ty<'tcx>,
-        trait_ref: Option<ty::TraitRef<'tcx>>,
+        self,
+        _: impl FnOnce(Self) -> Result<Self::Path, Self::Error>,
+        _: &DisambiguatedDefPathData,
+        _: Ty<'tcx>,
+        _: Option<ty::TraitRef<'tcx>>,
     ) -> Result<Self::Path, Self::Error> {
-        self.push(match trait_ref {
-            Some(_) => "X",
-            None => "M",
-        });
-        self.push_disambiguator(disambiguated_data.disambiguator as u64);
-        self = print_prefix(self)?;
-        self = self_ty.print(self)?;
-        if let Some(trait_ref) = trait_ref {
-            self = self.print_def_path(trait_ref.def_id, trait_ref.substs)?;
-        }
-        Ok(self)
+        // Inlined into `print_impl_path`
+        unreachable!()
     }
+
     fn path_append(
         self,
         print_prefix: impl FnOnce(Self) -> Result<Self::Path, Self::Error>,
@@ -605,6 +626,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
             name.as_ref().map_or("", |s| &s[..]),
         )
     }
+
     fn path_generic_args(
         mut self,
         print_prefix: impl FnOnce(Self) -> Result<Self::Path, Self::Error>,

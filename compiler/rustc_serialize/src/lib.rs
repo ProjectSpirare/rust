@@ -5,7 +5,7 @@ Core encoding and decoding interfaces.
 */
 
 #![doc(
-    html_root_url = "https://doc.rust-lang.org/nightly/",
+    html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
     html_playground_url = "https://play.rust-lang.org/",
     test(attr(allow(unused_variables), deny(warnings)))
 )]
@@ -13,6 +13,13 @@ Core encoding and decoding interfaces.
 #![feature(never_type)]
 #![feature(nll)]
 #![feature(associated_type_bounds)]
+#![cfg_attr(bootstrap, feature(min_const_generics))]
+#![feature(min_specialization)]
+#![feature(vec_spare_capacity)]
+#![feature(core_intrinsics)]
+#![feature(int_bits_const)]
+#![feature(maybe_uninit_slice)]
+#![feature(new_uninit)]
 #![cfg_attr(test, feature(test))]
 #![allow(rustc::internal)]
 

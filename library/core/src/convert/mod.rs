@@ -134,8 +134,7 @@ pub const fn identity<T>(x: T) -> T {
 /// want to accept all references that can be converted to [`&str`] as an argument.
 /// Since both [`String`] and [`&str`] implement `AsRef<str>` we can accept both as input argument.
 ///
-/// [`Option<T>`]: Option
-/// [`Result<T, E>`]: Result
+/// [`&str`]: primitive@str
 /// [`Borrow`]: crate::borrow::Borrow
 /// [`Eq`]: crate::cmp::Eq
 /// [`Ord`]: crate::cmp::Ord
@@ -167,9 +166,6 @@ pub trait AsRef<T: ?Sized> {
 ///
 /// **Note: This trait must not fail**. If the conversion can fail, use a
 /// dedicated method which returns an [`Option<T>`] or a [`Result<T, E>`].
-///
-/// [`Option<T>`]: Option
-/// [`Result<T, E>`]: Result
 ///
 /// # Generic Implementations
 ///
@@ -269,8 +265,6 @@ pub trait AsMut<T: ?Sized> {
 /// is_hello(s);
 /// ```
 ///
-/// [`Option<T>`]: Option
-/// [`Result<T, E>`]: Result
 /// [`String`]: ../../std/string/struct.String.html
 /// [`Vec`]: ../../std/vec/struct.Vec.html
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -358,8 +352,6 @@ pub trait Into<T>: Sized {
 /// }
 /// ```
 ///
-/// [`Option<T>`]: Option
-/// [`Result<T, E>`]: Result
 /// [`String`]: ../../std/string/struct.String.html
 /// [`from`]: From::from
 /// [book]: ../../book/ch09-00-error-handling.html
@@ -468,7 +460,6 @@ pub trait TryInto<T>: Sized {
 /// assert!(try_successful_smaller_number.is_ok());
 /// ```
 ///
-/// [`i32::MAX`]: crate::i32::MAX
 /// [`try_from`]: TryFrom::try_from
 /// [`!`]: ../../std/primitive.never.html
 #[stable(feature = "try_from", since = "1.34.0")]

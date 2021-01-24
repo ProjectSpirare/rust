@@ -33,6 +33,15 @@ pub trait TypeRelation<'tcx>: Sized {
     /// relation. Just affects error messages.
     fn a_is_expected(&self) -> bool;
 
+    /// Whether we should look into the substs of unevaluated constants
+    /// even if `feature(const_evaluatable_checked)` is active.
+    ///
+    /// This is needed in `combine` to prevent accidentially creating
+    /// infinite types as we abuse `TypeRelation` to walk a type there.
+    fn visit_ct_substs(&self) -> bool {
+        false
+    }
+
     fn with_cause<F, R>(&mut self, _cause: Cause, f: F) -> R
     where
         F: FnOnce(&mut Self) -> R,
@@ -490,7 +499,7 @@ pub fn super_relate_consts<R: TypeRelation<'tcx>>(
     let eagerly_eval = |x: &'tcx ty::Const<'tcx>| x.eval(tcx, relation.param_env()).val;
 
     // FIXME(eddyb) doesn't look like everything below checks that `a.ty == b.ty`.
-    // We could probably always assert it early, as `const` generic parameters
+    // We could probably always assert it early, as const generic parameters
     // are not allowed to depend on other generic parameters, i.e. are concrete.
     // (although there could be normalization differences)
 
@@ -576,7 +585,20 @@ pub fn super_relate_consts<R: TypeRelation<'tcx>>(
             new_val.map(ty::ConstKind::Value)
         }
 
-        // FIXME(const_generics): this is wrong, as it is a projection
+        (
+            ty::ConstKind::Unevaluated(a_def, a_substs, None),
+            ty::ConstKind::Unevaluated(b_def, b_substs, None),
+        ) if tcx.features().const_evaluatable_checked && !relation.visit_ct_substs() => {
+            if tcx.try_unify_abstract_consts(((a_def, a_substs), (b_def, b_substs))) {
+                Ok(a.val)
+            } else {
+                Err(TypeError::ConstMismatch(expected_found(relation, a, b)))
+            }
+        }
+
+        // While this is slightly incorrect, it shouldn't matter for `min_const_generics`
+        // and is the better alternative to waiting until `const_evaluatable_checked` can
+        // be stabilized.
         (
             ty::ConstKind::Unevaluated(a_def, a_substs, a_promoted),
             ty::ConstKind::Unevaluated(b_def, b_substs, b_promoted),
@@ -590,7 +612,7 @@ pub fn super_relate_consts<R: TypeRelation<'tcx>>(
     new_const_val.map(|val| tcx.mk_const(ty::Const { val, ty: a.ty }))
 }
 
-impl<'tcx> Relate<'tcx> for &'tcx ty::List<ty::ExistentialPredicate<'tcx>> {
+impl<'tcx> Relate<'tcx> for &'tcx ty::List<ty::Binder<ty::ExistentialPredicate<'tcx>>> {
     fn relate<R: TypeRelation<'tcx>>(
         relation: &mut R,
         a: Self,
@@ -603,9 +625,10 @@ impl<'tcx> Relate<'tcx> for &'tcx ty::List<ty::ExistentialPredicate<'tcx>> {
         // in `a`.
         let mut a_v: Vec<_> = a.into_iter().collect();
         let mut b_v: Vec<_> = b.into_iter().collect();
-        a_v.sort_by(|a, b| a.stable_cmp(tcx, b));
+        // `skip_binder` here is okay because `stable_cmp` doesn't look at binders
+        a_v.sort_by(|a, b| a.skip_binder().stable_cmp(tcx, &b.skip_binder()));
         a_v.dedup();
-        b_v.sort_by(|a, b| a.stable_cmp(tcx, b));
+        b_v.sort_by(|a, b| a.skip_binder().stable_cmp(tcx, &b.skip_binder()));
         b_v.dedup();
         if a_v.len() != b_v.len() {
             return Err(TypeError::ExistentialMismatch(expected_found(relation, a, b)));
@@ -613,14 +636,18 @@ impl<'tcx> Relate<'tcx> for &'tcx ty::List<ty::ExistentialPredicate<'tcx>> {
 
         let v = a_v.into_iter().zip(b_v.into_iter()).map(|(ep_a, ep_b)| {
             use crate::ty::ExistentialPredicate::*;
-            match (ep_a, ep_b) {
-                (Trait(a), Trait(b)) => Ok(Trait(relation.relate(a, b)?)),
-                (Projection(a), Projection(b)) => Ok(Projection(relation.relate(a, b)?)),
-                (AutoTrait(a), AutoTrait(b)) if a == b => Ok(AutoTrait(a)),
+            match (ep_a.skip_binder(), ep_b.skip_binder()) {
+                (Trait(a), Trait(b)) => Ok(ty::Binder::bind(Trait(
+                    relation.relate(ep_a.rebind(a), ep_b.rebind(b))?.skip_binder(),
+                ))),
+                (Projection(a), Projection(b)) => Ok(ty::Binder::bind(Projection(
+                    relation.relate(ep_a.rebind(a), ep_b.rebind(b))?.skip_binder(),
+                ))),
+                (AutoTrait(a), AutoTrait(b)) if a == b => Ok(ep_a.rebind(AutoTrait(a))),
                 _ => Err(TypeError::ExistentialMismatch(expected_found(relation, a, b))),
             }
         });
-        Ok(tcx.mk_existential_predicates(v)?)
+        Ok(tcx.mk_poly_existential_predicates(v)?)
     }
 }
 
