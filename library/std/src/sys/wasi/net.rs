@@ -1,21 +1,57 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+/*
 use crate::convert::TryFrom;
 use crate::fmt;
 use crate::io::{self, IoSlice, IoSliceMut};
 use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
+use crate::net::IpAddr;
 use crate::sys::fd::WasiFd;
+use crate::sys::fd::{iovec, ciovec};
 use crate::sys::{unsupported, Void};
 use crate::sys_common::FromInner;
 use crate::time::Duration;
+*/
+use crate::convert::{TryFrom, TryInto};
+use crate::fmt;
+use crate::io::{self, IoSlice, IoSliceMut};
+use crate::mem;
+use crate::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
+use crate::sys::fd::WasiFd;
+// use crate::sys::fd::{iovec, ciovec};
+use crate::sys::unsupported;
+use crate::sys_common::FromInner;
+use crate::time::Duration;
+use crate::vec::IntoIter;
 
 pub struct TcpStream {
     fd: WasiFd,
 }
 
+fn iovec<'a>(a: &'a mut [IoSliceMut<'_>]) -> &'a [wasi::Iovec] {
+    assert_eq!(mem::size_of::<IoSliceMut<'_>>(), mem::size_of::<wasi::Iovec>());
+    assert_eq!(mem::align_of::<IoSliceMut<'_>>(), mem::align_of::<wasi::Iovec>());
+    unsafe { mem::transmute(a) }
+}
+
+fn ciovec<'a>(a: &'a [IoSlice<'_>]) -> &'a [wasi::Ciovec] {
+    assert_eq!(mem::size_of::<IoSlice<'_>>(), mem::size_of::<wasi::Ciovec>());
+    assert_eq!(mem::align_of::<IoSlice<'_>>(), mem::align_of::<wasi::Ciovec>());
+    unsafe { mem::transmute(a) }
+}
+
 impl TcpStream {
-    pub fn connect(_: io::Result<&SocketAddr>) -> io::Result<TcpStream> {
-        unsupported()
+    pub fn connect(addr: io::Result<&SocketAddr>) -> io::Result<TcpStream> {
+        println!("rust_stdlib_sys_wasi_net::TcpStream::connect");
+
+        if let SocketAddr::V4(ipv4) = addr.expect("unrapping io::Result<&SocketAddr> failed") {
+            let addr: u32 = ipv4.ip().clone().into();
+            let port: u16 = ipv4.port();
+            let fd = unsafe { wasi::sock_connect(addr, port).unwrap() };
+            Ok(Self { fd: unsafe { WasiFd::from_raw(fd) } })
+        } else {
+            unsupported()
+        }
     }
 
     pub fn connect_timeout(_: &SocketAddr, _: Duration) -> io::Result<TcpStream> {
@@ -42,24 +78,24 @@ impl TcpStream {
         unsupported()
     }
 
-    pub fn read(&self, _: &mut [u8]) -> io::Result<usize> {
-        unsupported()
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_vectored(&mut [IoSliceMut::new(buf)])
     }
 
-    pub fn read_vectored(&self, _: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        unsupported()
+    pub fn read_vectored(&self, iov: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        Ok(unsafe { wasi::sock_recv(self.fd.as_raw(), iovec(iov), 0).unwrap().0 })
     }
 
     pub fn is_read_vectored(&self) -> bool {
         true
     }
 
-    pub fn write(&self, _: &[u8]) -> io::Result<usize> {
-        unsupported()
+    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        self.write_vectored(&[IoSlice::new(buf)])
     }
 
-    pub fn write_vectored(&self, _: &[IoSlice<'_>]) -> io::Result<usize> {
-        unsupported()
+    pub fn write_vectored(&self, iov: &[IoSlice<'_>]) -> io::Result<usize> {
+        Ok(unsafe { wasi::sock_send(self.fd.as_raw(), ciovec(iov), 0).unwrap() })
     }
 
     pub fn is_write_vectored(&self) -> bool {
@@ -343,34 +379,55 @@ impl fmt::Debug for UdpSocket {
     }
 }
 
-pub struct LookupHost(Void);
+pub struct LookupHost(IntoIter<SocketAddr>, u16);
 
 impl LookupHost {
     pub fn port(&self) -> u16 {
-        match self.0 {}
+        self.1
     }
 }
 
 impl Iterator for LookupHost {
     type Item = SocketAddr;
-    fn next(&mut self) -> Option<SocketAddr> {
-        match self.0 {}
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
     }
 }
 
 impl<'a> TryFrom<&'a str> for LookupHost {
     type Error = io::Error;
 
-    fn try_from(_v: &'a str) -> io::Result<LookupHost> {
-        unsupported()
+    fn try_from(s: &'a str) -> io::Result<LookupHost> {
+        macro_rules! try_opt {
+            ($e:expr, $msg:expr) => {
+                match $e {
+                    Some(r) => r,
+                    None => return Err(io::Error::new(io::ErrorKind::InvalidInput, $msg)),
+                }
+            };
+        }
+
+        // split the string by ':' and convert the second part to u16
+        let mut parts_iter = s.rsplitn(2, ':');
+        let port_str = try_opt!(parts_iter.next(), "invalid socket address");
+        let host = try_opt!(parts_iter.next(), "invalid socket address");
+        let port: u16 = try_opt!(port_str.parse().ok(), "invalid port value");
+
+        (host, port).try_into()
     }
 }
 
 impl<'a> TryFrom<(&'a str, u16)> for LookupHost {
     type Error = io::Error;
 
-    fn try_from(_v: (&'a str, u16)) -> io::Result<LookupHost> {
-        unsupported()
+    fn try_from((host, port): (&'a str, u16)) -> io::Result<LookupHost> {
+        println!("rust_stdlib_sys_wasi_net::LookupHost::try_from tuple: {:#?}:{:#?}", host, port);
+
+        let mut addrs = vec![];
+
+        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        addrs.push(socket);
+        Ok(LookupHost(addrs.into_iter(), port))
     }
 }
 
